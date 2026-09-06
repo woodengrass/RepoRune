@@ -1,7 +1,9 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成、commit `4cb6e29`——**尚未接過
-真實 OpenCode host 驗收**，是目前唯一剩下的工作，細節見文末「立刻可以做的下一步」。以下段落按時間
+最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成之後，再加一輪純設計文件修訂
+（部署模型、`protocol_version`、git worktree／多 agent 協作、scope reconciliation 治理——**不含
+任何程式碼變更**，見 IMPLEMENTATION_PLAN.md「Milestone 7 開工」第四輪修訂）。**尚未接過真實
+OpenCode host 驗收**，是目前唯一剩下的實作工作，細節見文末「立刻可以做的下一步」。以下段落按時間
 順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原「為什麼是這樣做」的完整脈絡；只要看結論，
 直接跳到「立刻可以做的下一步」即可。
 
@@ -483,8 +485,9 @@ git-init 過的小型測試用 repo）。
 
 ## 已知的限制／還沒做的事（不是 bug，是刻意的 V1 範圍）
 
-- **多人協作衝突**：`revision` 是單純遞增整數，兩個 branch 各自從同一個 revision 產生下一版再
-  merge 會撞號，V1 明確不解決，只保證偵測到衝突時會拒絕 materialize（不會默默選一個）。
+- **多人協作衝突（含 git worktree）**：`revision` 是單純遞增整數，兩個 branch（git worktree 本質上
+  就是這個場景的具體案例，見 ARCHITECTURE.md 第 16 節、DATA_MODEL.md §8）各自從同一個 revision
+  產生下一版再 merge 會撞號，V1 明確不解決，只保證偵測到衝突時會拒絕 materialize（不會默默選一個）。
   - **`from . import X`（Python 純點號相對 import）解析不到具體目標**：因為目前的擷取邏輯只抓
     relative import 的點號前綴，沒有抓 `import` 後面的名稱列表，這種情況現在回傳 `None`（誠實地
     unresolved），刻意不猜（之前猜錯過，猜成套件自己的 `__init__.py`，已經修掉那個假陽性）。
@@ -492,6 +495,17 @@ git-init 過的小型測試用 repo）。
   現在就要做到完美聚類。
 - **`project.json` 的 `last_indexed_*` 欄位跟 SQLite commit 不是原子的**：這是接受的已知限制，
   有文件記錄取捨理由跟自我修復機制（下次 update 一定會重新算，不會被過期 metadata 帶壞）。
+- **Scope membership 沒有 per-membership provenance**（本輪新增記錄，見 DATA_MODEL.md
+  §9）：`ScopeMembers` 只有 `files`/`symbols` 兩個純清單，回答不了「這條 membership 是
+  human/model/auto 加的」，也沒有「human exclude」機制——這是 multi-worktree scope
+  reconciliation（ARCHITECTURE.md §4.4/§16.6）需要、但現行 schema 不支援的東西，明確記錄為
+  future/V2，不是這輪或 Milestone 7 要做的事。
+- **`rune scope reconcile`（含 large-churn guardrail 的具體 threshold）尚未實作**：ARCHITECTURE.md
+  §4.4 已經把 incremental scope reconciliation 的完整規則寫清楚（untouched region frozen、
+  AUTO/KEEP/REVIEW/BROKEN 分類、locked/human-confirmed membership 保護），但 CLI 命令本身、
+  large-churn 的具體數值都還沒做，是設計先於實作的狀態。
+- **`protocol_version` 尚未加進任何 `--json` 輸出**：ARCHITECTURE.md §6.2 已經定義好 adapter/core
+  相容性契約的設計，但目前所有 `--json` 命令都還沒有這個欄位，是 Milestone 7 收尾前要補的 contract。
 
 ## 立刻可以做的下一步
 
@@ -532,3 +546,31 @@ regression test 直接斷言），JSON 格式逐字對照 ARCHITECTURE §7.6。3
 `injectViaPromptFallback`，目前完全未接入）是否真的需要，或 `system.transform` 已經夠可靠。找到
 可用的 OpenCode 執行環境後，重讀 ARCHITECTURE.md §6/§6.1 與 IMPLEMENTATION_PLAN.md 第 134-140
 條，照著上面三點逐一驗證、修正落差、更新對應章節。
+
+**Milestone 7 之後、純設計文件修訂一輪（不含程式碼）**：見 IMPLEMENTATION_PLAN.md「Milestone 7
+開工」第四輪修訂（第 141-147 條）、ARCHITECTURE.md 新第 14/16/17 節與 §4.4/§6.2、DATA_MODEL.md
+新第 9 節。確認了部署模型（machine-level install once、per-repo `rune init`、plugin 偵測
+`.rune/` 且絕不自動 init、V1 不用 daemon）、`protocol_version` adapter/core 相容性契約（設計已定，
+CLI 尚未實作）、git worktree／多 agent 協作 workflow 與 "merge reconciliation follows
+provenance" 原則、把既有 incremental scope 自動併入規則泛化成完整的 Scope Membership
+Reconciliation 設計（untouched region frozen、large-churn guardrail、AUTO/KEEP/REVIEW/BROKEN
+分類，CLI 尚未實作）、記錄 Scope membership 缺乏 per-membership provenance 的 schema 限制
+（future/V2，不改 schema）。**這輪沒有任何程式碼變更**，317 個 Python 測試／20 個 TypeScript 測試
+維持不變。
+
+### Plugin 開發邊界（可並行開發）
+
+`adapters/opencode/**` 可以交給另一個 agent 並行開發，範圍邊界：
+
+- **允許碰**：`adapters/opencode/**`（`src/rune-cli.ts`/`rune-context.ts`/`plugin.ts`/
+  `tool-paths.ts` 與對應測試）。
+- **原則上不要碰**：`src/rune/**`、Python tests、canonical/data model 商業邏輯。
+
+Plugin 的職責邊界收斂為：呼叫 CLI、解析 JSON、render OpenCode 專屬 context、注入、session state、
+dedup、path extraction、host hooks、custom tool wrapper。Core 的職責（visibility、current
+revision、staleness、scope membership truth、bootstrap content 篩選、proposal 語意、note
+lifecycle、semantic 邏輯）一律留在 Python core，plugin 不得反過來補業務邏輯。
+
+**若 plugin 需要尚未存在的 CLI endpoint**：先定義 TypeScript interface、在 plugin 測試裡 mock（比照
+既有 `RuneClient` 介面，見 `plugin.ts`），**不要自行跑去 Python core 補業務邏輯**，等 integration
+階段才真正接線確認 CLI 形狀。

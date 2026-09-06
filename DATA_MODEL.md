@@ -1,6 +1,6 @@
 # RepoRune（rune）— 資料模型
 
-狀態：**已確認（第十一輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
+狀態：**已確認（第十二輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
 必須分離）、補上 `source_bound`/`scope_bound`/`temporary` Constraint 實際可實作所需的 snapshot 欄位、
 補上 Note 的 revision 機制、以及 ScopeSummary `source_files` 的推導 invariant。第三輪修正
 `created_by` 的型別（改為 `RevisionAuthor` enum，解決與「系統自動附加 revision」的矛盾）、補上
@@ -33,7 +33,13 @@ current revision 的完整內容、只改動 status/last_error（首次生成就
 空字串」跟「API key 沒設」歸為同一類設定錯誤，不再視同「使用者刻意關閉」的靜默跳過。這只影響
 provider 健康檢查怎麼分類「沒有可用 provider」的原因，不影響這裡記錄的 `possibly_stale` 觸發規則
 本身（不論是哪種原因，只要這次沒有可用 provider，判斷邏輯都一樣）。provider 健康檢查設計細節見
-ARCHITECTURE.md §4.5。這是 Milestone 1–6/7 實作時遵循的契約。
+ARCHITECTURE.md §4.5。**第十二輪是 Milestone 7 完工後的純設計文件修訂（不含程式碼變更）**：確認
+git worktree／多 agent 協作場景不需要新的 revision schema——第 8 節既有的「單一寫入者假設」invariant
+本來就涵蓋這個情境（worktree 本質上就是「多個 branch 平行推進」），只是把這點明確寫出來；新增第 9
+節，記錄 Scope membership 缺乏 per-membership provenance（human/model/auto 來源、是否
+locked/human-confirmed）這個 schema 限制，**明確記錄為 future/V2，本輪不修改 `Scope`/
+`ScopeMembers` schema**。完整設計討論見 ARCHITECTURE.md 第 16、17 節。這是 Milestone 1–7 實作時
+遵循的契約。
 
 ## 1. 慣例
 
@@ -843,3 +849,54 @@ revision)` 重複兩行。**V1 明確假設單一寫入者，不處理這個情�
 
 未來若需要多人協作，`revision` 應升級為 `revision_id`（例如 ULID）+ `parent_revision_id`，數字型
 `revision` 僅作顯示用途；V1 不為此預先設計，避免拖延開發。
+
+**第十二輪確認：git worktree 是這個 invariant 最主要的真實觸發場景，不構成需要新設計的理由**——
+同一個 repo 開多個 git worktree（例如給不同 agent／不同 issue 各自一份 checkout）本質上就是「多個
+branch 各自從同一個 revision 往下推進」，跟這裡描述的衝突場景是同一件事，不是需要另外設計的新
+情境。Worktree 場景下的完整 workflow 建議（哪些操作允許平行進行、由誰負責 merge 後的收斂）記錄在
+ARCHITECTURE.md 第 16 節，但那份文件不改變這裡定義的 invariant 本身：偵測到重複
+`(record_id/id, revision)` 依然是「中止、回報、要求人類解決」，不自動 resolve。
+
+## 9. 已知限制：Scope membership 缺乏 per-membership provenance（future/V2，本輪只記錄，不改 schema）
+
+**第十二輪發現、記錄，明確不在本輪或 Milestone 7 修改 schema。**
+
+現行 `ScopeMembers`（§2.3）只有：
+
+```python
+class ScopeMembers(BaseModel):
+    files: list[str] = []
+    symbols: list[str] = []
+```
+
+`Scope.source`（`ScopeSource`：`auto`/`model`/`human`）記錄的是**整個 scope**的來源，不是**每一筆
+membership**的來源——這個模型沒有辦法回答「`foo.ts` 這一條 membership 是人類手動加的、還是 model
+建議後人類確認的、還是 incremental auto-add 自動寫入的」。
+
+這個限制在 ARCHITECTURE.md §4.4（Scope Membership Reconciliation）與 §16.5-16.6（merge
+reconciliation 的 provenance 原則）被明確依賴到：reconciliation 規則要求「human-confirmed
+membership 不得被自動移除」，但現行 schema 沒有欄位可以精確標記「這一條 membership 是
+human-confirmed 的」——目前只能退而求其次，用 `locked`（整個 scope 層級）或「這個檔案還在
+changed set 裡沒有」這種較粗的判斷代替，沒有真正的 per-membership 保護欄位。
+
+**未來（V2 候選，不是本輪或 M7 範圍）可能需要的方向**，記錄供將來設計參考、不代表確定會照這個形狀做：
+
+```python
+class ScopeMembership:  # 概念草稿，非最終設計
+    scope_id: str
+    target_type: Literal["file", "symbol"]
+    target: str
+    source: Literal["human", "model", "auto"]
+    # 可能需要：locked/authoritative 旗標（獨立於整個 scope 的 locked）
+    # 可能需要：evidence（例如「透過哪條 import edge 判斷」，供人類審查時參考）
+    # 可能需要：include/exclude 模式
+```
+
+**特別記錄一個具體需求，供未來設計時參考**：需要支援「human exclude」——使用者已經明確表示「這個
+檔案不屬於這個 scope」時，未來的 auto/model membership inference 不應該每次重新推導又建議加回去。
+目前的 schema（單純的 `files`/`symbols` 清單）沒有辦法表示「排除」，只能表示「包含」，這也是
+per-membership provenance 缺失暴露出的同一類限制。
+
+**本輪明確不做的事**：不修改 `Scope`/`ScopeMembers` 的 Pydantic model、不修改 SQLite `scope_files`/
+`scope_symbols` 表結構、不新增 migration。這是 multi-worktree reconciliation／穩定 scope 治理的
+實際需求暴露出來的 schema 限制，記錄下來供未來（可能是 V2）需要時參考，不是這輪或 M7 要交付的東西。

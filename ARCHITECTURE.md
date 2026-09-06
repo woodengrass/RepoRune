@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十六輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十七輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -67,7 +67,15 @@ custom tool 註冊的部分先前記錄本來就正確，不需修正。**第十
 `adapters/opencode/src/{rune-context,plugin,tool-paths}.ts` 與對應的 `node:test` 測試（20 個全綠），
 `rune-cli.ts` 補上 `bootstrapHard`/`bootstrapSoft`/`decisionPropose`/`constraintPropose`/`noteAdd`/
 `changedFilesFromGitStatus`；CLI 端的 `decision propose`/`constraint propose`/`note add` 補上
-`--json` 輸出供 custom tool 使用（317 個 Python 測試全綠）。本文件與
+`--json` 輸出供 custom tool 使用（317 個 Python 測試全綠）。**第十七輪是純設計文件修訂，不含任何
+程式碼變更**：補上 Milestone 7 完成後浮現的幾個部署/多 agent 協作層級的設計問題——安裝單位與部署
+模型（新第 14 節：machine-level install once、per-repo `rune init`、plugin 自動偵測 `.rune/` 且絕不
+自動 init、V1 不引入 daemon）、adapter/core 之間的 `protocol_version` 相容性契約（新第 15 節，M7
+的待完成 contract，本輪只定設計不改 CLI）、Git worktree／多 agent 協作模型與 merge reconciliation
+的 provenance 原則（新第 16 節）、把既有 §4.4 的 incremental scope 自動併入規則泛化成完整的 Scope
+Membership Reconciliation 設計（§4.4 新增小節，AUTO/KEEP/REVIEW/BROKEN 分類與 large-churn guardrail
+皆為未來待實作項，不是本輪程式碼交付）。這些新增內容全部標記為設計決議或 future backlog，**沒有
+一項在本輪被實作**，實作進度仍以文中各處明確標示的「已實作」/「未實作」為準。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -288,6 +296,52 @@ scope 是否「像人會畫的架構邊界」，再調整——這是刻意不�
    路徑**，因此只能用 §4.3 明定的 high-confidence 訊號（import edge），不能讓 best-effort reference
    的不確定性滲透進一個沒有人類審查的自動寫入動作。`locked` scope 永遠不受任何形式（clustering
    建議或 incremental 自動併入）影響，這是既有規則的延伸適用，不是新規則。
+
+**Scope Membership Reconciliation（第十七輪新增，純設計、未實作 CLI）——把上面第 3 點既有的
+incremental 自動併入規則，泛化成適用於任何「repo 在背後大幅變動後才被 rune 看到」的一般情境（多
+worktree merge 是最主要的觸發場景，見第 16 節，但規則本身不限定於 worktree）**：
+
+**核心原則：Scope 是穩定、漸進累積的 project knowledge，不是可以隨時重新計算的衍生資料。**
+`rune update`／未來的 `rune scope reconcile` 在任何情況下都**不得**把整個 repository 重新理解一遍、
+造成大規模 membership churn——這與 §4.4 開頭「Clustering 品質定位為建議實驗」的既有原則是同一件事的
+兩面：clustering 建議永遠只影響「這次要不要建立新 scope」，而 reconciliation 管的是「既有 scope
+的既有 membership 要不要因為 repo 變了就跟著變」，兩者都刻意迴避「AI 一次性重新設計整個架構圖」這種
+高風險、低必要性的操作。
+
+1. **Reconciliation 預設必須是 incremental，範圍限定在 changed set**：新增、修改、刪除、
+   重新命名（V1 若無法區分 rename 與「刪除+新增」，比照現有規則沿用 delete+add 語意即可，不用為此
+   新增偵測邏輯）的檔案／symbol，稱為 *changed set*。**只有 changed set 才是 reconciliation 的
+   auto-apply 對象**；沒有變更、只是被當作判斷 evidence 用的鄰近節點（例如 changed 檔案的
+   import/importer、owning scope、一層 graph neighbor）**不得**因為它被讀取為 evidence，就連帶被
+   改動 membership——這條規則稱為 **untouched region frozen**：沒有實際變更的既有 file/symbol，
+   membership 預設凍結，一般 incremental reconciliation 不得修改。
+2. **Auto-apply 沿用 §4.4 第 3 點既有的 high-confidence 判準，不放寬**：import edge、恰好命中單一
+   既有 unlocked scope，才能自動寫入；best-effort reference 不足以支撐 unattended write；任何
+   removal／move／模糊的重新指派，一律落回人類審查，不自動做。**不可僅因「模型現在覺得某檔案更像
+   另一個 scope」就自動搬移既有 membership**（例如 `foo.ts` 原本屬於 `authentication`，reconciliation
+   後模型認為更像 `session`）——沒有明確的 deterministic/high-confidence 證據時，只能產生 review
+   proposal，不能自動先移除再新增。
+3. **`locked` scope 與 human-confirmed membership 的保護，reconciliation 不得繞過**：任何形式的
+   auto reconciliation（incremental 或未來的 `--full`）都不得修改 `locked` scope 的 membership；
+   human 標記過的 membership 不得被自動移除或搬移。若一個 human/locked membership 指向的
+   file/symbol 已不存在，reconciliation 必須產生警告／要求人類審查，**不得由 AI 自行悄悄清掉**——
+   現有 `Scope`／`ScopeMembers` schema（DATA_MODEL §2.3）沒有 per-membership 層級的
+   provenance/locked 欄位可以精確表示「這一條 membership 是誰加的、能不能被自動改」，這是本輪發現、
+   但刻意不在這裡動 schema 的限制，記錄為 future improvement，見 DATA_MODEL.md §9。
+4. **Full reconciliation 必須是明確 opt-in（未來可能的 `rune scope reconcile --full`），且輸出只能
+   是 candidate/proposal/diff，不得靜默改寫 canonical membership**——即使是 `--full` 模式，
+   `locked`／human-authoritative membership 一樣受保護，不因為使用者選了 `--full` 就取消這條防線。
+5. **Large churn guardrail**：若一次 incremental reconciliation 推導出的 membership 變更量明顯超出
+   changed set 應有的合理範圍，判定為 suspicious，中止自動套用，要求人類審查。**本輪刻意不鎖死具體
+   threshold**（絕對數量、changed-file-based 比例都是候選做法）——架構層只鎖死「非預期的大量 churn
+   絕不能自動套用」這條不變式，數值交給未來實作/`config.toml` 決定，避免現在鎖一個沒有真實資料佐證
+   的數字。
+6. **概念上的四種 reconciliation 結果分類（未來 CLI 輸出格式，本輪只定概念、不實作）**：`AUTO`（新
+   檔案依既有規則自動併入某 scope）、`KEEP`（既有 human-authoritative membership 不變）、`REVIEW`
+   （模糊的重新指派/移除/多個候選 scope，需要人類決定）、`BROKEN`（human/locked membership 指向的
+   目標已消失）。連同 changed files 數、auto-applied 數、review 數、維持不變的既有 membership 數、
+   suspicious churn 旗標一起呈現——這是未來 `rune scope reconcile` 實作時的輸出需求規格，記錄進
+   IMPLEMENTATION_PLAN.md 的待辦清單，本輪不實作 CLI。
 
 ### 4.5 Semantic Worker（`core.semantic`）
 針對過期／缺漏的 scope summary，用該 scope 的成員檔案／symbol 組 prompt，呼叫設定的 `ModelProvider` 取得
@@ -741,6 +795,38 @@ session 之間狀態互不外洩。`extractPathsFromToolArgs()`（`tool-paths.ts
 `*** Add/Update/Delete File:` 標記——**這組欄位名稱未對照真實 host 驗證過**，猜錯的後果是「這次
 tool 呼叫沒有觸發任何 context 注入」（fail open，不是注入到錯的路徑）。
 
+### 6.2 Adapter/Core protocol compatibility——`protocol_version`（第十七輪新增，純設計，M7 待完成
+contract，本輪不改任何 CLI schema）
+
+**問題**：Python `rune` CLI 是 machine-level 安裝一次（見第 14 節），OpenCode adapter 是獨立的 npm
+套件，兩者各自升級、版本號彼此無關。若 adapter 假設某個 `--json` 輸出一定長某個形狀，而使用者升級了
+其中一邊，schema 不相容時**絕不能靜默 best-effort 解析**——那等於用錯誤或不完整的資料驅動 agent
+行為，比直接失敗更危險。
+
+**設計決議**：
+
+- 所有面向 adapter（未來也包含 MCP，見第 8 節）的 `--json` 輸出，其頂層物件應包含
+  `protocol_version: int`，例如：
+  ```json
+  {
+    "protocol_version": 1,
+    ...
+  }
+  ```
+- **`protocol_version` 是 adapter/core 介面版本，不是 RepoRune/`rune` 套件本身的版本號**——套件版本
+  可以頻繁變動（bug fix、功能新增），只要輸出的 JSON 形狀沒變，`protocol_version` 就不動；只有當
+  既有欄位的意義、必要性、或形狀改變到「舊版 adapter 解析新版輸出會出錯或誤解」的程度，才遞增。這條
+  跟現有 `CACHE_SCHEMA_VERSION`（materialize.py，管的是 SQLite 衍生 cache 形狀）、canonical
+  `schema_version`（管 JSONL 檔案形狀）是同一種精神在不同層級的應用：**「形狀變了就換版號，讀者版號
+  不符就拒絕、絕不假裝相容」**，不是本輪發明新原則，只是把既有精神延伸到 adapter/core 這條邊界。
+- **adapter 遇到不支援的 `protocol_version` 必須大聲失敗**，錯誤訊息需明確指出「core 與 adapter
+  版本不相容，需要升級其中一方」，不得吞掉錯誤或嘗試用舊邏輯硬解析新形狀（或反之）。這與
+  ARCHITECTURE 其餘地方反覆出現的「大聲失敗優於靜默錯誤」原則（例如第 7.7 節 hard bootstrap
+  overflow、`CanonicalConflictError`）完全一致。
+- **本輪不要求立即修改所有既有 `--json` 命令加上這個欄位**——那是實作工作，留給 Milestone 7 收尾時
+  一次性補齊（IMPLEMENTATION_PLAN.md 已記錄為 M7 contract 待辦項），本輪只確認設計、把它列為
+  M7 完工前必須補上的契約，不是「現在已經做了」。
+
 ## 7. Global Code Standards / Hard-Soft Bootstrap（本輪新增，agent-injection semantics 的正式一部分）
 
 這不是附加功能，而是 rune V1 agent-injection semantics 的正式組成部分，與規格 §34-38 的 constraint
@@ -960,7 +1046,10 @@ summary 掛不到 scope、scoped Decision/Constraint 失去 target、clustering 
 `materialize.py` 解析 canonical JSONL 時發現同一 `(record_id, revision)`／`(id, revision)` 重複，
 視為 canonical 衝突，中止該次 materialize 並由 `rune doctor`/`rune update` 回報，絕不自動選一筆默默
 採用。細節與未來多人協作的可能演進方向（`revision_id` 改為 ULID + `parent_revision_id`）見
-DATA_MODEL §8；V1 不為此預先設計。
+DATA_MODEL §8；V1 不為此預先設計。**第十七輪確認：git worktree 是這條限制最主要的真實觸發場景**
+（同一 repo 多個 worktree 平行工作，本質上就是「多個 branch 各自推進」的具體案例），第 16 節記錄
+worktree／多 agent 協作的完整 workflow，但這裡的 invariant 本身不因此改變——worktree 場景不觸發任何
+新的 schema 或 revision 機制設計，仍然是「偵測到衝突就拒絕、要求人類解決」。
 
 ## 13. 測試策略（另見 IMPLEMENTATION_PLAN.md 測試計畫章節）
 兩個 fixture repo（`tests/integration/fixtures/ts-simple`、`python-simple`）驅動 init -> update ->
@@ -969,3 +1058,211 @@ DATA_MODEL §8；V1 不為此預先設計。
 redaction、FTS 索引（規格 §65）。**Windows 相容性不獨立立項，併入既有整合測試**（本輪確認降低優先
 級）：fixture repo 內含 Unicode 路徑、中文檔名、CRLF 換行的檔案，驗證 hashing/atomic-write/git
 subprocess（UTF-8 編碼）在這些輸入下行為正確。
+
+## 14. 部署模型與安裝單位（第十七輪新增，純設計，本輪不改任何程式碼）
+
+Milestone 7 完工後才第一次需要正式回答「這個工具實際上怎麼裝到使用者機器上」，本節記錄確認結果。
+
+### 14.1 Repo 結構與 package 邊界
+
+`rune` core（Python）與 `adapters/opencode`（TypeScript）放在同一個 Git repository，但是**獨立的
+installation unit**——這是既有第 2 節目錄結構早就長這樣（`src/rune/` 與 `adapters/opencode/` 平行），
+本輪只是把「為什麼可以同 repo 不同安裝單位」正式寫下來，不是新的目錄結構決定：
+
+- Python 端：`rune` CLI／`RepoRune` package（`pyproject.toml`，`pip install`／未來可能的
+  `pipx install`）。
+- TypeScript 端：OpenCode adapter（`adapters/opencode/package.json`，npm 套件）。
+
+**具體 package 名稱本輪不鎖死**——`pyproject.toml`／`package.json` 目前的 `name` 欄位（`rune`、
+`rune-opencode-adapter`）是開發階段用的內部名稱，正式發布時的公開套件名稱是獨立的產品/命名決策，
+不屬於這輪的架構討論範圍，等真的要發布時再確認。
+
+### 14.2 Machine-level install once，per-repo `rune init`
+
+**Rune 應用程式本身（`rune` CLI）是機器層級安裝一次，不是每個 project 各裝一份**：
+
+```text
+User machine
+├─ rune executable / RepoRune package        （裝一次）
+├─ OpenCode Rune adapter                      （裝一次）
+├─ repo A/.rune/                              （per-repo state）
+├─ repo B/.rune/
+└─ repo C/.rune/
+```
+
+每個 project 只需要 **project-local 的 Rune state**：跑 `rune init` 建立 `.rune/`，canonical
+memory／`config.toml`／local cache 全部落在該 repo 目錄下（既有第 2、11 節已經是這個設計，本輪只是
+明確標註「安裝」與「初始化」是兩個不同層級的操作，不要混為一談）：
+
+> Install Rune once. Initialize Rune per repository.
+
+### 14.3 OpenCode plugin 的偵測與啟用規則
+
+OpenCode plugin **也應該只安裝一次**，不是每個 project 各自複製一份 plugin 程式碼。Plugin 啟動
+（`Plugin` 工廠函式收到 `PluginInput`，見第 6.1 節）時：
+
+1. 從 OpenCode 提供的 `directory`/`worktree` 判斷所在的 repository。
+2. 偵測該 repository 是否存在 `.rune/`。
+3. 存在 → 啟用 Rune integration（第 6、7 節描述的整套 hook 行為）。
+4. 不存在 → **silent no-op**——不報錯、不提示、不影響 OpenCode 其他功能，就當作這個 repo 沒有裝
+   Rune 一樣正常運作。
+
+**Plugin 絕對不可自動執行 `rune init`。** `rune init` 是使用者明確選擇導入 Rune governance（Decision/
+Constraint/Note 治理、scope 系統）的動作，不是「plugin 偵測到沒有 `.rune/` 就自動幫你建一個」——這
+會在使用者完全不知情的狀況下，把一個治理系統的初始狀態悄悄種進他們的 repo，違反本專案處處強調的
+「human-in-the-loop、不自動做有持久後果的決定」精神（同一原則見第 7.9 節 Global MUST 一樣要走
+propose/approve、第 4.4 節 clustering 永遠只建議）。
+
+### 14.4 CLI discovery
+
+Adapter 呼叫 `rune` CLI 的方式（`adapters/opencode/src/rune-cli.ts`，第 6 節）：
+
+- **預設從 PATH 呼叫 `rune`**——對應「機器層級安裝一次」的預期部署方式。
+- **保留 `RUNE_CLI_PATH` 環境變數覆寫**——主要供開發、測試、CI，或還沒把 `rune` 放進全域 PATH 的
+  特殊部署情境使用，不是正式部署的主要路徑。
+
+這是既有實作已經做的事（`rune-cli.ts` 從 Milestone 7 spike 就這樣寫），本輪只是把它記錄成正式的
+部署設計決策，不是新行為。
+
+### 14.5 V1 不引入 daemon；MCP server 的定位
+
+**V1 明確不引入 daemon/server 常駐程序**：OpenCode plugin 呼叫 `rune` CLI 的方式就是每次
+subprocess + `--json` 輸出（見第 6 節），沒有長駐 process、沒有 IPC、沒有需要管理生命週期的背景
+服務。這保持了「adapter 唯一合法介面是 CLI 的 `--json` 輸出」（第 6 節既有規則）的簡單性，也避免
+daemon 帶來的額外複雜度（多 client 併發存取同一份 state、daemon crash 恢復、版本升級時如何優雅
+重啟等）在 V1 完全不需要處理。
+
+第 8 節的 MCP server（Milestone 8）**保留作為未來 Codex／Claude Code／其他 generic MCP client 的
+整合手段**，但**不是 OpenCode V1 整合的必要依賴**——OpenCode 走 CLI subprocess，不透過 MCP。MCP
+server 本身要不要以 daemon 形式常駐，是 Milestone 8 開工時才需要回答的問題，不在本輪討論範圍。
+
+## 15. Adapter/Core Protocol Compatibility
+
+（`protocol_version` 的完整設計已併入第 6.2 節，緊鄰它所規範的 adapter/core `--json` 介面邊界，
+避免同一個契約分散在文件兩個不相鄰的地方。此處保留章節編號僅作為目錄索引用途。）
+
+## 16. Git Worktree 與多 Agent 協作模型（第十七輪新增，純設計，本輪不改任何程式碼）
+
+### 16.1 為什麼需要這節：worktree 是「多個 agent 平行工作在同一個 repo」的常見部署形態
+
+```text
+main
+├─ worktree A → agent A / issue A
+├─ worktree B → agent B / issue B
+└─ worktree C → agent C / issue C
+```
+
+每個 worktree 會各自 checkout 一份完整的 `.rune/` canonical 檔案（因為它們是 git-tracked 檔案，
+跟著 branch 走）。這一節記錄「多個 worktree 平行工作、最終需要 merge」這個場景下，Rune 的哪些部分
+該怎麼表現——**這不是新的儲存機制或新的 revision schema，是既有機制（canonical vs derived 分離、
+單一寫入者假設、既有的 incremental scope 併入規則）在多 worktree 場景下的行為說明與 workflow
+建議**。
+
+### 16.2 Derived 與 canonical 狀態的 per-worktree 行為
+
+- **`.rune/cache/`（`memory.db`）、`.rune/logs/` 等 derived/local state**：per-worktree、
+  gitignored（既有規則，見第 2、11 節）、**不參與 git merge**、需要時直接 `rune rebuild-cache`
+  重建即可——這本來就是「SQLite 是完全衍生的 cache」這條既有核心原則（第 3、7 節）在多 worktree
+  情境下的自然結果，不需要為 worktree 場景另外設計同步機制。
+- **Canonical memory**（`scopes.json`、`decisions.jsonl`、`constraints.jsonl`、`notes.jsonl` 等）：
+  跟著 branch/worktree，**會參與正常的 git merge**。不同 logical record 之間的 append-only 變更，
+  原則上可以直接保留為 union（git 本身的 line-based merge 通常就能處理，因為每個 record 是獨立的
+  JSONL 行）。
+- **同一個 logical record（同一 `record_id`/`id`）的 revision 在不同 worktree 各自往下推進、merge
+  後撞號**：這正是第 12 節、DATA_MODEL §8 已經定義的「單一寫入者假設」衝突場景，**V1 不自動
+  resolve**——現有的 duplicate logical revision 偵測與 single-writer 保護機制直接適用，不需要為
+  worktree 新增任何邏輯：偵測到衝突就大聲失敗，由人類或下方 16.4 節的 integration session 決定
+  如何 reconcile。**V1 本輪依然不把 `revision` 改成 ULID + parent revision DAG**——那是既有記錄
+  在案的 future/V2 候選方向（DATA_MODEL §8），worktree 這個新場景不構成「現在就該做」的理由。
+
+### 16.3 Parallel worktree 的 authoritative-memory workflow：允許與不允許的操作
+
+**平行工作的 agent worktree 可以**：
+- 讀取正式的 Rune memory（`rune search`／`rune check`／`rune scope-for`／`rune bootstrap`）。
+- 修改程式碼。
+- 建立 Note（無需核准，第 4.6 節既有語意，本輪不變）。
+- 建立 Decision/Constraint proposal（`propose`，仍待核准，第 4.6、7.9 節既有語意，本輪不變）。
+
+**平行工作的 agent worktree 原則上不應該**：
+- 同時批准（`approve`）同一個 Decision/Constraint 的 authoritative revision——批准是產生 canonical
+  真相的動作，多個 worktree 各自批准同一筆會直接製造 16.2 節描述的 revision 衝突。
+- 把 branch-local 的 semantic refresh（`rune update` 觸發的 scope summary 重新生成）當成「merge
+  之後的最終權威 semantic state」——branch-local 的程式碼還沒有反映 merge 後的真實狀態，這份
+  summary 只對這個 worktree 自己當下的程式碼有效。
+
+### 16.4 Integration worktree／integration session 的角色
+
+負責把平行工作收斂成一份權威狀態：
+
+- Merge 程式碼。
+- Resolve canonical 衝突（16.2 節描述的 revision 撞號，需要人類或人類授權的 integration session
+  介入，不是自動化步驟）。
+- Review／approve 治理 proposal（Decision/Constraint 的批准動作集中在這裡執行，避免 16.3 節提到的
+  平行批准衝突）。
+- 執行最終的 `rune update`（在 merge 後的程式碼上重新跑一次決定性索引）。
+- 執行最終的 semantic refresh（在 merge 後的程式碼上重新生成過期的 scope summary，取代任何
+  branch-local 的 semantic 結果）。
+- 執行最終的 scope reconciliation（見 §4.4 新增的 Scope Membership Reconciliation 規則，
+  16.5-16.6 節）。
+
+### 16.5 Merge reconciliation 的 provenance 原則（架構層正式原則）
+
+> **Merge reconciliation follows provenance.**
+
+即：判斷「merge 之後這份狀態該怎麼處理」的依據，是這份狀態的來源是什麼，而不是「AI 現在看著 merge
+後的程式碼、覺得應該長怎樣」。具體分類：
+
+**可以在 merge 後從 merged repository 重新產生**（derived/reproducible state，既有機制直接適用，
+不需要為 merge 場景另外設計）：
+- File index、symbol index、import/reference graph（`core.index`，第 4.1、4.2 節既有機制）。
+- 衍生 SQLite cache（`rune rebuild-cache`，完全衍生，第 3、7 節既有原則）。
+- Semantic summary（`core.semantic`，第 4.5 節既有機制——但僅限「重新生成」本身允許，*寫入*仍要走
+  既有的 staleness/refresh 邏輯，不是 merge 觸發就无条件整批重跑）。
+- Auto-inferred scope membership——**但受 §4.4 新增的 Scope Membership Reconciliation 規則限制**
+  （16.6 節），不是「可以隨便重新推導」。
+
+**不可以由 AI 根據 merge 後的程式碼自動重新發明**（human-authoritative state，只能 merge 或明確
+reconcile，絕不能被「根據現在的 code 重新生成一份新的權威版本」取代）：
+- 已核准的 Decision。
+- 已核准的 Constraint。
+- Human-authoritative 的 Scope 定義（`locked` scope、`ScopeSource.human` 的 scope 本身）。
+- `locked` membership。
+- Human-confirmed 的 membership（即使該 scope 本身不是 `locked`，個別由人類確認過的 membership
+  一樣受保護，見 16.6 節）。
+
+**AI 對治理層的 merge 衝突可以提 reconciliation proposal（例如「這個 Decision 在兩個 worktree
+各自被修改，建議合併成……」），但不能自己成為 authoritative**——批准權仍在人類手上，這與第 7.9 節
+「Global MUST 一樣要走 propose/approve」是同一條原則的延伸適用。
+
+### 16.6 Scope membership 在 merge 後的 reconciliation：適用 §4.4 的規則，不是重新設計
+
+Merge 後的 scope membership reconciliation，完整規則寫在第 4.4 節新增的「Scope Membership
+Reconciliation」小節（untouched region frozen、auto-apply 限定 high-confidence 且僅限 changed
+set、`locked`/human-confirmed membership 絕對保護、large churn guardrail、AUTO/KEEP/REVIEW/BROKEN
+四種結果分類），這裡不重複，只強調一點：**merge 後的 reconciliation 用的是同一套規則，不是給
+worktree 場景另外發明一套「合併後重新分類全部 scope」的邏輯**——這正是 §4.4 開頭「Rune 不得在正常
+update／merge reconciliation 時重新理解整個 repository」這句話特別把 merge reconciliation 也點名
+在內的原因。
+
+**若目前程式已經會在一般 `rune update` 對「新增檔案」自動寫 `scopes.json`（第 4.4 節既有的
+incremental 自動併入規則，Milestone 4 已實作）**：這個行為繼續保留，不因為本輪新增 worktree/merge
+討論就改變或停用；只是現在明確補上一句——**multi-worktree 情境下，真正權威的 reconciliation 以
+merged tree 為準**，也就是說：branch-local 的 `rune update` 若在合併前就已經對某個新檔案觸發了
+incremental 自動併入（因為當時只看得到 branch-local 的 import graph），這筆自動寫入的
+`scopes.json` 變更會隨著 git merge 一起帶進 integration worktree；**integration reconciliation
+仍然需要在 merged state 上重新驗證**——如果 merge 後這個檔案的 import graph 因為其他 worktree 帶進
+的變更而不再滿足「恰好命中單一 unlocked scope」的條件（例如 merge 後多了一個候選 scope），這筆
+membership 就不再自動視為有效，需要落回人類審查，不是「因為之前 branch-local 已經自動寫過了，
+merge 後就自動維持」。
+
+## 17. Milestone 7 待完成 contract 清單（第十七輪新增，索引用途，避免散落各節找不到）
+
+本輪（第十七輪）新增的設計，有幾項明確標記為「尚待實作」，這裡集中列出，完整細節見各自章節與
+IMPLEMENTATION_PLAN.md 對應的待辦條目：
+
+1. **`protocol_version` 加進既有 `--json` 輸出**（第 6.2 節）——本輪只定義設計，未修改任何 CLI。
+2. **`rune scope reconcile`（含 `--full`）與 AUTO/KEEP/REVIEW/BROKEN 輸出格式**（第 4.4 節新增
+   小節）——本輪只定義概念與規則，未實作 CLI 命令，也未鎖定 large-churn threshold 的具體數值。
+3. **Scope membership 的 per-membership provenance schema**（`ScopeMembership` 概念，第 4.4/16.6
+   節提及，完整內容見 DATA_MODEL.md §9）——本輪明確記錄為 future/V2，不在這輪或 Milestone 7 修改
+   `Scope`/`ScopeMembers` schema。

@@ -1923,3 +1923,90 @@ session 狀態互不外洩。新增 4 個 Python regression test（三個 `--jso
 `experimental.chat.system.transform` 的實際行為（是否真的每次呼叫前執行、`output.system` 的實際
 用法）都只驗證到「型別檢查通過」，沒有驗證到「真的在 OpenCode 裡跑起來符合預期」，這是 Milestone 7
 交付前最後需要用真實 host 驗收的部分。
+
+### 第四輪修訂（純設計文件修訂，不含任何程式碼變更——部署模型、`protocol_version`、git worktree／
+多 agent 協作、scope reconciliation 治理）
+
+使用者要求針對 Milestone 7 spike 完成後浮現的幾個部署/協作層級問題，先只修訂 ARCHITECTURE.md／
+DATA_MODEL.md／IMPLEMENTATION_PLAN.md／HANDOFF.md 四份文件，本輪明確不寫程式碼。逐項對照現有文件
+確認無矛盾（見下方「一致性檢查」）後，新增以下正式設計決議：
+
+141. **部署模型與安裝單位**（ARCHITECTURE.md 新第 14 節）：`rune` core（Python）與
+    `adapters/opencode`（TypeScript）同 repo、不同 installation unit，具體 package 名稱本輪不鎖死。
+    確認「machine-level install once，per-repo `rune init`」的部署模型；OpenCode plugin 啟動時
+    偵測 `.rune/` 是否存在決定是否啟用（不存在則 silent no-op），**plugin 絕對不可自動執行
+    `rune init`**——這是使用者明確導入 governance 的動作，不是 plugin 可以代為決定的事。CLI
+    discovery 沿用既有的 PATH + `RUNE_CLI_PATH` override（既有實作行為，本輪只是正式記錄成部署
+    設計）。確認 V1 不引入 daemon；MCP server（Milestone 8）保留作未來 generic client 整合手段，
+    不是 OpenCode V1 的必要依賴。
+142. **`protocol_version` adapter/core 相容性契約**（ARCHITECTURE.md 新第 6.2 節）：所有面向
+    adapter（未來含 MCP）的 `--json` 輸出頂層應包含 `protocol_version: int`，語意上是「adapter/core
+    介面版本」，跟 RepoRune 套件版本、`CACHE_SCHEMA_VERSION`、canonical `schema_version` 都是各自
+    獨立的版號，只在輸出形狀變動到舊版 adapter 會解析錯誤的程度才遞增。Adapter 遇到不支援的
+    `protocol_version` 必須大聲失敗，明確提示「core/adapter 版本不相容」，不允許 schema 不相容時
+    silently best-effort parse。**本輪只定義設計，未修改任何現有 CLI `--json` 輸出**——列為
+    Milestone 7 收尾前必須補齊的 contract，見下方「尚待實作」清單。
+143. **Git worktree／多 agent 協作模型**（ARCHITECTURE.md 新第 16 節）：確認 worktree 場景下
+    derived state（cache/logs）per-worktree、gitignored、不參與 merge；canonical memory 跟著
+    branch 走、正常參與 git merge；同一 logical record 的 revision 衝突沿用既有「單一寫入者假設」
+    （第 12 節、DATA_MODEL §8），**不自動 resolve，不改成 ULID revision graph**。定義 parallel
+    worktree 允許做（讀 memory、改程式碼、建 Note、建 proposal）與不應該做（同時批准同一筆
+    Decision/Constraint、把 branch-local semantic refresh 當成 merge 後權威狀態）的邊界；定義
+    integration worktree 的角色（merge 程式碼、resolve canonical 衝突、review/approve 治理
+    proposal、跑最終 `rune update`／semantic refresh／scope reconciliation）。
+144. **Merge reconciliation 的 provenance 原則**（ARCHITECTURE.md §16.5，正式架構原則）：
+    "Merge reconciliation follows provenance." Derived/reproducible state（file/symbol/graph
+    index、衍生 SQLite cache、semantic summary、受 §4.4 規則限制的 auto-inferred scope
+    membership）可以在 merge 後重新產生；human-authoritative state（已核准 Decision/Constraint、
+    human-authoritative scope 定義、`locked`/human-confirmed membership）不可由 AI 根據 merged
+    code 自動重新發明，只能 merge 或明確 reconcile。AI 對治理層衝突可以提 reconciliation
+    proposal，但不能自己成為 authoritative——與既有第 7.9 節「Global MUST 一樣要走 propose/approve」
+    同一條原則的延伸適用。
+145. **Scope Membership Reconciliation**（ARCHITECTURE.md §4.4 新增小節，泛化既有第 4.4 節第 3 點
+    的 incremental 自動併入規則，**本輪最重要的新規則**）：明確 reconciliation（含未來
+    `rune update`／`rune scope reconcile`）預設必須 incremental，範圍限定在 changed set（新增/
+    修改/刪除/重新命名的檔案與 symbol），沒有實際變更、只作為 evidence 使用的鄰近節點——
+    **untouched region frozen**，不因為被讀取為 evidence 就連帶被改動 membership。Auto-apply 沿用
+    既有 high-confidence 判準（import edge + 恰好單一候選 + unlocked），**不因為「模型現在覺得更像
+    另一個 scope」就自動搬移既有 membership**，沒有 deterministic 證據一律落回 review proposal。
+    `locked` scope 與 human-confirmed membership 絕對保護，即使未來的 `--full` 模式也不能繞過，
+    輸出只能是 candidate/proposal/diff，不能靜默改寫 canonical membership。**Large churn
+    guardrail**：非預期的大量 membership 變更必須中止自動套用、要求人類審查，**本輪刻意不鎖死具體
+    threshold 數值**（絕對數量 vs. changed-file-based 比例都是候選做法，留給未來實作/config 決定）。
+    概念上定義 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 四種 reconciliation 結果分類供未來 CLI 輸出格式
+    參考。**明確保留現有已實作行為**：Milestone 4 已實作的「`rune update` 對新增檔案 incremental
+    自動併入」繼續生效，不因本輪新增 worktree/merge 討論而改變或停用；只補上一句
+    multi-worktree 情境下的釐清——branch-local 的自動併入結果會隨 git merge 帶入 integration
+    worktree，但 integration reconciliation 仍需在 merged state 上重新驗證這筆 membership 是否
+    依然滿足既有的自動寫入條件，不是「因為之前寫過了就自動視為有效」。
+146. **Scope membership 缺乏 per-membership provenance——記錄為 future/V2 schema 限制**
+    （DATA_MODEL.md 新第 9 節）：現行 `ScopeMembers`（`files`/`symbols` 純清單）無法回答某條
+    membership 是 human／model／auto 哪一種來源、是否 human-confirmed，這是 §4.4/§16.6 的
+    reconciliation 規則依賴到、但現行 schema 沒有欄位可以精確表示的限制。記錄未來可能的
+    `ScopeMembership` 概念草稿（`scope_id`/`target_type`/`target`/`source`/可能的
+    locked/evidence/include-exclude 欄位）與「human exclude」的具體需求（避免使用者明確排除的
+    檔案被 auto inference 每次重新建議加回），**本輪與 Milestone 7 皆不修改 `Scope`/`ScopeMembers`
+    Pydantic model 或 SQLite `scope_files`/`scope_symbols` 表結構**。
+147. **OpenCode adapter 的並行開發邊界**（HANDOFF.md 新增小節，M7 實作指引）：`adapters/opencode/**`
+    可由另一個 agent 並行開發，範圍不得碰 `src/rune/**`、Python tests、canonical/data model 商業
+    邏輯。Plugin 的職責邊界收斂為「呼叫 CLI、解析 JSON、render OpenCode 專屬 context、注入、session
+    state、dedup、path extraction、host hooks、custom tool wrapper」，不得反過來去 Python core
+    補業務邏輯；若 plugin 需要尚未存在的 CLI endpoint，先定義 TypeScript interface、在 plugin
+    測試裡 mock，等 integration 階段才真正接線——這是既有 `RuneClient` 介面設計（見上方第三輪第 137
+    條）已經在遵循的模式，本輪把它明確寫成給未來並行開發者的指引，不是新的程式碼結構。
+
+**一致性檢查（使用者要求逐項確認）**：對照 ARCHITECTURE/DATA_MODEL/IMPLEMENTATION_PLAN/HANDOFF
+現有內容，沒有發現與上述新決議矛盾之處——`adapters/opencode/` 的目錄結構、CLI discovery
+（PATH/`RUNE_CLI_PATH`）、既有 incremental scope 自動併入規則、DATA_MODEL §8 的單一寫入者假設，
+本輪新增內容都是既有設計的正式化或泛化，不是推翻既有決議；沒有發現需要使用者裁決的矛盾，因此本輪
+未使用 AskUserQuestion。
+
+**尚待實作（本輪只完成設計，以下皆未動程式碼，不要誤讀為已完成）**：
+- `protocol_version` 加進既有 `--json` 輸出（第 142 條，ARCHITECTURE §6.2）。
+- `rune scope reconcile`（含 `--full`）CLI 命令與 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 輸出格式，以及
+  large-churn threshold 的具體數值（第 145 條，ARCHITECTURE §4.4）。
+- `ScopeMembership` per-membership provenance schema——future/V2，非近期待辦（第 146 條，
+  DATA_MODEL §9）。
+
+本輪未新增任何測試（沒有程式碼變更可測）；317 個 Python 測試、20 個 TypeScript 測試維持上一輪的
+綠燈狀態不變。
