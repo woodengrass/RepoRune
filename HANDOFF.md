@@ -1,6 +1,11 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-06，Milestone 4 已實作、完成驗證、commit `edd87d8`。之後兩輪自我複查／使用者轉述
+最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成、commit `4cb6e29`——**尚未接過
+真實 OpenCode host 驗收**，是目前唯一剩下的工作，細節見文末「立刻可以做的下一步」。以下段落按時間
+順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原「為什麼是這樣做」的完整脈絡；只要看結論，
+直接跳到「立刻可以做的下一步」即可。
+
+之後兩輪自我複查／使用者轉述
 外部 finding 各修正若干問題：`rune scope suggest` 崩潰 bug（IMPLEMENTATION_PLAN.md 第 50 條）；接著
 使用者轉述 6 條 Milestone 3／4 finding，逐條重現後全部確認為真並修正（第九輪修訂，見 IMPLEMENTATION_
 PLAN.md 第 51-56 條）：unchanged caller 的 reference edge 不會重新解析、Python/TS 的
