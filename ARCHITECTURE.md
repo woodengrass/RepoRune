@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十一輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十二輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -35,10 +35,13 @@ review，5 條 finding 全部確認為真並修正**：SQLite cache 沒有 schem
 直接回傳舊摘要文字、只能指向真實原始碼；provider 健康檢查改成三層（設定錯誤直接攔下要求修正、
 rate limit 提示使用者、其他錯誤 retry 一次後大聲失敗但不擋決定性索引）。**第十一輪完成第十輪確認
 設計的實作**：`check_semantic_health`（三層健康檢查）、`ModelProvider.probe()`、`ProviderError.
-status_code`/`is_rate_limited`、`mark_possibly_stale`、CLI 依健康狀態決定 exit code，並在實作中
-發現並修正一處對第十輪原始措辭的必要澄清——「`enabled=True` 但 `model` 為空字串」（每個全新專案
-的預設狀態）改歸類為靜默跳過而非設定錯誤，避免所有未設定過 semantic 的專案每次 `rune update` 都
-無謂地大聲失敗，細節見第 4.5 節與文末「第十五輪修訂」。本文件與
+status_code`/`is_rate_limited`、`mark_possibly_stale`、CLI 依健康狀態決定 exit code。實作時一度把
+「`enabled=True` 但 `model` 為空字串」（每個全新專案的預設狀態）改歸類為靜默跳過，但使用者明確
+要求改回：專案部署完成後就應該正確填入設定，`model` 空字串也必須算設定錯誤、大聲失敗，**第十二輪
+撤回這個簡化，恢復成第十輪原始措辭**——`model` 空字串跟 API key 缺一樣，只要 `semantic.enabled=
+true` 就是設定錯誤，不因為是預設值就特殊放行；受影響的既有測試（假設「什麼都不設也能正常跑
+update」的測試）改成明確加上 `semantic.enabled=false` 才算未使用 semantic 這個前提。細節見第 4.5
+節與文末「第十五輪修訂」「第十七輪修訂」。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -378,16 +381,16 @@ API key／`semantic.enabled=false`／預算用完）時，一個已經變 stale 
    ```text
    config.semantic.enabled != true
      → 維持現狀：使用者刻意關閉，靜默跳過，不是錯誤
-   config.semantic.enabled == true 但 model 是空字串
-     → 視同 disabled，靜默跳過，不印任何訊息（見下方「實作時發現並修正」）
-   config.semantic.enabled == true 且 model 非空：
+   config.semantic.enabled == true：
      Step 1（純靜態檢查，不呼叫網路）：
-       對應 provider 的 API key 環境變數沒設，或 provider 名稱不是已知的
-       openrouter/openai
+       model 是空字串，或對應 provider 的 API key 環境變數沒設，或
+       provider 名稱不是已知的 openrouter/openai
          → 這是設定錯誤，不是暫時性問題：印出明確訊息告訴使用者缺什麼、
-           怎麼補（例如「OPENROUTER_API_KEY is not set」），這次 semantic
-           整段跳過，但決定性程式碼索引照常完成，CLI 對這個狀態回傳
-           exit code 1（「在初始啟動的時候就報錯」，不能讓錯誤悄悄擴大）
+           怎麼補（例如「semantic.model is empty」或「OPENROUTER_API_KEY
+           is not set」），這次 semantic 整段跳過，但決定性程式碼索引照常
+           完成，CLI 對這個狀態回傳 exit code 1（「在初始啟動的時候就
+           報錯」，不能讓錯誤悄悄擴大；`model` 空字串跟 API key 沒設一樣
+           算設定錯誤，不因為是預設值就特殊放行——見下方「第十二輪修訂」）
      Step 2（僅 Step 1 通過才做，一次輕量連線測試呼叫，`ModelProvider.
      probe()`：max_tokens=1、強制關閉 reasoning，避免 thinking model 把
      這一點點 budget 燒在 reasoning 上而誤判為探測失敗）：
@@ -408,16 +411,16 @@ API key／`semantic.enabled=false`／預算用完）時，一個已經變 stale 
    的 `update` 指令把 `run_update` 回傳的 `semantic_health_status`/`semantic_health_message`
    從一般 stats k=v 那行拆出來，另外印一行、且依狀態決定 exit code，不會被埋沒在一堆數字裡。
 
-   **實作時發現並修正的一點（相對於第十輪文件原始措辭的修正）**：原始設計把「model 是空字串」跟
-   「API key 沒設」一起歸類為 Step 1 的「設定錯誤」。但 `SemanticConfig` 的預設值正是
-   `enabled=True, model=""`——也就是說每一個從沒碰過 semantic 設定的全新專案都會落在這個狀態，
-   若真的當成「設定錯誤」處理，會讓每個從未設定過 semantic 的專案在每一次 `rune update` 都大聲
-   失敗，這既不是使用者的本意也不是「打錯字/忘記 export」這種情境（那兩個情境都預設使用者*已經*
-   嘗試設定了什麼）。因此在實作時把「`enabled=True` 但 `model` 是空字串」重新歸類為等同
-   `disabled`（靜默跳過，不印訊息），把 `config_error`（連同 CLI 的 exit code 1）保留給「使用者
-   確實設定了 model，但缺 API key 或 provider 名稱打錯」這種更貼近原意的情境。這是實作過程中發現
-   的必要澄清，不是重新開放已確認的設計本身——三層檢查的結構、`possibly_stale` 的觸發規則、
-   retrieval 端不顯示舊摘要的規則都完全比照第十輪的決議。
+   **第十二輪修訂：`model` 空字串維持算設定錯誤，撤回第十一輪一度做的簡化**。第十一輪實作時，
+   因為 `SemanticConfig` 的預設值正是 `enabled=True, model=""`——也就是每一個從沒碰過 semantic
+   設定的全新專案都會落在這個狀態——曾經一度把這個狀況重新歸類為等同 `disabled`（靜默跳過），
+   理由是若照 Step 1 原字面意思處理，每一個未設定過 semantic 的專案都會在每次 `rune update` 大聲
+   失敗。**使用者明確不同意這個簡化，予以撤回**：這個專案完工、被別人部署使用時，理當已經正確
+   填入 API 設定，`model` 空字串不該被當成「還沒設定、暫時放行」的特例，而應該跟 API key 沒設一樣
+   算設定錯誤——這才是「在初始啟動時就報錯，避免錯誤不斷擴大」這條既有原則該套用的地方，不能因為
+   空字串剛好是預設值就例外處理。連帶影響：先前假設「什麼都不設定也能正常 `rune update`」的既有
+   測試（例如 CLI 層驗證 working-tree freshness 的測試），現在必須明確在 config.toml 寫
+   `semantic.enabled = false` 才能維持「不使用 semantic」這個前提，不能再依賴預設值的巧合。
 
 **第二輪品質複查（外部 review 轉述，本輪新增）修正的 5 個問題**：
 

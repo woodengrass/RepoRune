@@ -96,21 +96,25 @@ DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但
    就無條件回傳 `True`。
 2. **Provider 健康檢查已實作為三層**（`check_semantic_health`，`rune.core.semantic.provider`），
    每次 `rune update` 開頭跑一次（`not full` 時）：`semantic.enabled != true` → 靜默跳過；Step 1
-   （純靜態，不連網）API key 環境變數沒設或 provider 名稱不認得 → **設定錯誤**，印出訊息，CLI exit
-   code 1；Step 2（一次輕量連線測試，`ModelProvider.probe()`）HTTP 429 → 提示使用者，exit code 0；
-   其他失敗 retry 一次仍失敗 → **大聲失敗**，exit code 1；成功 → 照現有方式刷新每個 scope。
-   `ProviderError` 新增 `status_code`/`is_rate_limited`；CLI 的 `update` 指令把健康狀態訊息從一般
-   stats 那行拆出來單獨印出。
-3. **實作時發現並修正一處對第十五輪原始措辭的必要澄清**：`SemanticConfig` 的預設值正是
-   `enabled=True, model=""`——如果照原始措辭把「model 是空字串」也算進「設定錯誤」，每個從未設定過
-   semantic 的全新專案會在每次 `rune update` 都大聲失敗、exit code 1。用既有測試
-   `test_update_then_status_reports_fresh_again`（預期未動過 semantic 設定時 exit code 0）重現確認
-   這個問題後，把「`enabled=True` 且 `model=""`」改歸類為等同 `disabled`（靜默跳過），`config_error`
-   保留給「已經設定了 model，但缺 key 或名稱打錯」這種更貼近使用者原話的情境。已同步更新
-   ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4 的措辭記錄這個澄清。
+   （純靜態，不連網）`model` 空字串、API key 環境變數沒設、或 provider 名稱不認得 → **設定錯誤**，
+   印出訊息，CLI exit code 1；Step 2（一次輕量連線測試，`ModelProvider.probe()`）HTTP 429 → 提示
+   使用者，exit code 0；其他失敗 retry 一次仍失敗 → **大聲失敗**，exit code 1；成功 → 照現有方式
+   刷新每個 scope。`ProviderError` 新增 `status_code`/`is_rate_limited`；CLI 的 `update` 指令把
+   健康狀態訊息從一般 stats 那行拆出來單獨印出。
 
 新增 17 個測試，每個都用 `git stash` 只還原 `src/` 改動、保留新測試，確認修法前確實會失敗才算數。
 192 個測試全綠，`ruff check` 全綠。
+
+**第十七輪修訂（使用者要求撤回一處實作時的簡化）**：第十六輪實作時，因為 `SemanticConfig` 預設值
+正是 `enabled=True, model=""`（每個全新專案的預設狀態），一度把「model 空字串」重新歸類為等同
+`disabled`（靜默跳過），避免所有未設定過 semantic 的專案每次 `rune update` 都大聲失敗。**使用者
+明確不同意**：這個專案完工、被別人部署使用時，理當已經正確填入 API 設定，`model` 空字串不該因為
+剛好是預設值就特殊放行，應該跟 API key 沒設一樣算設定錯誤——已撤回這個簡化，恢復成第十五輪原始
+措辭（`model` 空字串一律算 `config_error`）。連帶修正：既有測試
+`test_update_then_status_reports_fresh_again`（測 working-tree freshness，跟 semantic 無關）
+改成明確在 config.toml 寫 `semantic.enabled = false`，不再依賴「什麼都不設也能正常 update」這個
+現在已不成立的假設；`tests/unit/test_semantic.py` 對應的健康檢查測試也改回預期 `config_error`。
+192 個測試維持全綠，`ruff check` 全綠。細節見 IMPLEMENTATION_PLAN.md 第十七輪修訂。
 
 retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、改指向 `source_files`」的規則（第十五輪決議
 第 2 點）尚未實作，屬於 Milestone 6 範圍，留到那時再做——見下方「立刻可以做的下一步」。
@@ -129,10 +133,10 @@ commit，全部已 push，沒有未提交的變更）。
 
 ## 必看的三份設計文件（優先順序：先讀這三份，再看程式碼）
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第十一輪
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第十二輪
   修訂**。
 - [`DATA_MODEL.md`](DATA_MODEL.md) — 所有 canonical Pydantic model、SQLite schema、revision
-  lifecycle 規則。目前**第十輪修訂**（這個輪數指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
+  lifecycle 規則。目前**第十一輪修訂**（這個輪數指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
   IMPLEMENTATION_PLAN 的輪數不是同一套計數，不要混淆——三份文件各自獨立記錄自己的修訂輪次）。
 - [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — 8 個 Milestone 的交付項目、驗收標準、
   **文末的「設計決策記錄」按輪次列出每一次修正**，這是最重要的部分：每個 milestone 完成後都有

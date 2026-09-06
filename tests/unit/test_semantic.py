@@ -250,17 +250,18 @@ def test_health_check_disabled_when_semantic_enabled_is_false() -> None:
     assert fallback is None
 
 
-def test_health_check_disabled_when_model_is_the_untouched_default(monkeypatch) -> None:
+def test_health_check_config_error_when_model_is_the_untouched_default(monkeypatch) -> None:
     """`enabled=True` with an empty `model` is exactly what every fresh
-    `rune init` produces -- must be treated as "nothing configured yet",
-    not a loud config error, or every unconfigured project would fail
-    loudly on its very first `rune update`.
+    `rune init` produces -- but the user explicitly wants this to fail
+    loudly too, not stay quiet: a project that's actually deployed is
+    expected to have a real model configured, so leaving `enabled=True`
+    with nothing filled in is a setup mistake, same as a missing API key.
     """
     from rune.core.storage.models import SemanticConfig
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "irrelevant")
     health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model=""))
-    assert health.status is SemanticHealthStatus.disabled
+    assert health.status is SemanticHealthStatus.config_error
     assert primary is None
 
 

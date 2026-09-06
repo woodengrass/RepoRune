@@ -1398,3 +1398,30 @@ is_rate_limited`、`check_semantic_health` 的 5 種狀態、`mark_possibly_stal
 
 Milestone 6（Policies & Memory）是下一步；retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、
 改指向 `source_files`」的規則（第十五輪決議第 2 點）屬於 Milestone 6 範圍，留到那時再做。
+
+### 第十七輪修訂（使用者要求撤回第 88 條的簡化：`model` 空字串維持算設定錯誤）
+
+91. **撤回第 88 條「`model` 空字串視同 disabled」的簡化**：第十六輪實作時，因為
+    `SemanticConfig` 預設值正是 `enabled=True, model=""`（每個全新專案未動過 semantic 設定的
+    狀態），為了不讓每個未設定過 semantic 的專案在每次 `rune update` 都大聲失敗，把「`model` 空
+    字串」重新歸類為等同 `disabled`（靜默跳過）。**使用者明確不同意**：「我覺得 model 是空字串也
+    是設定錯誤，因為未來當專案完工以後別人部署時就應該正確填入 api 否則無法正常使用」——這個專案
+    部署完成後理當已經正確設定，`model` 空字串不該因為剛好是預設值就特殊放行，跟 API key 沒設
+    一樣都是設定錯誤，應該套用「在初始啟動時就報錯」這條既有原則。已撤回，`check_semantic_health`
+    的 Step 1 恢復成第十五輪原始措辭：`model` 空字串跟 API key 沒設、provider 名稱不認得，三者
+    一律是 `config_error`（CLI exit code 1），只有 `semantic.enabled=false` 才是靜默跳過的
+    `disabled`。
+92. **連帶修正兩個假設「什麼都不設定也能正常 `rune update`」的既有測試**：
+    - `tests/unit/test_cli.py::test_update_then_status_reports_fresh_again` 測的是 working-tree
+      freshness 回報，跟 semantic 設定無關，只是意外依賴了「預設狀態下 semantic 不會出錯」這個
+      現在已不成立的巧合。改成明確在 config.toml 寫 `semantic.enabled = false`，讓這個測試繼續
+      只測它原本要測的東西。
+    - `tests/unit/test_semantic.py::test_health_check_disabled_when_model_is_the_untouched_default`
+      改名為 `test_health_check_config_error_when_model_is_the_untouched_default`，斷言從
+      `SemanticHealthStatus.disabled` 改為 `SemanticHealthStatus.config_error`。
+    兩者都先確認會因為第 91 條的程式碼改動而失敗（`assert 1 == 0`／`assert config_error is
+    disabled`），改完後跟其餘測試一起全綠，不是憑空改斷言遷就程式碼。
+
+已同步更新 ARCHITECTURE.md §4.5（第十二輪）、DATA_MODEL.md §2.4（第十一輪）的措辭，移除「`model`
+空字串視同 disabled」這個已撤回的描述。192 個測試維持全綠，`ruff check` 全綠——本輪淨變更只有
+`check_semantic_health` 裡一個 `if` 分支的邏輯，以及兩個既有測試的修正，沒有新增功能。

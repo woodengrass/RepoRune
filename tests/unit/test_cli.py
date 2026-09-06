@@ -47,8 +47,16 @@ def test_status_reports_modified_added_and_deleted_counts(git_repo: Path) -> Non
 
 
 def test_update_then_status_reports_fresh_again(git_repo: Path) -> None:
+    """Tests working-tree freshness reporting, not semantic -- explicitly
+    disables semantic so this doesn't get tangled up in the (correct,
+    separately-tested) config_error a bare, unconfigured `semantic.
+    enabled=True` default now produces.
+    """
     (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
     runner.invoke(app, ["init", "--path", str(git_repo)])
+    (git_repo / ".rune" / "config.toml").write_text(
+        "[semantic]\nenabled = false\n", encoding="utf-8"
+    )
     (git_repo / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
 
     result = runner.invoke(app, ["update", "--path", str(git_repo)])

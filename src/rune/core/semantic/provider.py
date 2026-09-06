@@ -275,11 +275,11 @@ class SemanticHealthStatus(str, Enum):
     """
 
     ok = "ok"
-    # config.semantic.enabled is false, or it's true but semantic.model is
-    # still the untouched empty-string default (what every fresh `rune
-    # init` produces). Neither is an error -- the first is the user
-    # deliberately opting out, the second is simply "haven't configured
-    # semantic yet" -- so callers must stay silent about both.
+    # config.semantic.enabled is false. Not an error -- the user turned
+    # this off on purpose -- so callers must stay silent about it. An
+    # empty `model` with enabled=True is NOT folded into this: that's
+    # config_error (see below) -- a deployed project is expected to have
+    # a real model configured, so leaving it blank must fail loudly.
     disabled = "disabled"
     # Step 1 (static, no network): empty model, unknown provider, or the
     # provider's API key env var isn't set. A basic setup mistake the
@@ -315,17 +315,24 @@ def check_semantic_health(config: SemanticConfig) -> tuple[SemanticHealthCheck, 
     if not config.enabled:
         return SemanticHealthCheck(status=SemanticHealthStatus.disabled), None, None
     if not config.model:
-        # `enabled=True` with an empty `model` is what every fresh `rune
-        # init` produces (SemanticConfig's own defaults) -- it means
-        # "haven't configured semantic yet", not "someone broke an
-        # existing configuration". Treated identically to `disabled`
-        # (silent, no message) rather than `config_error`, so a project
-        # that has simply never touched semantic settings doesn't fail
-        # loudly on every single `rune update`. `config_error` is reserved
-        # for a configuration that was actually attempted and got
-        # something wrong -- a non-empty model with a missing API key, or
-        # an unrecognized provider name, both handled below.
-        return SemanticHealthCheck(status=SemanticHealthStatus.disabled), None, None
+        # An empty model with semantic left enabled is exactly as much a
+        # setup mistake as a missing API key -- a deployed project must
+        # have this filled in to work at all, so it's `config_error`
+        # (loud, non-zero CLI exit) rather than a silent skip. This is a
+        # deliberate choice, not an oversight: earlier during development
+        # this was folded into `disabled` to keep an unconfigured fresh
+        # project quiet, but the user explicitly overrode that -- once
+        # this project is actually deployed, `semantic.enabled=True`
+        # without a real model means someone forgot to finish setup, and
+        # that should fail loudly rather than silently do nothing.
+        return (
+            SemanticHealthCheck(
+                status=SemanticHealthStatus.config_error,
+                message="semantic.enabled is true but semantic.model is empty in config.toml",
+            ),
+            None,
+            None,
+        )
 
     try:
         primary = build_provider(
