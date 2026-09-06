@@ -637,3 +637,228 @@ def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
     stats = run_update(layout, full=False)
     assert stats["files_parsed"] == 0  # nothing changed since the failed attempt
     assert stats["files_reused"] == 3
+
+
+class _FakeSemanticProvider:
+    """Implements the ModelProvider protocol used by core.semantic without
+    touching the network -- injected by monkeypatching
+    `update_module._build_semantic_providers`, the same pattern this file
+    already uses for `resolve_references`/`get_parser_adapter`.
+    """
+
+    def __init__(self, model: str, responses: list) -> None:
+        self.model = model
+        self._responses = list(responses)
+
+    def complete(self, *, system_prompt, user_prompt, max_tokens):
+        from rune.core.semantic.provider import ProviderResponse
+
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return ProviderResponse(content=item, input_tokens=10, output_tokens=5, cost=0.001)
+
+
+def _good_semantic_json(purpose: str = "does the app thing") -> str:
+    import json
+
+    return json.dumps({"purpose": purpose})
+
+
+def test_semantic_refresh_end_to_end_appends_new_revision(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Full wiring test for Milestone 5: a scope with no existing summary
+    gets one generated during `rune update`, materialized into SQLite in
+    the same run, and appended to semantic.jsonl afterward.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("summarizes app services")])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+
+    stats = run_update(layout, full=True)
+
+    assert stats["semantic_scopes_refreshed"] == 1
+    revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    assert len(revisions) == 1
+    assert revisions[0].scope_id == "app"
+    assert revisions[0].revision == 1
+    assert revisions[0].purpose == "summarizes app services"
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    row = conn.execute(
+        "SELECT current_revision, purpose, status FROM semantic_objects WHERE scope_id = 'app'"
+    ).fetchone()
+    assert row == (1, "summarizes app services", "fresh")
+
+
+def test_semantic_refresh_regenerates_after_member_file_content_changes(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Milestone 5's acceptance criterion, literally: modify a scope's
+    member file, and the next `rune update` must produce a new `fresh`
+    revision reflecting the new source_hash -- `semantic.jsonl` gains
+    exactly one more line, not a rewrite of the first.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("v1 purpose")])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+    run_update(layout, full=True)
+    first = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    assert len(first) == 1
+    assert first[0].status.value == "fresh"
+
+    (python_simple_repo / "app" / "services.py").write_text(
+        (python_simple_repo / "app" / "services.py").read_text(encoding="utf-8") + "\n# changed\n",
+        encoding="utf-8",
+    )
+    provider2 = _FakeSemanticProvider("fake-model", [_good_semantic_json("v2 purpose")])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider2, None)
+    )
+    stats = run_update(layout, full=False)
+
+    assert stats["semantic_scopes_refreshed"] == 1
+    revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    assert len(revisions) == 2  # appended, not rewritten
+    assert revisions[1].revision == 2
+    assert revisions[1].purpose == "v2 purpose"
+    assert revisions[1].status.value == "fresh"
+    assert revisions[1].source_hash != revisions[0].source_hash
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    row = conn.execute(
+        "SELECT current_revision, purpose FROM semantic_objects WHERE scope_id = 'app'"
+    ).fetchone()
+    assert row == (2, "v2 purpose")  # SQLite reflects only the current revision
+
+
+def test_semantic_refresh_failure_does_not_leave_partial_canonical_state(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Regression test for the same all-or-nothing requirement Milestone 4's
+    scope auto-assignment fix established: if rebuild_cache fails, the new
+    semantic.jsonl revision computed this run must not have been written --
+    the whole point of deferring the canonical append until after
+    rebuild_cache succeeds.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+
+    def failing_rebuild_cache(*args, **kwargs):
+        raise RuntimeError("simulated rebuild_cache failure")
+
+    monkeypatch.setattr(update_module, "rebuild_cache", failing_rebuild_cache)
+
+    try:
+        run_update(layout, full=True)
+        raise AssertionError("expected the simulated rebuild_cache failure to propagate")
+    except RuntimeError:
+        pass
+
+    assert read_jsonl(layout.semantic_jsonl, ScopeSummary) == []
+
+
+def test_semantic_refresh_failure_writes_sanitized_error_to_canonical_and_full_detail_to_local_log(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Round-10 design decision, end to end: `semantic.jsonl`'s `last_error`
+    must be a short sanitized classification even when the underlying
+    failure carries a detailed provider message, and the full detail must
+    still be recoverable from the local, gitignored `.rune/logs/semantic.log`.
+    """
+    import rune.core.update as update_module
+    from rune.core.semantic.provider import ProviderError
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    detailed_error = "upstream said: quota exceeded for customer 12345, retry after 60s"
+    provider = _FakeSemanticProvider(
+        "fake-model", [ProviderError(detailed_error), ProviderError(detailed_error)]
+    )
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+
+    run_update(layout, full=True)
+
+    revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    assert len(revisions) == 1
+    assert revisions[0].status.value == "unavailable"
+    assert detailed_error not in (revisions[0].last_error or "")
+    assert revisions[0].last_error == "provider_error:ProviderError"
+
+    log_text = layout.semantic_log.read_text(encoding="utf-8")
+    assert detailed_error in log_text

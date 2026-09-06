@@ -73,16 +73,19 @@ CREATE TABLE IF NOT EXISTS scope_symbols (
     PRIMARY KEY (scope_id, symbol_id)
 );
 
--- semantic summary (current only; history stays in semantic.jsonl)
+-- semantic summary (current_revision = MAX(revision) per scope_id, same
+-- convention as decision/constraint/note below; full history stays in
+-- semantic.jsonl)
 CREATE TABLE IF NOT EXISTS semantic_objects (
-    scope_id      TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
-    purpose       TEXT NOT NULL,
-    payload_json  TEXT NOT NULL,
-    generated_at  TEXT NOT NULL,
-    model         TEXT NOT NULL,
-    source_hash   TEXT NOT NULL,
-    status        TEXT NOT NULL,
-    last_error    TEXT
+    scope_id         TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
+    current_revision INTEGER NOT NULL,
+    purpose          TEXT NOT NULL,
+    payload_json     TEXT NOT NULL,
+    generated_at     TEXT NOT NULL,
+    model            TEXT NOT NULL,
+    source_hash      TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    last_error       TEXT
 );
 
 -- decision (current_revision = MAX(revision), independent of status)

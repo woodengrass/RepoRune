@@ -81,7 +81,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
 
 
 def _group_current_by_id(
-    records: list[MemoryRevision] | list[Note] | list[Proposal],
+    records: list[MemoryRevision] | list[Note] | list[Proposal] | list[ScopeSummary],
     id_field: str,
     label: str,
 ) -> dict[str, list]:
@@ -271,23 +271,36 @@ def _materialize_proposals(conn: sqlite3.Connection, proposals: list[Proposal]) 
 
 
 def _materialize_semantic(conn: sqlite3.Connection, summaries: list[ScopeSummary]) -> None:
-    # Last line per scope_id wins (append order = generation order); this is
-    # not the Decision/Constraint/Note revision mechanism (ScopeSummary has
-    # no `revision` field — see DATA_MODEL.md §2.4).
-    latest: dict[str, ScopeSummary] = {}
-    for summary in summaries:
-        latest[summary.scope_id] = summary
-    for scope_id, summary in latest.items():
+    # current_revision = MAX(revision) per scope_id, same convention (and
+    # same duplicate-(id, revision) conflict detection) as Decision/
+    # Constraint/Note — see DATA_MODEL.md §2.4's revised revision mechanism,
+    # which replaced the earlier "last line wins by append order" scheme.
+    grouped = _group_current_by_id(summaries, "scope_id", "semantic.jsonl")
+    for scope_id, revs in grouped.items():
+        current = revs[-1]
         conn.execute(
             "INSERT INTO semantic_objects "
-            "(scope_id, purpose, payload_json, generated_at, model, source_hash, "
-            " status, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(scope_id, current_revision, purpose, payload_json, generated_at, "
+            " model, source_hash, status, last_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                scope_id, summary.purpose, summary.model_dump_json(),
-                summary.generated_at, summary.model, summary.source_hash,
-                summary.status.value, summary.last_error,
+                scope_id, current.revision, current.purpose,
+                current.model_dump_json(), current.generated_at, current.model,
+                current.source_hash, current.status.value, current.last_error,
             ),
         )
+
+
+def current_scope_summaries(summaries: list[ScopeSummary]) -> dict[str, ScopeSummary]:
+    """Public helper for `core.update`/`core.semantic.worker`, which need
+    this run's current per-scope `ScopeSummary` *before* `rebuild_cache`
+    runs (to decide which scopes are stale and need a refresh attempt).
+    Reuses the same duplicate-(scope_id, revision) conflict detection
+    `rebuild_cache` itself applies, so a canonical conflict is caught here
+    too rather than only surfacing once the whole update tries to commit.
+    """
+    grouped = _group_current_by_id(summaries, "scope_id", "semantic.jsonl")
+    return {scope_id: revs[-1] for scope_id, revs in grouped.items()}
 
 
 @dataclass(frozen=True)
@@ -429,6 +442,7 @@ def rebuild_cache(
     layout: RuneLayout,
     code_index: CodeIndexData | None = None,
     scopes_override: ScopesFile | None = None,
+    semantic_override: list[ScopeSummary] | None = None,
 ) -> dict[str, int]:
     """Fully rebuilds memory.db from canonical files (and, from Milestone 2
     on, the caller-supplied `code_index`). Zero LLM calls, zero network.
@@ -453,6 +467,14 @@ def rebuild_cache(
     canonical file (decisions/constraints/notes/proposals/semantic) still
     always reads fresh from disk here; scopes.json is the only one with an
     in-flight in-memory mutation to reconcile in Milestone 4's scope.
+
+    `semantic_override`, when given, is the *complete* current set of
+    `ScopeSummary` (existing current revisions plus this run's new ones) to
+    materialize in place of reading `layout.semantic_jsonl`. Same rationale
+    as `scopes_override` (Milestone 5): `core.semantic.worker`'s freshly
+    computed revisions must land in this same transaction, but the
+    canonical `semantic.jsonl` append only happens after `rebuild_cache`
+    actually succeeds — see the call site.
 
     Rebuilds **in place**, inside a single SQLite transaction (clear every
     table, then re-insert everything, then commit) rather than building a
@@ -483,7 +505,11 @@ def rebuild_cache(
         constraints = read_jsonl(layout.constraints_jsonl, MemoryRevision)
         notes = read_jsonl(layout.notes_jsonl, Note)
         proposals = read_jsonl(layout.proposals_jsonl, Proposal)
-        semantic = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+        semantic = (
+            semantic_override
+            if semantic_override is not None
+            else read_jsonl(layout.semantic_jsonl, ScopeSummary)
+        )
 
         conn.execute("BEGIN;")
         _clear_all_content(conn)

@@ -180,10 +180,24 @@ class SemanticStatus(str, Enum):
     fresh = "fresh"
     possibly_stale = "possibly_stale"
     stale = "stale"
+    unavailable = "unavailable"
+    # This scope has never had a successful generation, and the most recent
+    # attempt failed. Distinct from `stale` (which means "there IS real
+    # content, it may just be outdated / the last refresh attempt failed"):
+    # when `unavailable`, every content field below is an empty placeholder
+    # (`purpose=""`, list fields `[]`) and must never be shown to an agent
+    # as if it were a real description (DATA_MODEL.md §2.4).
 
 
 class ScopeSummary(BaseModel):
     scope_id: str
+    revision: int = Field(ge=1)
+    # Per-scope_id monotonically increasing; current = max(revision), same
+    # convention as Decision/Constraint/Note (DATA_MODEL.md §1, §3). Added
+    # so a failed-generation status can persist across a `rebuild-cache`
+    # instead of only living in one run's in-memory state — see §2.4's
+    # revision table for what each outcome (success / retry-with-content /
+    # first-ever-failure) writes.
     purpose: str
     responsibilities: list[str] = Field(default_factory=list)
     entry_points: list[str] = Field(default_factory=list)
@@ -199,6 +213,12 @@ class ScopeSummary(BaseModel):
     source_files: dict[str, str] = Field(default_factory=dict)
     status: SemanticStatus = SemanticStatus.fresh
     last_error: str | None = None
+    # Only a short, sanitized classification (e.g. "provider_error:
+    # TimeoutError", "schema_validation_failed") -- never the raw provider
+    # response or exception text/traceback. This file is canonical and may
+    # be committed to git, so its sensitivity bar is the same as source
+    # code; the unsanitized error goes to the local, gitignored
+    # `.rune/logs/semantic.log` instead (ARCHITECTURE.md §4.5).
     schema_version: int = 1
 
 

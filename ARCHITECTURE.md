@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第六輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第七輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -16,8 +16,12 @@ Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節
 scope 候選（heuristic/clustering）不持久化、純一次性 CLI 互動；clustering 候選建議可同時使用
 import 與 best-effort reference edge（因為一定經人類確認，不牴觸 §4.3 的治理層信任原則）；新檔案
 incremental 自動併入既有 scope 只認 import edge 且僅限單一候選（無人把關的寫入路徑，必須用
-high-confidence 訊號）。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1
-的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、staleness 語意或
+high-confidence 訊號）。**第七輪在 Milestone 5（Semantic worker）開工前，修正第 4.5 節一個自相矛盾**：
+`ScopeSummary` 新增 `revision` 欄位（比照 Decision/Constraint/Note），讓生成失敗的狀態能真正跨
+session 持久化，而不是先前版本宣稱的「只在 SQLite 投影中維持，不寫 JSONL」（這句話與「SQLite 投影
+每次都是從 canonical 重新算出來」互相矛盾）；`last_error` 收斂為清洗過的分類字串，原始錯誤改寫進
+不進 git 的 `.rune/logs/semantic.log`。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成
+Milestone 1 的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、staleness 語意或
 agent-injection 語意的後續變更，仍必須重新提案並取得確認後才能實作。
 
 ## 1. 目的與非目標
@@ -244,8 +248,22 @@ structured `ScopeSummary`，經三層驗證（schema、路徑存在性、symbol 
 - **Strip**：summary 中引用到不存在的 file/symbol 的「條目」被移除並記錄警告，不影響其餘欄位。
 - **Reject**：只有當核心欄位（如 `purpose`）本身無法通過 schema 驗證時，才整份 generation 被拒絕。
 
-失敗或被拒絕的 generation 保留舊 summary、`status=stale`、記錄 `last_error`，絕不清空或損毀既有 summary
-（規格 §62）。
+失敗或被拒絕的 generation 保留舊 summary 的**內容**、絕不清空或損毀既有 summary（規格 §62），但**失敗
+狀態本身必須持久化**（本輪修正，見 DATA_MODEL §2.4）：`ScopeSummary` 新增 `revision` 欄位，失敗時
+附加新的一行——已有成功產生過的 scope，複製上一筆 current revision 的完整內容、只改動
+`status=stale`、`last_error`、`generated_at`、`source_hash`/`source_files`（更新為目前的，供下次
+staleness 判斷比對）；從未成功產生過的 scope，附加 `revision=1`、`status=unavailable`，內容欄位
+留空、不虛構。這解決了先前版本「失敗不寫 JSONL，只在 SQLite 投影中維持 status=stale」的自相矛盾
+（SQLite 投影本身就是從 `semantic.jsonl` 重新算出來的，不可能反映一個從未落地的狀態）。
+
+**`last_error` 只允許清洗過的分類字串，絕不放原始 provider 回應或例外訊息（本輪新增）**：
+`semantic.jsonl` 是 canonical、可能進 git 的檔案，敏感度假設等同任何原始碼——不能把 provider 的原始
+回應內容（可能夾帶 prompt injection 殘留、模型 hallucinate 出的片段）直接寫進去。`last_error` 收斂
+為簡短分類值（例如 `"schema_validation_failed"`、`"provider_error:TimeoutError"`、
+`"repair_retry_failed"`、`"fallback_failed"`）。完整、未清洗的原始錯誤（例外訊息、traceback、
+provider 回應片段）寫進 `.rune/logs/semantic.log`——這個檔案**不是 canonical、不進 git**（`rune
+init` 時比照 `.rune/cache/` 加進 `.gitignore`），純粹是本機除錯用的操作記錄，可隨時刪除，不影響
+任何 rebuild 或 retrieval 邏輯。
 
 **Provider 視為不可靠外部依賴，fallback policy 明定為有限步驟（本輪新增）**：
 
@@ -256,7 +274,8 @@ call primary model
       → 仍失敗
         → fallback model（config 另外指定，例如更貴但更穩的模型）
           → 仍失敗
-            → 保留舊 summary，status=stale，記錄 last_error，不再重試
+            → 附加新 revision：status=stale（已有內容時複製舊內容）或
+              status=unavailable（從未成功過），記錄清洗後的 last_error，不再重試
 ```
 
 不做無限 retry。每次呼叫記錄以下 metrics（寫入 SQLite 或獨立的 metrics 表，供 `rune update` 輸出

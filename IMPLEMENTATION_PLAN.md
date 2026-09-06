@@ -1,6 +1,6 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第九輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+狀態：**已確認（第十一輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
 做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
 修訂」。第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
 持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認，細節見文末「第七輪
@@ -8,7 +8,14 @@
 修正**（unchanged caller 的 reference edge 不會重新解析、qualified/generic 繼承 reference 被丟棄、
 extends/implements target 沒有 kind 限制、scope 自動併入在 rebuild_cache 前就寫入 canonical、真實
 repo 品質實驗的第二個樣本改用真正中型的 repo、補齊 locked scope 的端對端測試），細節見文末「第九輪
-修訂」。將規格 §70-77 展開為具體交付項目、模組目標與各 Milestone
+修訂」。**第十輪是 Milestone 5（Semantic worker）開工前，修正 `ScopeSummary` 生成失敗語意的自相
+矛盾**：新增 `revision` 欄位讓失敗狀態能真正跨 session 持久化，`last_error` 收斂為清洗過的分類
+字串、原始錯誤另存不進 git 的本機 log，細節見文末「第十輪修訂」與 DATA_MODEL.md §2.4、
+ARCHITECTURE.md §4.5。**第十一輪是 Milestone 5 的實作記錄**：`core.semantic.{provider,worker,
+validation,redaction}` 完整實作、接線進 `rune update`（`rebuild_cache` 新增 `semantic_override`
+比照 Milestone 4 的 `scopes_override` 模式）、以使用者提供的 OpenRouter API key 對
+`qwen/qwen3.8-flash` 做真實端到端驗證（不只 mock），細節見文末「第十一輪實作記錄」。將規格
+§70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
 before`/`after`、session events、custom tool 皆為真實 API），並針對前一輪列出的風險（import/
@@ -332,6 +339,11 @@ edge；incremental 自動併入只認 import edge 且僅限單一候選，其餘
   對照改進。這條驗收標準的性質與其他機制性驗收不同：目的是收集資料而非通過/失敗判定。
 
 ## Milestone 5 — Semantic worker
+
+**目前狀態：已實作並通過測試**（`src/rune/core/semantic/{provider,worker,validation,redaction}.py`，
+152 個測試全綠，`ruff check` 全綠，含 27 個新的 semantic 單元測試 + 4 個端對端整合測試）。細節、
+真實 API 驗證結果與已知未完成項見文末「第十一輪實作記錄」。
+
 **模組**：`rune.core.semantic.{provider,worker,validation,redaction}`。
 
 **交付項目：**
@@ -351,8 +363,13 @@ edge；incremental 自動併入只認 import edge 且僅限單一候選，其餘
   `scope.members.files ∪ {owning_file(s) for s in scope.members.symbols}`**——一個只透過
   `members.symbols` 納入成員的 scope，仍必須把這些 symbol 的 owning file 解析出來納入
   `source_files`，不能因為 `members.files` 是空的就讓 `source_files` 也是空的。
-- 逐 scope 失敗隔離：產生失敗或被拒絕時，保留 `semantic.jsonl` 舊行、不附加新行、記錄 `last_error`，
-  只在 SQLite 投影中維持 `status=stale`（不是產生新的 JSONL 行，因為實際上沒有新內容產出）。
+- **逐 scope 失敗隔離，失敗狀態需持久化（第十輪修訂，取代原本自相矛盾的版本）**：`ScopeSummary`
+  新增 `revision` 欄位（DATA_MODEL §2.4），失敗時**附加新的一行**而非「不附加新行」：已有成功
+  產生過的 scope，複製上一筆 current revision 的完整內容、只改動 `status=stale`、`last_error`、
+  `generated_at`、`source_hash`/`source_files`（更新為目前的）；從未成功產生過的 scope，附加
+  `revision=1`、`status=unavailable`，內容欄位留空不虛構。`last_error` 只寫入清洗過的分類字串
+  （例如 `"provider_error:TimeoutError"`），原始例外/provider 回應內容寫進不進 git 的
+  `.rune/logs/semantic.log`（`rune init` 時加進 `.gitignore`）。
 - **有限步驟 fallback policy（本輪新增，見 ARCHITECTURE §4.5）**：primary model 失敗 -> 1 次
   repair-prompt retry -> fallback model（config 另外指定）-> 仍失敗則保留舊 summary 並停止，不做
   無限重試。同時記錄 `schema_success_rate`／`reference_strip_rate`／`fallback_rate`／
@@ -365,8 +382,12 @@ edge；incremental 自動併入只認 import edge 且僅限單一候選，其餘
 - 修改某 scope 的一個 member 檔案，該 scope 的 summary 被標記 `stale`；執行 `rune update` 後重新產生
   並轉回 `fresh`，`semantic.jsonl` 恰好新增一行，且新行的 `source_files` 正確反映哪些檔案的 hash
   改變了。
-- 模擬 provider 失敗：舊 summary 保持不變，`last_error` 被設定，不損毀 `semantic.jsonl`，不影響本次
-  update 的其他 scope。
+- 模擬 provider 失敗：附加一筆新 revision，內容複製自上一筆 current revision（不虛構新內容），
+  `status=stale`、`last_error` 為清洗過的分類字串，不損毀 `semantic.jsonl` 既有行，不影響本次
+  update 的其他 scope；`rebuild-cache` 之後這個失敗 revision 仍然是 current（驗證失敗狀態真的跨
+  session 持久化，而非本次 process 記憶體裡的暫態）。
+- 模擬一個從未成功產生過摘要的 scope 首次生成即失敗：附加 `revision=1`、`status=unavailable`，
+  內容欄位為空，不得出現任何虛構的 `purpose`/`responsibilities` 等內容。
 - 模型回應引用不存在的 file/symbol：該引用被 strip，不被信任，但其餘欄位正常保留（非整份拒絕）。
 - 一個 scope 只有 `members.symbols`（`members.files` 為空）時，`source_files` 正確解析出這些
   symbol 的 owning file 並納入，不會是空字典。
@@ -964,3 +985,79 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     （`tests/integration/test_update_flow.py`），對一個 `locked=True` 的 scope 跑一次完整
     `rune update`，斷言 `stats["scope_files_auto_assigned"] == 0`、SQLite `scope_files` 表裡新檔案
     沒有任何 membership、原本的 membership 也完全不變。
+
+### 第十輪修訂（Milestone 5 開工前，修正 ScopeSummary 生成失敗語意的自相矛盾）
+
+開工前重新檢視 Milestone 5 的既有文字時發現：「產生失敗時不附加新的 JSONL 行，只在 SQLite 投影中
+維持 `status=stale`」這句話本身無法同時成立——SQLite 的 `semantic_objects` 表每次都是
+`rebuild_cache` 從 `semantic.jsonl` 重新讀取算出來的，不寫 JSONL 就沒有任何東西可以讓 SQLite 投影
+出「失敗」這件事，下一次 `rebuild-cache`／`rune update` 一定會讓這個狀態消失。這正是「先問使用者，
+再動手」的情境：失敗狀態要不要跨 session 持久化，兩種答案都說得通，但語意差很多。
+
+57. **`ScopeSummary` 新增 `revision` 欄位，比照 Decision/Constraint/Note 既有機制**：失敗狀態確定
+    要跨 session 持久化（撐過 `rebuild-cache`），做法不是另外發明一套，而是重用專案裡已經三次驗證
+    過的 revision 模式——`scope_id` 底下 `revision` 單調遞增，current = `max(revision)`，與
+    Decision/Constraint/Note 共用同一套「current」定義（DATA_MODEL §1、§3）。失敗時附加新 revision：
+    已有成功產生過的 scope，複製上一筆 current revision 的完整內容（比照 §2.5「系統自動附加 revision
+    必須是完整 snapshot」的既有規則）、只改動 `status=stale`／`last_error`／`generated_at`／
+    `source_hash`/`source_files`；從未成功產生過的 scope，附加 `revision=1`、新增的
+    `status=unavailable`，內容欄位留空、不虛構（不能因為 LLM 沒回應就編一個假的 `purpose`）。實作於
+    Milestone 1（model 定義補上 `revision`/`unavailable`）與 Milestone 5（worker 實際產生這些
+    revision）。
+58. **`last_error` 收斂為清洗過的分類字串，原始錯誤另存本機 log**：`semantic.jsonl` 是可能進 git 的
+    canonical 檔案，敏感度假設等同任何原始碼——不能把 provider 的原始回應、例外訊息或 traceback 直接
+    寫進去（可能夾帶 prompt injection 殘留、模型 hallucinate 片段，或未被既有 redaction pass 攔到的
+    殘留內容）。`last_error` 只允許簡短分類值（`schema_validation_failed`／
+    `provider_error:<ExceptionType>`／`repair_retry_failed`／`fallback_failed`），完整原始錯誤寫進
+    新增的 `.rune/logs/semantic.log`——這個檔案不是 canonical、不進 git（`rune init` 時加進
+    `.gitignore`，比照 `.rune/cache/`），純粹是人類本機除錯用的操作記錄，可隨時刪除，不影響任何
+    rebuild 或 retrieval 邏輯。實作於 Milestone 5。
+
+### 第十一輪實作記錄（Milestone 5）
+
+59. **實作範圍**：`provider.py`（`ModelProvider` protocol、`OpenAICompatibleProvider` 通用實作、
+    `OpenRouterProvider`/`OpenAIProvider`、`build_provider` 從環境變數解析 API key——`.rune/`
+    底下任何檔案都不會被拿來讀 API key，`token.env` 這類本機開發用的檔案純粹是外部 shell/dotenv
+    的慣例，不是 rune 自己的程式碼會去讀的東西）、`redaction.py`（沿用共用的 secret pattern，只套用
+    在 free-text 欄位，`entry_points`/`important_symbols`/`dependencies` 這類結構化參照欄位完全不碰，
+    避免把真的 symbol_id/file path 誤傷）、`validation.py`（schema 核心欄位失敗即拒絕、清單條目引用
+    不存在的 file/symbol 則 strip，`dependencies` 因為可能是外部套件名稱/scope_id、無法驗證，維持
+    best-effort 不做 strip）、`worker.py`（`compute_source_files` 的 union invariant、
+    `needs_refresh` 的 staleness 判斷、`refresh_scope_summary` 的 fallback ladder、
+    `run_semantic_refresh` 的逐 scope 迴圈 + `max_input_tokens_per_run` 預算裁切）。`rune update`
+    的接線比照 Milestone 4 的 `scopes_override` 模式：算好的 `ScopeSummary` 透過新增的
+    `rebuild_cache(semantic_override=...)` 參數跟其餘決定性索引一起進同一個 transaction，
+    `semantic.jsonl` 的 append 與 `.rune/logs/semantic.log` 的寫入延後到 `rebuild_cache` 成功之後才
+    執行——回歸測試 `test_semantic_refresh_failure_does_not_leave_partial_canonical_state` 用
+    `git stash`／monkeypatch 手法確認過這個順序被破壞時測試真的會抓到。
+60. **真實 API 驗證（2026-09-06，`qwen/qwen3.8-flash` via OpenRouter，使用者提供的個人 API
+    key）**：不只用 mock provider 測，額外做了端到端的真實呼叫，發現一個純讀文件推導不出來的行為
+    ——這個模型會先在 `reasoning` 欄位「思考」，`max_tokens` 太小時整個預算被思考過程吃光，
+    `content` 回傳 `None`；`provider.py` 因此把「`content is None`」明確視為一種獨立的
+    `ProviderError`（而非放給下游 JSON parse 失敗去籠統歸類），訊息裡直接提示要調高
+    `max_tokens`。真實呼叫過程中還真的踩到一次 OpenRouter 上游對這個免費/共用池模型的 429
+    rate-limit，`refresh_scope_summary` 的 fallback ladder 正確處理：第一次嘗試 429 失敗、
+    repair-retry 再打一次 primary 就成功，`metrics.provider_error=True` 與
+    `metrics.schema_success=True` 同時為真，忠實反映「這次呼叫其實中途失敗過一次，最後才成功」。
+    另一次成功呼叫中，模型自己 hallucinate 了 3 個不存在的 symbol/file 到 `entry_points`，
+    validation 的 strip 規則正確地把這 3 個踢掉、只留下真正存在的 2 個，其餘欄位正常保留——不是
+    mock 出來的行為，是真的模型輸出被真的 strip 邏輯處理過。
+61. **已知未完成／刻意延後的項目（誠實記錄，不是遺漏）**：
+    - `possibly_stale` 這個 `SemanticStatus` 值目前完全沒有任何程式碼路徑會設定它——DATA_MODEL.md
+      沒有具體定義它該由什麼觸發（不像 `fresh`/`stale`/`unavailable` 三者都有明確規則），保留在
+      enum 裡供未來（例如「間接依賴的 scope 變了，但這個 scope 自己的 member 沒變」這種較弱的
+      staleness 訊號）使用，V1 不強行發明一個用途。
+    - `needs_refresh` 對「`status=stale`／`unavailable` 但 source_hash 沒變」的情境選擇每次
+      `rune update` 都重新嘗試，而不是做指數退避或次數上限——如果一個 scope 持續失敗（例如
+      provider 本身有問題），目前的行為是每次 `rune update` 都會再花一次 fallback ladder 的成本
+      重試。這是刻意的簡化（V1 情境是小規模、少量 scope，成本可接受），但如果之後有真實中大型 repo
+      report「一直重試某個壞掉的 scope 浪費錢」，退避機制會是下一步要補的東西，目前只在
+      `needs_refresh` 的 docstring 裡記錄了這個取捨，沒有另外開 issue 追蹤。
+    - 驗收標準裡「schema_success_rate 等六項 metrics 在正常與失敗案例下都被正確記錄」只在
+      `aggregate_metrics`／`refresh_scope_summary` 的單元測試層級驗證過，沒有另外寫一個端對端測試
+      斷言 `rune update` 的 CLI 輸出裡真的印得出這六個數字——`run_update` 的回傳 stats dict 已經把
+      `semantic_<metric>` 展開進去，CLI 既有的 `"Indexed: " + ", ".join(...)"` 輸出格式會自動印出
+      這些新 key，但這條銜接沒有專門測試鎖住。
+    - `rune bootstrap`/`rune search` 等會真正「顯示」semantic summary（含 `unavailable`/`stale`
+      的可見性規則）的 retrieval 邏輯是 Milestone 6 的範圍，本輪只確保寫入端（worker + materialize）
+      正確，沒有涉及讀取端。

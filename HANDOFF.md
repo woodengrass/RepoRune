@@ -7,7 +7,20 @@ PLAN.md 第 51-56 條）：unchanged caller 的 reference edge 不會重新解�
 qualified/generic 繼承 reference 被整個丟棄、extends/implements target 沒有 kind 限制導致誤配、
 scope 自動併入在 `rebuild_cache` 之前就寫入 canonical `scopes.json`（破壞 all-or-nothing 交易）、
 真實 repo 品質實驗第二個樣本改用真正中型的 `honeypot-discord-bot`、補齊 locked scope 的端對端測試。
-121 個測試全綠，`ruff check` 全綠。**Milestone 3、4 目前已重新確認完成，沒有已知未修的問題。**
+121 個測試全綠，`ruff check` 全綠。Milestone 3、4 目前已重新確認完成，沒有已知未修的問題。
+
+**Milestone 5（Semantic worker）已實作並通過測試**（`core.semantic.{provider,worker,validation,
+redaction}`，152 個測試全綠）。開工前先修正 `ScopeSummary` 生成失敗語意的自相矛盾（新增 `revision`
+欄位，比照 Decision/Constraint/Note，`last_error` 收斂為清洗過的分類字串，原始錯誤另存不進 git 的
+`.rune/logs/semantic.log`——見 IMPLEMENTATION_PLAN.md 第 57-58 條、DATA_MODEL.md §2.4、
+ARCHITECTURE.md §4.5）。`rune update` 的接線比照 Milestone 4 的 `scopes_override` 模式，`semantic.
+jsonl` 的 append 延後到 `rebuild_cache` 成功之後才執行，維持 all-or-nothing。**用使用者提供的
+OpenRouter API key 對 `qwen/qwen3.8-flash` 做過真實端到端驗證**（不只 mock）：發現這個模型的
+`reasoning` 欄位會吃掉 `max_tokens`、真的踩過一次上游 429 rate-limit 並確認 fallback ladder 正確
+處理、真的讓模型 hallucinate 出不存在的 symbol 並確認 strip 邏輯正確踢掉。細節見 IMPLEMENTATION_
+PLAN.md 第 59-61 條，含 3 項刻意延後的已知未完成項目（`possibly_stale` 沒有觸發邏輯、無退避的
+無限重試、CLI 輸出六項 metrics 沒有端對端測試——都不是遺漏，是誠實記錄的取捨）。**Milestone 6
+（Policies & Memory）是下一步。**
 
 ## 專案是什麼
 
@@ -83,12 +96,12 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 2. Code index | ✅ 完成 | Tree-sitter 掃描/解析、symbol 擷取、import graph |
 | 3. References / graph | ✅ 完成 | best-effort calls/extends/implements 解析 |
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
-| 5. Semantic worker | ❌ 未開始 | 便宜模型 scope summary |
+| 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ❌ 未開始 | Decision/Constraint/Note 生命週期、search |
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**121 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**152 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
@@ -106,6 +119,11 @@ src/rune/
 │  │  ├─ model.py            # Scope CRUD、import-only incremental membership assignment
 │  │  ├─ heuristics.py       # 路徑候選（一次性、非 canonical）
 │  │  └─ clustering.py       # SQLite edges -> NetworkX graph 候選（一次性、非 canonical）
+│  ├─ semantic/
+│  │  ├─ provider.py         # ModelProvider protocol、OpenRouter/OpenAI/通用 httpx 實作
+│  │  ├─ redaction.py        # free-text 欄位 secret 遮蔽（結構化參照欄位不碰）
+│  │  ├─ validation.py       # schema 拒絕 vs. 條目 strip 的三層驗證
+│  │  └─ worker.py           # staleness 判斷、fallback ladder、逐 scope refresh 迴圈
 │  ├─ index/
 │  │  ├─ scanner.py         # include/exclude glob 走訪（自寫 **-aware matcher）、diff_against_previous
 │  │  ├─ treesitter.py      # ParserAdapter protocol + Python/JS/TS/TSX 實作
@@ -178,6 +196,17 @@ git-init 過的小型測試用 repo）。
    Pydantic 靜默吞掉。這是刻意的，因為靜默接受設定錯字比丟例外更危險。
 9. **`find_repo_root` 真的呼叫 `git rev-parse --show-toplevel`**，不是只檢查 `.git` 路徑存不
    存在——一個偽造的 `.git` 空目錄不該被當成合法 repo。
+10. **`ScopeSummary` 現在有 `revision` 欄位，跟 Decision/Constraint/Note 共用同一套 current 機制**
+    （DATA_MODEL.md §2.4，Milestone 5 開工前修正）：生成失敗時**一定要附加新的一行**（已有內容就
+    複製舊內容只改 status/last_error，從未成功過就附加 `status=unavailable` 且內容留空），絕不能
+    回到「失敗不寫 JSONL」的舊設計——那個設計自相矛盾，SQLite 投影本來就是從 JSONL 重新算出來的。
+11. **`semantic.jsonl` 的 `last_error` 只能是清洗過的分類字串**（例如 `"provider_error:
+    TimeoutError"`），絕對不能放 provider 的原始回應或例外訊息——那個檔案可能進 git。完整原始錯誤
+    寫進 `.rune/logs/semantic.log`（不進 git，純本機除錯用）。
+12. **API key 只能從環境變數讀，rune 自己的程式碼絕不讀專案根目錄的任何檔案來取得 key**——即使
+    使用者為了本機測試方便建立了 `token.env` 之類的檔案，那也只是外部 shell 慣例，不是 rune 的
+    功能。`build_provider()`（`core.semantic.provider`）只認 `OPENROUTER_API_KEY`/`OPENAI_API_KEY`
+    這兩個環境變數。
 
 ## 這個專案的工作方式（如果你是接手的 agent，請比照辦理）
 
@@ -214,5 +243,10 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-Milestone 5（Semantic worker）。開工前重讀 DATA_MODEL.md §2.4、§6 與 IMPLEMENTATION_PLAN.md 的
-Milestone 5 段落；ScopeSummary 的 source hash 與 Decision/Constraint/Note staleness 是兩套獨立語意。
+**Milestone 6（Policies & Memory）**：`rune.core.memory.{decisions,constraints,notes,staleness}`。
+開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 6 整段（含驗收標準）與 DATA_MODEL.md §1、§3、§6——
+「current 與 visible 分離」是這個 milestone 最容易重犯的錯誤點，文件裡已經明講必須有專門測試鎖死
+`rev1=active, rev2=inactive` 這個 case。Note 的 revision 化現在有 Milestone 5 的 `ScopeSummary`
+revision 實作可以參考同一套模式。Proposal 流程（`decision_propose`/`constraint_propose`）也是這個
+milestone 的範圍，記得核准 constraint 時要依 `persistence_mode` 自動算好
+`source_hashes`/`scope_hashes`/`expires_at` snapshot，不是人類手動填。

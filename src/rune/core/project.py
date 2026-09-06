@@ -112,6 +112,20 @@ class RuneLayout:
         return self.cache_dir / "memory.db"
 
     @property
+    def logs_dir(self) -> Path:
+        return self.rune_dir / "logs"
+
+    @property
+    def semantic_log(self) -> Path:
+        """Local-only, gitignored log of full (unsanitized) semantic worker
+        errors — see ARCHITECTURE.md §4.5. `semantic.jsonl`'s `last_error`
+        field only ever holds a short sanitized classification; the raw
+        exception/provider response text goes here instead, never into a
+        canonical file that could end up committed to git.
+        """
+        return self.logs_dir / "semantic.log"
+
+    @property
     def gitignore(self) -> Path:
         return self.rune_dir / ".gitignore"
 
@@ -132,7 +146,7 @@ class RuneLayout:
 
 
 def _write_gitignore(layout: RuneLayout, commit_proposals_to_git: bool) -> None:
-    lines = ["cache/"]
+    lines = ["cache/", "logs/"]
     if not commit_proposals_to_git:
         lines.append("proposals.jsonl")
     atomic_write_text(layout.gitignore, "\n".join(lines) + "\n")

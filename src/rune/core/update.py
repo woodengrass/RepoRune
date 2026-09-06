@@ -34,17 +34,27 @@ from rune.core.scopes.model import (
     load_scopes,
     save_scopes,
 )
-from rune.core.storage.canonical import read_json_model, write_json_model
+from rune.core.semantic.provider import ModelProvider, ProviderError, build_provider
+from rune.core.semantic.worker import aggregate_metrics, run_semantic_refresh
+from rune.core.storage.canonical import (
+    append_jsonl,
+    read_json_model,
+    read_jsonl,
+    write_json_model,
+)
 from rune.core.storage.models import (
     Edge,
     EdgeType,
     IndexedFile,
     IndexedFileStatus,
     ProjectFile,
+    RuneConfig,
+    ScopeSummary,
     Symbol,
 )
 from rune.core.storage.sqlite.materialize import (
     CodeIndexData,
+    current_scope_summaries,
     read_current_code_index,
     rebuild_cache,
 )
@@ -161,7 +171,42 @@ def _extract_references_only(scanned: ScannedFile) -> list[RawReference]:
         return []
 
 
-def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
+def _build_semantic_providers(config: RuneConfig) -> tuple[ModelProvider | None, ModelProvider | None]:
+    """Builds (primary, fallback) providers for the semantic worker, or
+    (None, None) if semantic refresh can't run this update — disabled in
+    config, no model configured, or the required API key env var is
+    missing. Never raises: a semantic-provider problem must never abort
+    the deterministic index update (ARCHITECTURE.md §4.9's failure-
+    isolation principle applies here too), it just means no scopes get
+    refreshed this run.
+    """
+    if not config.semantic.enabled or not config.semantic.model:
+        return None, None
+    try:
+        primary = build_provider(provider_name=config.semantic.provider, model=config.semantic.model)
+    except ProviderError:
+        return None, None
+    fallback = None
+    if config.semantic.fallback_model:
+        try:
+            fallback = build_provider(
+                provider_name=config.semantic.provider, model=config.semantic.fallback_model
+            )
+        except ProviderError:
+            fallback = None
+    return primary, fallback
+
+
+def _append_semantic_log(layout: RuneLayout, lines: list[str]) -> None:
+    if not lines:
+        return
+    layout.logs_dir.mkdir(parents=True, exist_ok=True)
+    with layout.semantic_log.open("a", encoding="utf-8") as f:
+        for line in lines:
+            f.write(f"{utc_now_iso()} {line}\n")
+
+
+def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]:
     config = load_config(layout.config_path)
     repo_root = layout.repo_root
     now = utc_now_iso()
@@ -280,13 +325,51 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
         if not auto_assigned_scope_ids:
             updated_scopes_file = None
 
+    # Semantic refresh (Milestone 5, ARCHITECTURE.md §4.5): computed here,
+    # in memory, for the same reason as the scopes auto-assignment above —
+    # the new/updated ScopeSummary revisions must land in this run's
+    # rebuild_cache transaction via `semantic_override`, but the canonical
+    # `semantic.jsonl` append is deferred until after rebuild_cache
+    # actually succeeds, so a failed update never leaves semantic.jsonl
+    # ahead of what the cache reflects (same all-or-nothing rationale as
+    # scopes.json in Milestone 4).
+    new_semantic_revisions: list[ScopeSummary] = []
+    semantic_local_log: list[str] = []
+    semantic_metrics_summary: dict[str, float] = {}
+    semantic_override: list[ScopeSummary] | None = None
+    existing_semantic: list[ScopeSummary] = []
+    primary_provider, fallback_provider = _build_semantic_providers(config)
+    if primary_provider is not None:
+        scopes_for_semantic = (updated_scopes_file or load_scopes(layout)).scopes
+        existing_semantic = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+        current_summaries = current_scope_summaries(existing_semantic)
+        refresh_result = run_semantic_refresh(
+            scopes=scopes_for_semantic,
+            current_summaries=current_summaries,
+            file_hashes={f.path: f.content_hash for f in new_files},
+            symbols=new_symbols,
+            primary_provider=primary_provider,
+            fallback_provider=fallback_provider,
+            max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
+            pricing=config.pricing,
+        )
+        new_semantic_revisions = refresh_result.new_revisions
+        semantic_local_log = refresh_result.local_log_lines
+        semantic_metrics_summary = aggregate_metrics(refresh_result.metrics)
+        if new_semantic_revisions:
+            semantic_override = [*existing_semantic, *new_semantic_revisions]
+
     stats = rebuild_cache(
         layout,
         code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges),
         scopes_override=updated_scopes_file,
+        semantic_override=semantic_override,
     )
     if updated_scopes_file is not None:
         save_scopes(layout, updated_scopes_file)
+    for summary in new_semantic_revisions:
+        append_jsonl(layout.semantic_jsonl, summary)
+    _append_semantic_log(layout, semantic_local_log)
 
     # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not
     # atomic with the SQLite commit above — memory.db and project.json are
@@ -312,6 +395,8 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
             "files_reused": len(changeset.unchanged),
             "files_deleted": len(changeset.deleted_paths),
             "scope_files_auto_assigned": len(auto_assigned_scope_ids),
+            "semantic_scopes_refreshed": len(new_semantic_revisions),
+            **{f"semantic_{key}": value for key, value in semantic_metrics_summary.items()},
         }
     )
     return stats

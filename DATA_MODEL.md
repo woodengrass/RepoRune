@@ -1,6 +1,6 @@
 # RepoRune（rune）— 資料模型
 
-狀態：**已確認（第三輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
+狀態：**已確認（第六輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
 必須分離）、補上 `source_bound`/`scope_bound`/`temporary` Constraint 實際可實作所需的 snapshot 欄位、
 補上 Note 的 revision 機制、以及 ScopeSummary `source_files` 的推導 invariant。第三輪修正
 `created_by` 的型別（改為 `RevisionAuthor` enum，解決與「系統自動附加 revision」的矛盾）、補上
@@ -11,8 +11,14 @@ Proposal 的 revision 機制（解決 append-only 與「改狀態」的矛盾）
 Policy Injection 支援欄位——`MemoryRevision` 新增選填的 `critical`（decision-only，標記進 hard
 bootstrap）、`source_document`/`source_section`（追溯到 `CODE_STANDARDS.md`）、
 `machine_check_hint`（constraint-only），以及 `BootstrapConfig`；「global constraint」的判定
-（`scopes == []`）完全沿用既有 schema，不需要新的 boolean flag，詳見 ARCHITECTURE.md §7。這是
-Milestone 1–6/7 實作時遵循的契約。
+（`scopes == []`）完全沿用既有 schema，不需要新的 boolean flag，詳見 ARCHITECTURE.md §7。**第六輪
+（Milestone 5 開工前）修正 `ScopeSummary` 的一個自相矛盾**：先前版本規定生成失敗時「不產生新的
+JSONL 行，只在 SQLite 投影中維持 `status=stale`」，但 SQLite 投影本身每次都是從 `semantic.jsonl`
+重新讀取算出來的，這句話邏輯上無法同時成立。`ScopeSummary` 新增 `revision` 欄位，比照
+Decision/Constraint/Note 既有的 revision 機制（current = `max(revision)`），失敗時複製上一筆
+current revision 的完整內容、只改動 status/last_error（首次生成就失敗則附加 `status=unavailable`
+且內容欄位留空，不虛構）；`last_error` 收斂為只允許清洗過的簡短分類字串，原始例外/provider 回應內容
+改寫進不進 git 的本機 `.rune/logs/semantic.log`。詳見 §2.4。這是 Milestone 1–6/7 實作時遵循的契約。
 
 ## 1. 慣例
 
@@ -130,14 +136,32 @@ class ScopesFile(BaseModel):
 `rune init --force` 絕不清空或重建此檔案為 skeleton，見第 9 節。
 
 ### 2.4 Semantic summary（`semantic.jsonl`，一行一個 JSON 物件，append-only）
+
+**本輪修訂（Milestone 5 開工前確認，取代先前「ScopeSummary 沒有 revision 欄位」的設計）**：先前版本
+規定生成失敗時「不產生新的 JSONL 行，只在 SQLite 投影中維持 `status=stale`」，但 SQLite 投影
+（`_materialize_semantic`）本身是每次 `rebuild_cache` 從 `semantic.jsonl` 重新讀取算出來的，這句話
+其實無法同時成立——失敗痕跡若不落地成 canonical，`rebuild-cache`／下一次 `rune update` 一定會讓它
+消失，回到「上次真正成功產生時的樣子」。討論後決定：**失敗狀態需要跨 session 持久化**，做法比照
+Decision/Constraint/Note 已經建立的 revision 機制，而不是另外發明一套：
+
 ```python
 class SemanticStatus(str, Enum):
     fresh = "fresh"
     possibly_stale = "possibly_stale"
     stale = "stale"
+    unavailable = "unavailable"
+    # 本輪新增：這個 scope 從未成功產生過任何 summary，且最近一次嘗試失敗。
+    # 與 stale 的差異：stale 代表「曾經有過內容，現在可能過期／上次刷新失敗」，
+    # 內容欄位仍是上次成功產生的真實內容；unavailable 代表「內容欄位從未有過
+    # 真實資料」，此時 purpose/responsibilities/... 等內容欄位一律是空值佔位
+    # （purpose=""、其餘 list 為 []），不得被當作真實描述顯示給 agent，只有
+    # revision/status/last_error/generated_at/model 帶有意義。
 
 class ScopeSummary(BaseModel):
     scope_id: str
+    revision: int              # 本輪新增，Field(ge=1)，per scope_id 單調遞增，
+                                # current = max(revision)，與 Decision/Constraint/
+                                # Note 共用同一套「current」定義（DATA_MODEL §1、§3）
     purpose: str
     responsibilities: list[str] = []
     entry_points: list[str] = []      # file 或 symbol_id
@@ -153,10 +177,18 @@ class ScopeSummary(BaseModel):
     source_files: dict[str, str] = {} # path -> content_hash，見下方 invariant
     status: SemanticStatus = SemanticStatus.fresh
     last_error: str | None = None
+    # 本輪重新定義：只允許「經過分類/清洗的簡短失敗原因」，例如
+    # "schema_validation_failed"、"provider_error:TimeoutError"、
+    # "repair_retry_failed"、"fallback_failed"——絕不允許放原始 provider
+    # 回應內容、原始例外訊息或 traceback（這些可能夾帶 prompt injection
+    # payload、模型 hallucinate 出的片段，或雖經 redaction 但仍有殘留風險的
+    # 文字）。canonical 檔案會進 git，敏感度假設等同任何其他原始碼檔案。
+    # 完整的原始錯誤（未清洗）寫入 `.rune/logs/semantic.log`（見 ARCHITECTURE
+    # §4.5），該檔案不進 git、不是 canonical 的一部分，僅供人類本機除錯。
     schema_version: int = 1
 ```
 
-**Invariant（本輪新增，修正 edge case）**：`source_files` 必須等於
+**Invariant（`source_files` 推導規則，維持不變）**：`source_files` 必須等於
 `scope.members.files ∪ {owning_file(s) for s in scope.members.symbols}`。也就是說，一個 scope 若只透過
 `members.symbols`（而非 `members.files`）納入成員（例如 `scope.files=[]`、
 `scope.symbols=["AuthService.login", "TokenService.rotate"]`），`source_files` 仍必須解析每個
@@ -170,10 +202,20 @@ symbol 的 owning file（透過 SQLite `symbols.file`）並納入，例如：
 `source_files = {}` 只有在 scope 完全沒有 member 時才合法；`core.semantic.worker` 在組 prompt 與計算
 `source_hash` 前，必須先呼叫這條解析邏輯，不能只看 `scope.members.files`。
 
-Append-only JSONL：每次 `rune update` 重新產生某 scope 的 summary 就附加新的一行；SQLite 只
-materialize 每個 `scope_id` 最新一行（`max(generated_at)` 或以寫入順序為準，非本節 revision
-機制管轄——ScopeSummary 沒有 Decision/Constraint/Note 那種 `revision` 欄位，因為它單純是「目前的
-描述」而非需要 audit trail 的治理紀錄）。
+**失敗時的 revision 語意（本輪新增）**：
+
+| 情境 | 附加的新 revision |
+|---|---|
+| 產生成功（schema 通過，`purpose` 等核心欄位有效） | 新內容、`status=fresh`、`last_error=None` |
+| 產生失敗／被拒絕，**且該 scope 之前已有成功產生過的 revision** | **複製上一個 current revision 的完整內容**（`purpose`/`responsibilities`/.../`source_files` 全部原樣帶過去，比照 §2.5 系統自動附加 revision 的「完整 snapshot」規則），只改動 `status=stale`、`last_error=<清洗後的分類字串>`、`generated_at`、`source_hash`/`source_files` 更新為**目前**的（不是舊的）——因為即使沒有新內容，staleness 判斷仍要對照現在的原始碼狀態，下次 hash 若又變了才知道要不要再試一次 |
+| 產生失敗，**且該 scope 從未成功產生過任何 revision**（`revision=1` 就失敗） | 附加 `revision=1`，`status=unavailable`，內容欄位一律留空（`purpose=""`、其餘 list 為 `[]`），不得虛構內容 |
+
+Append-only JSONL：每次 `rune update` 對某 scope 附加新的一行（不論成功或失敗，見上表），`current
+= max(revision)`（per `scope_id`），與 Decision/Constraint/Note 共用同一套「current」定義。SQLite
+`semantic_objects` 表只 materialize 每個 `scope_id` 的 current revision（`materialize.py` 計算
+current 時同樣不得依 `status` 過濾，純粹 `MAX(revision)`——與 §3 的既有規則一致）；若解析
+`semantic.jsonl` 時發現同一 `(scope_id, revision)` 重複，視為 canonical 衝突，中止該次 materialize，
+比照 Decision/Constraint/Note 的既有規則（§1、§3、§8），不自動選一筆。
 
 ### 2.5 Decision / Constraint revision（`decisions.jsonl`、`constraints.jsonl`）
 
@@ -505,16 +547,19 @@ materialize）——一個 typo 或指向已刪除檔案的 scope membership 只
 `rune update`/`rune rebuild-cache` 整個失敗。
 
 ```sql
--- semantic summary（只存目前一份；歷史留在 semantic.jsonl，非本檔案 revision 機制管轄）
+-- semantic summary（只存每個 scope_id 的 current revision＝MAX(revision)；
+-- 完整歷史留在 semantic.jsonl。本輪（Milestone 5 開工前）新增 current_revision
+-- 欄位，比照 decision_records/constraint_records/note_records 的既有模式）
 CREATE TABLE semantic_objects (
-    scope_id      TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
-    purpose       TEXT NOT NULL,
-    payload_json  TEXT NOT NULL,   -- 完整 ScopeSummary 序列化（含 source_files）
-    generated_at  TEXT NOT NULL,
-    model         TEXT NOT NULL,
-    source_hash   TEXT NOT NULL,
-    status        TEXT NOT NULL,
-    last_error    TEXT
+    scope_id         TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
+    current_revision INTEGER NOT NULL,
+    purpose          TEXT NOT NULL,
+    payload_json     TEXT NOT NULL,   -- 完整 ScopeSummary 序列化（含 source_files）
+    generated_at     TEXT NOT NULL,
+    model            TEXT NOT NULL,
+    source_hash      TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    last_error       TEXT
 );
 
 -- decision（current_revision = max(revision)，與 status 無關，見第 3 節）
