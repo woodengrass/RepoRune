@@ -166,3 +166,55 @@ def test_check_raises_cache_unusable_error_on_corrupt_db(git_repo: Path) -> None
 
     with pytest.raises(CacheUnusableError):
         check(layout)
+
+
+def test_check_finds_constraint_bound_directly_to_a_changed_file(python_simple_repo: Path) -> None:
+    """A relayed review confirmed by hand: `rune check` only ever looked
+    up constraints through scope membership (constraint_scopes), so a
+    constraint bound directly to `files=[...]` with no `scopes` at all
+    (e.g. a source_bound constraint) was invisible even when the exact
+    file it's bound to changed. Uses SHOULD severity specifically so the
+    global-MUST fallback path can't be what's finding it.
+    """
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="prefer f-strings",
+        severity=Severity.should, persistence_mode=PersistenceMode.source_bound,
+        files=["app/services.py"],
+    )
+    approve(layout, proposal.proposal_id, resolved_by="alice")
+    run_update(layout, full=True)
+
+    services = python_simple_repo / "app" / "services.py"
+    services.write_text(services.read_text(encoding="utf-8") + "\n# x\n", encoding="utf-8")
+
+    result = check(layout)
+    assert [c.record_id for c in result.constraints] == ["c1"]
+    assert result.constraints[0].scope_ids == []
+
+
+def test_check_finds_constraint_bound_to_a_symbol_in_a_changed_file(python_simple_repo: Path) -> None:
+    import sqlite3
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    conn = sqlite3.connect(str(layout.memory_db))
+    symbol_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'UserService.get_user'"
+    ).fetchone()[0]
+    conn.close()
+
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="must validate input",
+        severity=Severity.should, persistence_mode=PersistenceMode.source_bound,
+        symbols=[symbol_id],
+    )
+    approve(layout, proposal.proposal_id, resolved_by="alice")
+    run_update(layout, full=True)
+
+    services = python_simple_repo / "app" / "services.py"
+    services.write_text(services.read_text(encoding="utf-8") + "\n# x\n", encoding="utf-8")
+
+    result = check(layout)
+    assert [c.record_id for c in result.constraints] == ["c1"]

@@ -6,6 +6,7 @@ import pytest
 
 from rune.core.memory.notes import (
     NoteNotFoundError,
+    NoteValidationError,
     get_current_note,
     note_add,
     note_update,
@@ -146,3 +147,73 @@ def test_note_update_does_not_overwrite_created_at(git_repo: Path) -> None:
     updated = note_update(layout, note.id, content="revised")
     assert updated.created_at == original_created_at
     assert updated.last_verified_at != original_created_at
+
+
+def test_note_add_rejects_unresolved_file(python_simple_repo: Path) -> None:
+    """A relayed review confirmed by hand: note_add() had no equivalent
+    of the "reject a partial snapshot" check core.memory.proposals.
+    approve() applies to source_bound Constraints -- files=["app/
+    services.py", "GONE.py"] used to succeed, silently recording a
+    source_hashes snapshot covering only the file that resolved.
+    """
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    with pytest.raises(NoteValidationError):
+        note_add(
+            layout, category=NoteCategory.observation, content="c", why_persist="w",
+            files=["app/services.py", "GONE.py"],
+        )
+
+
+def test_note_add_rejects_unknown_scope(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    with pytest.raises(NoteValidationError):
+        note_add(layout, category=NoteCategory.observation, content="c", why_persist="w", scopes=["nope"])
+
+
+def test_note_update_can_change_files_and_recompute_source_hashes(python_simple_repo: Path) -> None:
+    """A relayed review confirmed by hand: note_update() previously had no
+    way to change scopes/files/symbols/expires_at/importance/confidence
+    at all -- a Note's binding and TTL were frozen at creation.
+    """
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    note = note_add(layout, category=NoteCategory.observation, content="c", why_persist="w")
+    assert note.files == []
+
+    updated = note_update(layout, note.id, files=["app/services.py"])
+    assert updated.files == ["app/services.py"]
+    assert "app/services.py" in updated.source_hashes
+
+
+def test_note_update_rejects_unresolved_new_file(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    note = note_add(layout, category=NoteCategory.observation, content="c", why_persist="w")
+    with pytest.raises(NoteValidationError):
+        note_update(layout, note.id, files=["GONE.py"])
+
+
+def test_note_update_can_change_expires_at_and_clear_it(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    note = note_add(
+        layout, category=NoteCategory.pitfall, content="c", why_persist="w",
+        expires_at="2099-01-01T00:00:00Z",
+    )
+    updated = note_update(layout, note.id, expires_at="2099-06-01T00:00:00Z")
+    assert updated.expires_at == "2099-06-01T00:00:00Z"
+
+    cleared = note_update(layout, note.id, clear_expires_at=True)
+    assert cleared.expires_at is None
+
+
+def test_note_update_can_change_importance_and_confidence(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    note = note_add(
+        layout, category=NoteCategory.pitfall, content="c", why_persist="w",
+        importance=0.5, confidence=0.5,
+    )
+    updated = note_update(layout, note.id, importance=0.9, confidence=0.2)
+    assert updated.importance == 0.9
+    assert updated.confidence == 0.2

@@ -200,6 +200,26 @@ def approve(
         )
 
     payload = edited_payload if edited_payload is not None else proposal.payload
+    if edited_payload is not None:
+        # An [E]dit is allowed to change content/rationale/scopes/files/
+        # symbols/severity/persistence_mode/expires_at/etc, but never
+        # which record it's approving into or what kind of record it is
+        # -- record_id/type identify *which proposal this is resolving*,
+        # not editable content. Without this check, an edited_payload
+        # with a different record_id silently writes the approval under
+        # an unrelated (possibly nonexistent) record while the original
+        # proposal gets marked resolved, which is effectively a hijacked
+        # approval with no error at all (confirmed by hand).
+        if edited_payload.record_id != proposal.record_id:
+            raise ProposalValidationError(
+                f"edited_payload.record_id ({edited_payload.record_id!r}) must match "
+                f"the proposal's own record_id ({proposal.record_id!r})"
+            )
+        if edited_payload.type != proposal.type:
+            raise ProposalValidationError(
+                f"edited_payload.type ({edited_payload.type.value!r}) must match "
+                f"the proposal's own type ({proposal.type.value!r})"
+            )
     _validate_payload_shape(payload.type, payload.severity, payload.persistence_mode, payload.expires_at)
 
     now = utc_now_iso()

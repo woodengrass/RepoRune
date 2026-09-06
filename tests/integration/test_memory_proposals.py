@@ -321,3 +321,71 @@ def test_approve_writes_memory_revision_before_resolving_proposal(git_repo: Path
     proposals = read_jsonl(layout.proposals_jsonl, Proposal)
     assert len(proposals) == 1
     assert proposals[0].status is ProposalStatus.pending
+
+
+def test_edited_payload_with_different_record_id_is_rejected(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: approve() never checked that
+    edited_payload.record_id matched the proposal being resolved, so an
+    edit could silently redirect the approval onto a completely different
+    (possibly unrelated or nonexistent) record_id while the original
+    proposal got marked resolved -- an undetected hijack, not an error.
+    """
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="original")
+    edited = proposal.payload.model_copy(update={"record_id": "d2-different", "content": "hijacked"})
+
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice", edited_payload=edited)
+
+    from rune.core.storage.canonical import read_jsonl
+    from rune.core.storage.models import MemoryRevision
+
+    assert read_jsonl(layout.decisions_jsonl, MemoryRevision) == []
+
+
+def test_edited_payload_with_different_type_is_rejected(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="original")
+    edited = proposal.payload.model_copy(
+        update={
+            "type": RecordType.constraint, "severity": Severity.must,
+            "persistence_mode": PersistenceMode.persistent,
+        }
+    )
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice", edited_payload=edited)
+
+
+def test_current_by_rejects_duplicate_revision(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: `core.memory.records.current_by`
+    (used by propose/approve/note_add/staleness, all of which read
+    canonical directly rather than through `rebuild_cache`) silently
+    picked one of two revisions sharing the same revision number, instead
+    of raising the same CanonicalConflictError `materialize.py`'s own
+    duplicate check already raises for the exact same situation. Two read
+    paths must agree that a canonical conflict is fatal, not just one.
+    """
+    from rune.core.storage.canonical import append_jsonl
+    from rune.core.storage.models import MemoryRevision, RevisionAuthor
+    from rune.core.storage.sqlite.materialize import CanonicalConflictError
+
+    layout = init_project(git_repo)
+    now = "2026-01-01T00:00:00Z"
+    append_jsonl(
+        layout.decisions_jsonl,
+        MemoryRevision(
+            record_id="d1", revision=2, type=RecordType.decision, status=RecordStatus.active,
+            content="version A", created_by=RevisionAuthor.human, created_at=now,
+        ),
+    )
+    append_jsonl(
+        layout.decisions_jsonl,
+        MemoryRevision(
+            record_id="d1", revision=2, type=RecordType.decision, status=RecordStatus.inactive,
+            content="version B", created_by=RevisionAuthor.human, created_at=now,
+        ),
+    )
+    from rune.core.memory.records import load_current_decisions
+
+    with pytest.raises(CanonicalConflictError):
+        load_current_decisions(layout)

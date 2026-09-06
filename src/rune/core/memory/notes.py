@@ -15,6 +15,7 @@ from rune.core.memory.hashes import compute_source_hashes
 from rune.core.memory.records import current_by_note_id
 from rune.core.memory.records import refresh_cache as _refresh_cache
 from rune.core.project import RuneLayout, utc_now_iso
+from rune.core.scopes.model import load_scopes
 from rune.core.semantic.redaction import redact_text
 from rune.core.storage.canonical import append_jsonl, read_jsonl
 from rune.core.storage.models import (
@@ -29,6 +30,19 @@ from rune.core.storage.sqlite.materialize import read_current_code_index
 
 class NoteNotFoundError(Exception):
     pass
+
+
+class NoteValidationError(Exception):
+    """Raised when a Note's `scopes`/`files`/`symbols` reference something
+    that doesn't currently resolve -- mirrors `core.memory.proposals.
+    approve()`'s "reject a partial snapshot outright" rule for
+    `persistence_mode=source_bound` Constraints: silently accepting a
+    Note bound to some files that resolve and some that don't would lose
+    the unresolved ones from `source_hashes` without telling anyone
+    (confirmed by hand this used to happen -- the exact class of bug
+    already fixed once for Constraint approval, reproduced here for Note
+    since `note_add` never had the equivalent check at all).
+    """
 
 
 def _redact(text: str, *, enabled: bool) -> str:
@@ -55,6 +69,34 @@ def _default_ttl_expiry(category: NoteCategory, notes_config: NotesConfig) -> st
     return (datetime.now(UTC) + timedelta(days=days)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _validate_references(
+    layout: RuneLayout, scopes: list[str], files: list[str], symbols: list[str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Rejects (`NoteValidationError`) any given scope/file/symbol that
+    doesn't currently resolve, instead of silently dropping it from
+    `source_hashes`/going unnoticed. Returns `(file_hashes,
+    symbol_owning_file)` so the caller can compute `source_hashes`
+    without loading the code index a second time.
+    """
+    code_index = read_current_code_index(layout)
+    file_hashes = {f.path: f.content_hash for f in code_index.files}
+    symbol_owning_file = {s.symbol_id: s.file for s in code_index.symbols}
+
+    missing_files = [f for f in files if f not in file_hashes]
+    unresolved_symbols = [s for s in symbols if s not in symbol_owning_file]
+    if missing_files or unresolved_symbols:
+        raise NoteValidationError(
+            "note references file(s)/symbol(s) that don't resolve to the current index -- "
+            f"unresolved files={missing_files}, symbols={unresolved_symbols}"
+        )
+    if scopes:
+        known_scope_ids = {s.id for s in load_scopes(layout).scopes}
+        unknown_scopes = [s for s in scopes if s not in known_scope_ids]
+        if unknown_scopes:
+            raise NoteValidationError(f"note references unknown scope(s): {unknown_scopes}")
+    return file_hashes, symbol_owning_file
+
+
 def note_add(
     layout: RuneLayout,
     *,
@@ -76,7 +118,9 @@ def note_add(
     is non-empty -- that's what makes the note "source_bound" for
     staleness purposes (DATA_MODEL.md §6: "只有設了 files/symbols/
     source_hashes 才 source-bound，否則視為 persistent"); a note with
-    neither stays persistent regardless of category.
+    neither stays persistent regardless of category. Any given `scopes`/
+    `files`/`symbols` that doesn't currently resolve raises
+    `NoteValidationError` rather than being silently dropped.
 
     `expires_at`, when not given explicitly, defaults from `config.notes`
     for the two TTL categories (`temporary_context`/`investigation_
@@ -84,11 +128,12 @@ def note_add(
     """
     now = utc_now_iso()
     source_hashes: dict[str, str] = {}
-    if files or symbols:
-        code_index = read_current_code_index(layout)
-        file_hashes = {f.path: f.content_hash for f in code_index.files}
-        symbol_owning_file = {s.symbol_id: s.file for s in code_index.symbols}
-        source_hashes = compute_source_hashes(list(files), list(symbols), file_hashes, symbol_owning_file)
+    if scopes or files or symbols:
+        file_hashes, symbol_owning_file = _validate_references(
+            layout, list(scopes), list(files), list(symbols)
+        )
+        if files or symbols:
+            source_hashes = compute_source_hashes(list(files), list(symbols), file_hashes, symbol_owning_file)
 
     if expires_at is None:
         config = load_config(layout.config_path)
@@ -134,6 +179,13 @@ def note_update(
     why_persist: str | None = None,
     status: NoteStatus | None = None,
     evidence: list[str] | None = None,
+    scopes: list[str] | None = None,
+    files: list[str] | None = None,
+    symbols: list[str] | None = None,
+    importance: float | None = None,
+    confidence: float | None = None,
+    expires_at: str | None = None,
+    clear_expires_at: bool = False,
     source: Literal["agent", "human"] = "agent",
     redact_secrets: bool = True,
     recompute_source_hashes: bool = False,
@@ -147,6 +199,19 @@ def note_update(
     one, because the underlying reason -- never losing metadata a later
     reader needs -- is the same).
 
+    `scopes`/`files`/`symbols`/`importance`/`confidence`/`expires_at` are
+    all independently updatable (previously only content/why_persist/
+    status/evidence were -- a Note's binding/TTL/metadata was otherwise
+    frozen at creation with no way to correct or extend it). Passing new
+    `files`/`symbols` re-validates and recomputes `source_hashes` for the
+    new set automatically (same "reject a partial resolve" rule as
+    `note_add`); passing neither leaves the existing snapshot as-is
+    unless `recompute_source_hashes=True`. `expires_at=None` (the
+    default) leaves the current value untouched -- pass
+    `clear_expires_at=True` to explicitly remove it (Python has no way to
+    distinguish "not passed" from "passed as None" through a single
+    parameter).
+
     `created_at` is deliberately NOT touched here -- DATA_MODEL.md §2.6
     lists only `status`/`source`/`last_verified_at` as the fields a
     revision transition changes; `created_at` is the note's original
@@ -154,27 +219,36 @@ def note_update(
     subsequent revision, distinct from `last_verified_at` which tracks
     this revision's own timestamp.
 
-    `recompute_source_hashes=True` re-snapshots `files`/`symbols` against
-    the current code index (e.g. after verifying a `stale` note's issue
-    was actually fixed and it's being un-staled) -- default False leaves
-    the existing snapshot untouched, since most updates (re-verifying,
-    archiving) aren't about the source content itself.
+    `recompute_source_hashes=True` re-snapshots the (possibly just-
+    updated) `files`/`symbols` against the current code index (e.g. after
+    verifying a `stale` note's issue was actually fixed and it's being
+    un-staled) -- default False leaves an untouched existing snapshot as
+    is, since most updates (re-verifying, archiving) aren't about the
+    source content itself.
     """
     current = get_current_note(layout, note_id)
     now = utc_now_iso()
+
+    new_scopes = list(scopes) if scopes is not None else current.scopes
+    new_files = list(files) if files is not None else current.files
+    new_symbols = list(symbols) if symbols is not None else current.symbols
+
     source_hashes = current.source_hashes
-    if recompute_source_hashes and (current.files or current.symbols):
-        code_index = read_current_code_index(layout)
-        file_hashes = {f.path: f.content_hash for f in code_index.files}
-        symbol_owning_file = {s.symbol_id: s.file for s in code_index.symbols}
-        source_hashes = compute_source_hashes(
-            current.files, current.symbols, file_hashes, symbol_owning_file
-        )
+    bindings_changed = scopes is not None or files is not None or symbols is not None
+    if bindings_changed or recompute_source_hashes:
+        file_hashes, symbol_owning_file = _validate_references(layout, new_scopes, new_files, new_symbols)
+        if new_files or new_symbols:
+            source_hashes = compute_source_hashes(new_files, new_symbols, file_hashes, symbol_owning_file)
+        else:
+            source_hashes = {}
 
     updates: dict = {
         "revision": current.revision + 1,
         "source": RevisionAuthor.agent if source == "agent" else RevisionAuthor.human,
         "last_verified_at": now,
+        "scopes": sorted(set(new_scopes)),
+        "files": sorted(set(new_files)),
+        "symbols": sorted(set(new_symbols)),
         "source_hashes": source_hashes,
     }
     if content is not None:
@@ -185,6 +259,14 @@ def note_update(
         updates["status"] = status
     if evidence is not None:
         updates["evidence"] = [_redact(e, enabled=redact_secrets) for e in evidence]
+    if importance is not None:
+        updates["importance"] = importance
+    if confidence is not None:
+        updates["confidence"] = confidence
+    if clear_expires_at:
+        updates["expires_at"] = None
+    elif expires_at is not None:
+        updates["expires_at"] = expires_at
 
     updated = current.model_copy(update=updates)
     append_jsonl(layout.notes_jsonl, updated)

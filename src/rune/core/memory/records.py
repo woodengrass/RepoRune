@@ -13,14 +13,38 @@ from rune.core.memory.revisions import current_revision
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_jsonl
 from rune.core.storage.models import MemoryRevision, Note, RecordType
-from rune.core.storage.sqlite.materialize import read_current_code_index, rebuild_cache
+from rune.core.storage.sqlite.materialize import (
+    CanonicalConflictError,
+    read_current_code_index,
+    rebuild_cache,
+)
 
 
 def _group_by_id[T](records: list[T], id_field: str) -> dict[str, list[T]]:
-    grouped: dict[str, list[T]] = defaultdict(list)
+    """Groups by logical id, rejecting a duplicate (id, revision) pair
+    the same way `materialize._group_current_by_id` already does.
+
+    This matters because `core.memory` reads canonical directly (propose/
+    approve/note_add/staleness all call `current_by*` here, not through
+    `rebuild_cache`), so without this check a corrupted canonical file
+    with two revisions sharing the same number would silently resolve to
+    an arbitrary one here -- computing the wrong `next_revision`, showing
+    the wrong current content -- while `rune update`/`rebuild-cache`
+    would correctly refuse to materialize the very same file. Both read
+    paths must treat a canonical conflict as fatal, not just one of them.
+    """
+    grouped: dict[str, dict[int, T]] = defaultdict(dict)
     for record in records:
-        grouped[getattr(record, id_field)].append(record)
-    return dict(grouped)
+        record_id = getattr(record, id_field)
+        revision = record.revision
+        if revision in grouped[record_id]:
+            raise CanonicalConflictError(
+                f"duplicate ({id_field}={record_id!r}, revision={revision}) found in canonical "
+                f"data -- refusing to silently pick one. Resolve manually (edit the file to "
+                f"remove/renumber one line)."
+            )
+        grouped[record_id][revision] = record
+    return {record_id: list(by_revision.values()) for record_id, by_revision in grouped.items()}
 
 
 def current_by[T](records: list[T], id_field: str) -> dict[str, T]:

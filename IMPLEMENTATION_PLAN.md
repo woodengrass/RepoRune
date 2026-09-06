@@ -1657,3 +1657,69 @@ revision 而改寫斷言，屬於預期行為變更，非迴歸）、`test_retri
 再動手修；「approve 兩段寫入非原子」用 monkeypatch 模擬崩潰、「history 找不到舊內容」用真實
 propose/approve 流程重現、「0-byte memory.db」用手工寫入空檔案重現。275 個測試全綠，`ruff check`
 全綠。
+
+### 第二十三輪修訂（使用者再轉述一份針對 Milestone 6 的外部 code review，20 條 finding，逐條確認）
+
+20 條裡有 9 條是上一輪（第二十二輪）已經修過的問題（重複轉述，非新問題），已重新確認修法仍然有效、
+未被本輪改動影響，不重複記錄。真正新確認、動手修的是以下 5 條，皆先寫重現腳本確認問題存在：
+
+116. **高·`rune check` 漏掉直接 file/symbol-bound 的 Constraint**：`check()` 先前只透過
+    `constraint_scopes` 反查（scope 路徑），一個沒有掛任何 scope、只靠 `persistence_mode=
+    source_bound` 的 `files`/`symbols` 直接綁定的 constraint，即使綁定的檔案剛好變更，也完全不會
+    出現在 `rune check` 的輸出。實測用 SHOULD severity（避開 Global MUST 分支誤判）重現：確實
+    找不到。修法：新增兩條額外查詢路徑，直接 join `constraint_files`（檔案比對）與
+    `constraint_symbols`（透過 `symbols` 表找出 symbol 的 owning file 是否在變更清單中，同時涵蓋
+    symbol 被刪除的情況——symbol 被刪除必然代表其所在檔案也變了，所以檔案層級的比對本來就會涵蓋
+    到），跟原本的 scope 路徑、global MUST 路徑取聯集。
+117. **中·edited proposal 可以偷偷改變 `record_id` 或 `type`**：`approve(edited_payload=...)`
+    先前完全不檢查 `edited_payload.record_id`/`.type` 是否跟原本要核准的 proposal 一致——實測重現：
+    把 `edited_payload.record_id` 改成一個完全不相關的值，核准照樣成功，內容被寫進了錯的
+    record_id，而原本的 proposal 卻顯示「已核准」，形同一次沒有任何錯誤訊息的靜默劫持。修法：
+    `approve()` 在使用 `edited_payload` 時，強制檢查兩者的 `record_id`/`type` 必須與原 proposal
+    相符，不符就拒絕。
+118. **中·`current_by()`（`core.memory.records`）對重複 revision 不拒絕**：`materialize.py` 自己
+    的 `_group_current_by_id` 早就會偵測 `(id, revision)` 重複並拒絕（`CanonicalConflictError`），
+    但 `core.memory.records.current_by()`——propose/approve/note_add/staleness 全部直接呼叫、
+    不經過 `rebuild_cache` 的另一條讀取路徑——完全沒有做一樣的檢查，實測重現：兩筆
+    `revision=2` 的 decision 丟進去，靜默選了其中一筆，沒有任何錯誤。這代表「canonical 衝突視為
+    致命錯誤」這件事只在其中一條讀取路徑上成立，另一條路徑會在資料已經損毀的情況下繼續假裝一切
+    正常。修法：把同樣的重複偵測邏輯搬進 `_group_by_id`，兩條路徑現在行為一致。
+119. **中·Note 的 `note_update()` 無法更新 binding/TTL/metadata**：先前只能改
+    `content`/`why_persist`/`status`/`evidence`，`scopes`/`files`/`symbols`/`expires_at`/
+    `importance`/`confidence` 建立後完全無法修改，形同 CRUD 裡永遠缺一角的 U。修法：全部補上
+    對應的可選參數，其中 `files`/`symbols` 變動時會重新驗證並用新的值重算 `source_hashes`
+    （沿用下面第 120 條的驗證邏輯）；`expires_at` 因為 Python 用 `None` 同時代表「不改」跟「清掉」
+    有歧義，另外新增 `clear_expires_at: bool` 明確表達「清掉」這個意圖。
+120. **中·`note_add()` 對不存在的 references 驗證不足**：跟第 107 條修過的 constraint
+    `source_bound` 核准是同一類問題，只是發生在 Note 身上——`files=["app/services.py",
+    "GONE.py"]` 這種情況下，`GONE.py` 解析不到就悄悄從 `source_hashes` 消失，`note_add()` 本身
+    不會報錯；`scopes` 引用不存在的 scope id 也完全沒有驗證。修法：新增 `NoteValidationError`，
+    `note_add`/`note_update` 都在寫入前檢查給定的 `scopes`/`files`/`symbols` 是否全部能解析，
+    有一個解析不到就整個拒絕（不是「至少一個成功就好」），跟 constraint 核准的標準一致。
+
+**確認已修過、本輪未再變動的 9 條**（第 107-115 條原始編號對照）：`source_bound` 核准接受部分
+snapshot（107）、Note TTL 死代碼（108）、`--history` 找不到舊 revision（109）、系統 note revision
+覆寫 `created_at`（110）、CLI `proposal edit` 缺欄位（111）、`search`/`check` 對損毀 db 無防護
+（112）、`approve()` 非原子寫入（113，見下方說明其現實邊界）、核准後 cache 不同步（114）、
+`rune check` 缺 Global MUST（115）。
+
+**四條評估後判定為既有設計邊界、非本輪修復範圍，向使用者說明理由而非直接動手**：
+- `approve()` 仍非嚴格原子（第 113 條的殘留部分）：上一輪已經把失敗模式從「靜默遺失」改成「可偵測、
+  可恢復」，這是 V1 單一寫入者假設下、不引入完整 two-phase-commit 機制的現實上限，跟這個專案對
+  `project.json`/`memory.db` 非原子性採取的態度一致（記錄為已知限制，而非追求完美原子性）。
+- `rune check` 顯示的是最近一次 `rune update` 材質化後的 status，不是「假設現在就跑 update 後會
+  變成什麼」的預測值——`rune status` 對工作目錄新鮮度也是用同樣「顯示已知狀態 + 另外報告差異」的
+  模式，不是重新計算假設性的未來狀態，`rune check` 沿用同一設計慣例。
+- `--history` 的名稱與行為並無不符：DATA_MODEL §3 明講「history 模式可看到全部 revision」，目前
+  `--history` 正是做這件事（含被取代的舊 revision 內容）。
+- FTS 索引只涵蓋 `content`/`rationale`/`why_persist` 等自由文字欄位，不含 `scopes`/`files`/
+  `symbols`/`severity`/`category` 等結構化欄位——這些欄位本來就有各自的 SQL 直接查詢管道（`rune
+  check` 剛好是最好的例子），FTS 全文檢索補的是「自然語言關鍵字搜尋」這個不同的需求，不是要取代
+  結構化查詢；新檔案還沒被分進任何 scope 時 `rune check` 的 scope 路徑自然找不到對應的
+  scope-bound constraint，這是正確反映現況（沒有 scope 就沒有 scope-bound 規則適用），第 116 條
+  修完後，直接綁定檔案/symbol 的 constraint 已經不再受這個限制。
+
+新增 8 個 regression test（`test_retrieval_check.py` +2、`test_memory_proposals.py` +3、
+`test_memory_notes.py` +5，其中 `note_update` 相關 3 個）。每條都先用 `git stash` 只還原
+`check.py`/`proposals.py`/`records.py`/`notes.py` 這四個檔案，確認新測試在修法前真的會失敗
+（`ImportError`、`DID NOT RAISE`、找不到結果），才視為有效。286 個測試全綠，`ruff check` 全綠。

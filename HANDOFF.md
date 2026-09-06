@@ -163,8 +163,22 @@ CRUD、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI
 的 memory 在下一次 `rune update` 前搜不到**（改成 `approve`/`note_add`/`note_update`/
 `deactivate` 都自動觸發一次輕量 materialize，重用已索引的 code index、不重新掃描原始碼）、
 **`rune check` 原本不含 global constraint**（改成也包含現行 global MUST 規則，SHOULD/INFO 維持
-scoped-only）。新增 22 個 regression test，每條都先寫重現腳本確認問題真的存在才動手修。**275 個
-測試全綠，`ruff check` 全綠。**
+scoped-only）。新增 22 個 regression test，每條都先寫重現腳本確認問題真的存在才動手修。275 個
+測試全綠，`ruff check` 全綠。
+
+**第二十三輪修訂：使用者再轉述一份 20 條 finding 的外部 review，逐條確認**（見
+IMPLEMENTATION_PLAN.md 第 116-120 條）。9 條是重複轉述（上一輪已修過），確認修法仍有效、未被
+本輪影響。5 條是新確認的真 bug 並修正：`rune check` 漏掉直接 file/symbol-bound（不掛任何 scope）
+的 constraint（高，新增 join `constraint_files`/`constraint_symbols` 兩條查詢路徑）、edited
+proposal 可以偷偷改變 `record_id`/`type` 造成靜默劫持核准內容（中，`approve()` 現在強制檢查兩者
+一致）、`core.memory.records.current_by()` 對重複 revision 不拒絕，跟 `materialize.py` 自己的
+衝突偵測邏輯不一致（中，兩條讀取路徑現在行為一致）、Note 的 `note_update()` 無法更新
+binding/TTL/metadata（中，補上對應可選參數）、`note_add()` 對不存在的 references 驗證不足（中，
+比照 constraint 核准的標準，新增 `NoteValidationError`）。另外 4 條（`approve()` 殘留的非嚴格
+原子性、`rune check` 顯示已知 status 而非預測值、`--history` 名稱與行為並無不符、FTS 索引不含
+結構化 metadata 欄位）評估後判定為既有設計邊界，向使用者說明理由而非直接動手，細節見
+IMPLEMENTATION_PLAN.md。新增 8 個 regression test，每條都用 `git stash` 確認修法前真的會失敗。
+**286 個測試全綠，`ruff check` 全綠。**
 
 ## 專案是什麼
 
@@ -245,7 +259,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**275 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**286 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
