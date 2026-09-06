@@ -204,9 +204,9 @@ git-init 過的小型測試用 repo）。
 
 - **多人協作衝突**：`revision` 是單純遞增整數，兩個 branch 各自從同一個 revision 產生下一版再
   merge 會撞號，V1 明確不解決，只保證偵測到衝突時會拒絕 materialize（不會默默選一個）。
-- **`from . import X`（Python 純點號相對 import）解析不到具體目標**：因為目前的擷取邏輯只抓
-  relative import 的點號前綴，沒有抓 `import` 後面的名稱列表，這種情況現在回傳 `None`（誠實地
-  unresolved），刻意不猜（之前猜錯過，猜成套件自己的 `__init__.py`，已經修掉那個假陽性）。
+  - **`from . import X`（Python 純點號相對 import）解析不到具體目標**：因為目前的擷取邏輯只抓
+    relative import 的點號前綴，沒有抓 `import` 後面的名稱列表，這種情況現在回傳 `None`（誠實地
+    unresolved），刻意不猜（之前猜錯過，猜成套件自己的 `__init__.py`，已經修掉那個假陽性）。
 - **Scope clustering 演算法參數不鎖死**：Milestone 4 明確定位為「留給真實 repo 實驗調整」，不是
   現在就要做到完美聚類。
 - **`project.json` 的 `last_indexed_*` 欄位跟 SQLite commit 不是原子的**：這是接受的已知限制，
