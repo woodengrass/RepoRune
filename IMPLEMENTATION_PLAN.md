@@ -1519,3 +1519,33 @@ IMPLEMENTATION_PLAN 第 410 行起、DATA_MODEL.md §2.5/§2.5a/§2.6/§6、ARCH
 
 尚未完成：`rune.core.retrieval.search`（八層排序）、`rune check`、CLI 子命令
 （`decision`/`constraint`/`note`/`proposal`/`search`/`check`）。
+
+### 第二十輪修訂（`rune.core.retrieval.search`/`check`）
+
+102. **`rune.core.retrieval.search`**：ARCHITECTURE §4.8 的八層排序，對五張 FTS5 表分別查詢後依
+    record 目前的 status/severity/是否 scoped 分類。查詢字串一律包成 FTS5 phrase query（引號包住、
+    內部引號雙寫跳脫）而非直接把使用者輸入丟給 MATCH——V1 不打算把 FTS5 完整查詢語法
+    （AND/OR/NEAR/欄位過濾）暴露給 CLI 使用者，phrase query 也能避免使用者輸入的連字號/冒號等字元
+    讓 MATCH 直接丟 `OperationalError`。**只有 MUST 分 global/scoped**（ARCHITECTURE §4.8 原文
+    明講這輪修訂的重點就是「插入 Global/Scoped MUST 的區分」），SHOULD 與未列出的 INFO severity
+    不分 global/scoped，統一算 rank 4；current+visible-with-warning 的 decision/constraint
+    （`review_required`/`stale`）沒有獨立 rank，因為八層清單裡沒有定義，維持在原本 severity/type
+    對應的 rank，只是額外帶 `warning` 欄位，不是自己發明一個新 rank。
+103. **落實 Milestone 5 第十五輪決議第 2 點：`possibly_stale`/`stale` 的 semantic summary 絕不直接
+    回傳舊摘要文字**：`_search_semantic` 對這兩種 status 回傳 `possibly_stale_pointer()`（指向
+    `source_files` 的提示訊息），只有 `fresh` 才回傳真正的 `purpose` 內容；`unavailable`/`orphaned`
+    完全跳過（原本就沒有可用內容）。這是這句決議寫下後第一次真正落地。
+104. **`rune.core.retrieval.check`**：不呼叫 git diff 第二次，直接重用 `rune status` 既有的
+    「掃描工作目錄 -> 對照 `files` 表的 content_hash」diff 機制，避免兩套「什麼算是變更」的定義互相
+    打架。變更檔案 -> `scope_files` 反查受影響 scope -> `constraint_scopes` 反查相關 constraint，
+    只回傳 current+visible 的 constraint（`inactive`/`orphaned` 排除），依 MUST 優先排序。刻意只回傳
+    constraint（IMPLEMENTATION_PLAN 原文字面只提到「相關 constraint 清單」，不含 decision），global
+    constraint（`scopes==[]`）不主動塞進每次 `rune check` 的輸出——它已經由 hard bootstrap（Milestone
+    7）與 `rune search` 覆蓋，`rune check` 的職責範圍限定在「這次變更牽動了哪些範圍內的規則」。
+
+新增 11 個測試（`test_retrieval_search.py` 6 個、`test_retrieval_check.py` 5 個），皆透過
+`python_simple_repo`/`git_repo` fixture 跑真實的 propose/approve/note_add → `run_update` →
+查詢流程。258 個測試全綠，`ruff check` 全綠。
+
+尚未完成：CLI 子命令（`decision`/`constraint`/`note`/`proposal`/`search`/`check`）——Milestone 6
+交付項目目前只剩這一塊，做完就是完整的 Milestone 6。
