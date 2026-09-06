@@ -1,0 +1,30 @@
+[project]
+name = "rune"
+version = "0.1.0"
+description = "RepoRune — Repository Understanding & Navigation Engine"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "tomli-w>=1.0",
+]
+
+[project.scripts]
+rune = "rune.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rune"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# B008 (function call in default arg) is Typer's standard idiom for
+# declaring options/arguments — not the mutable-default footgun the rule
+# exists for. Ignore it repo-wide rather than sprinkling noqa on every
+# CLI parameter.
+ignore = ["B008"]
