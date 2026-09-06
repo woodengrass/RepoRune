@@ -31,7 +31,7 @@ class AlreadyInitializedError(Exception):
     pass
 
 
-def _utc_now_iso() -> str:
+def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace(
         "+00:00", "Z"
     )
@@ -175,7 +175,7 @@ def init_project(repo_root: Path, force: bool = False) -> RuneLayout:
         project = ProjectFile(
             project_id=str(uuid.uuid4()),
             name=repo_root.name,
-            created_at=_utc_now_iso(),
+            created_at=utc_now_iso(),
         )
         write_json_model(layout.project_json, project)
 

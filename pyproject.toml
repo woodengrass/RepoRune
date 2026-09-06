@@ -7,6 +7,10 @@ dependencies = [
     "pydantic>=2.6",
     "typer>=0.12",
     "tomli-w>=1.0",
+    "tree-sitter>=0.23",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
 ]
 
 [project.scripts]
@@ -21,6 +25,13 @@ packages = ["src/rune"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+# Fixture repos under tests/integration/fixtures are sample source data
+# consumed by the indexer's tests, not code this project maintains to its
+# own style — e.g. python-simple/app/main.py deliberately imports an
+# unused stdlib module to exercise unresolved-import handling.
+extend-exclude = ["tests/integration/fixtures"]
 
 [tool.ruff.lint]
 # B008 (function call in default arg) is Typer's standard idiom for

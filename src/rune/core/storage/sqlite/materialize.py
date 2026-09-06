@@ -1,14 +1,19 @@
 """canonical -> SQLite materialization. Never calls an LLM (spec §44).
 
-`rebuild_cache` performs a full rebuild: delete memory.db, recreate schema,
-and repopulate every table from the canonical files in one transaction that
-commits atomically at the end (ARCHITECTURE.md §4.7) — so a reader never
-observes a half-materialized database.
+`rebuild_cache` performs a full rebuild: clear every table, recreate
+schema, and repopulate everything in one transaction that commits
+atomically at the end (ARCHITECTURE.md §4.7) — so a reader never observes
+a half-materialized database.
 
 Milestone 1 scope: code index tables (files/symbols/edges) are created but
-stay empty; they are populated starting Milestone 2. Everything else
-(scopes, decisions, constraints, notes, proposals, semantic summaries) is
-fully materialized here since the canonical writers already exist.
+stay empty unless the caller passes `code_index` explicitly. Milestone 2's
+`core.update` is the first caller to actually populate them — it re-derives
+this data straight from source on every run (ARCHITECTURE.md invariant #2:
+source code is the only source of truth for code facts), so unlike the
+canonical-memory tables there is no JSONL/JSON file backing files/symbols/
+edges. Everything else (scopes, decisions, constraints, notes, proposals,
+semantic summaries) is fully materialized here since the canonical writers
+already exist.
 """
 
 from __future__ import annotations
@@ -16,18 +21,25 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import defaultdict
+from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model, read_jsonl
 from rune.core.storage.models import (
+    Edge,
+    EdgeType,
+    IndexedFile,
+    IndexedFileStatus,
     MemoryRevision,
     Note,
     Proposal,
     RecordType,
     ScopesFile,
     ScopeSummary,
+    Symbol,
+    SymbolKind,
 )
 
 
@@ -259,6 +271,106 @@ def _materialize_semantic(conn: sqlite3.Connection, summaries: list[ScopeSummary
         )
 
 
+@dataclass(frozen=True)
+class CodeIndexData:
+    """The decisive-index tables' content for one materialize pass.
+    Milestone 2's `core.update` builds this fresh on every run — files/
+    symbols/edges have no canonical JSON/JSONL backing them (see module
+    docstring), so there is nothing to "read from disk" the way
+    scopes/decisions/etc. are.
+    """
+
+    files: list[IndexedFile] = field(default_factory=list)
+    symbols: list[Symbol] = field(default_factory=list)
+    edges: list[Edge] = field(default_factory=list)
+
+
+def _materialize_code_index(conn: sqlite3.Connection, code_index: CodeIndexData) -> None:
+    for f in code_index.files:
+        conn.execute(
+            "INSERT INTO files "
+            "(path, language, content_hash, size, mtime, git_blob_hash, indexed_at, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                f.path, f.language, f.content_hash, f.size, f.mtime,
+                f.git_blob_hash, f.indexed_at, f.status.value,
+            ),
+        )
+    for s in code_index.symbols:
+        conn.execute(
+            "INSERT INTO symbols "
+            "(symbol_id, file, name, qualified_name, kind, signature, start_line, end_line) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                s.symbol_id, s.file, s.name, s.qualified_name, s.kind.value,
+                s.signature, s.start_line, s.end_line,
+            ),
+        )
+    for e in code_index.edges:
+        conn.execute(
+            "INSERT INTO edges "
+            "(source_symbol, source_file, target_symbol, target_file, edge_type, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                e.source_symbol, e.source_file, e.target_symbol, e.target_file,
+                e.edge_type.value, e.confidence,
+            ),
+        )
+
+
+def read_current_code_index(layout: RuneLayout) -> CodeIndexData:
+    """Reads the currently-materialized files/symbols/edges back out of
+    memory.db. Used by `core.update` to know what was indexed last time
+    (for change detection) and to reuse symbols/edges for files whose
+    content hash hasn't changed, without re-parsing them. Returns an
+    empty CodeIndexData if memory.db doesn't exist yet (first run).
+    """
+    if not layout.memory_db.exists():
+        return CodeIndexData()
+    conn = connect(layout.memory_db)
+    try:
+        files = [
+            IndexedFile(
+                path=row["path"],
+                language=row["language"],
+                content_hash=row["content_hash"],
+                size=row["size"],
+                mtime=row["mtime"],
+                git_blob_hash=row["git_blob_hash"],
+                indexed_at=row["indexed_at"],
+                status=IndexedFileStatus(row["status"]),
+            )
+            for row in conn.execute("SELECT * FROM files")
+        ]
+        symbols = [
+            Symbol(
+                symbol_id=row["symbol_id"],
+                file=row["file"],
+                name=row["name"],
+                qualified_name=row["qualified_name"],
+                kind=SymbolKind(row["kind"]),
+                signature=row["signature"],
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+            )
+            for row in conn.execute("SELECT * FROM symbols")
+        ]
+        edges = [
+            Edge(
+                source_symbol=row["source_symbol"],
+                source_file=row["source_file"],
+                target_symbol=row["target_symbol"],
+                target_file=row["target_file"],
+                edge_type=EdgeType(row["edge_type"]),
+                confidence=row["confidence"],
+            )
+            for row in conn.execute("SELECT * FROM edges")
+        ]
+        return CodeIndexData(files=files, symbols=symbols, edges=edges)
+    finally:
+        conn.close()
+
+
 # Tables that own their family via ON DELETE CASCADE — clearing just these
 # six also clears every dependent table (symbols/edges under files;
 # scope_files/scope_symbols/semantic_objects under scopes; the *_scopes/
@@ -280,9 +392,21 @@ def _clear_all_content(conn: sqlite3.Connection) -> None:
         conn.execute(f"DELETE FROM {table};")
 
 
-def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
-    """Fully rebuilds memory.db from canonical files. Zero LLM calls, zero
-    network. Returns a small stats dict for `rune rebuild-cache` output.
+def rebuild_cache(
+    layout: RuneLayout, code_index: CodeIndexData | None = None
+) -> dict[str, int]:
+    """Fully rebuilds memory.db from canonical files (and, from Milestone 2
+    on, the caller-supplied `code_index`). Zero LLM calls, zero network.
+    Returns a small stats dict for `rune rebuild-cache`/`rune update`
+    output.
+
+    `code_index` has no canonical JSON/JSONL backing (files/symbols/edges
+    are re-derived from source on every run — ARCHITECTURE.md invariant
+    #2), so this function does not compute it itself; `core.update` does
+    (either a full fresh scan+parse for `rune rebuild-cache`, or an
+    incremental diff-and-reuse pass for `rune update`) and passes the
+    result in. Omitting it (the Milestone 1 behavior, and what plain
+    canonical-only tests use) simply leaves files/symbols/edges empty.
 
     Rebuilds **in place**, inside a single SQLite transaction (clear every
     table, then re-insert everything, then commit) rather than building a
@@ -299,6 +423,7 @@ def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
     read transaction keeps seeing its snapshot until it starts a new one,
     without the underlying file ever needing to be swapped out.
     """
+    code_index = code_index if code_index is not None else CodeIndexData()
     conn = connect(layout.memory_db)
     try:
         create_schema(conn)
@@ -312,6 +437,7 @@ def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
 
         conn.execute("BEGIN;")
         _clear_all_content(conn)
+        _materialize_code_index(conn, code_index)
         _materialize_scopes(conn, scopes_file)
         _materialize_decisions_or_constraints(conn, decisions, RecordType.decision)
         _materialize_decisions_or_constraints(conn, constraints, RecordType.constraint)
@@ -329,6 +455,9 @@ def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
         conn.close()
 
     return {
+        "files": len(code_index.files),
+        "symbols": len(code_index.symbols),
+        "edges": len(code_index.edges),
         "scopes": len(scopes_file.scopes),
         "decisions": len(decisions),
         "constraints": len(constraints),

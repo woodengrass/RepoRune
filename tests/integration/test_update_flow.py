@@ -1,0 +1,165 @@
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from rune.core.project import RuneLayout, init_project
+from rune.core.update import run_update
+
+
+def test_python_simple_fixture_indexes_expected_symbols(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    stats = run_update(layout, full=True)
+
+    assert stats["files"] == 3  # __init__.py, main.py, services.py
+    assert stats["files_parsed"] == 3
+    assert stats["files_reused"] == 0
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
+    assert "UserService" in qnames
+    assert "UserService.get_user" in qnames
+    assert "run" in qnames
+    assert "DEFAULT_TIMEOUT" in qnames
+
+    # `.services` relative import from app/main.py must resolve to the real file
+    edge = conn.execute(
+        "SELECT target_file FROM edges WHERE source_file = ? AND target_file IS NOT NULL",
+        ("app/main.py",),
+    ).fetchone()
+    assert edge == ("app/services.py",)
+
+    # the unresolvable stdlib import must still be recorded, just unresolved
+    stdlib_edges = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE source_file = ? AND target_file IS NULL",
+        ("app/main.py",),
+    ).fetchone()[0]
+    assert stdlib_edges == 1
+
+
+def test_ts_simple_fixture_indexes_expected_symbols_and_edge(ts_simple_repo: Path) -> None:
+    layout = init_project(ts_simple_repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    rows = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT qualified_name, kind FROM symbols")
+    }
+    assert rows["Vector"] == "interface"
+    assert rows["add"] == "function"
+    assert rows["Calculator"] == "class"
+    assert rows["Calculator.sum"] == "method"
+    assert rows["origin"] == "function"
+
+    edge = conn.execute(
+        "SELECT target_file FROM edges WHERE source_file = ?", ("src/index.ts",)
+    ).fetchone()
+    assert edge == ("src/utils.ts",)
+
+
+def test_update_only_reparses_the_changed_file(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    # no changes: a second update must parse nothing
+    noop_stats = run_update(layout, full=False)
+    assert noop_stats["files_parsed"] == 0
+    assert noop_stats["files_reused"] == 3
+
+    # modify exactly one file
+    (python_simple_repo / "app" / "services.py").write_text(
+        (python_simple_repo / "app" / "services.py").read_text(encoding="utf-8") + "\n# comment\n",
+        encoding="utf-8",
+    )
+    stats = run_update(layout, full=False)
+    assert stats["files_parsed"] == 1
+    assert stats["files_reused"] == 2
+
+
+def test_symbol_rename_produces_new_id_and_removes_old(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    old_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = ?", ("UserService.get_user",)
+    ).fetchone()[0]
+
+    services_path = python_simple_repo / "app" / "services.py"
+    services_path.write_text(
+        services_path.read_text(encoding="utf-8").replace("get_user", "fetch_user"),
+        encoding="utf-8",
+    )
+    run_update(layout, full=False)
+
+    conn2 = sqlite3.connect(str(layout.memory_db))
+    qnames = {row[0] for row in conn2.execute("SELECT qualified_name FROM symbols")}
+    assert "UserService.get_user" not in qnames
+    assert "UserService.fetch_user" in qnames
+    new_id = conn2.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = ?", ("UserService.fetch_user",)
+    ).fetchone()[0]
+    assert new_id != old_id
+    # the old id must be gone entirely, not orphaned
+    assert conn2.execute(
+        "SELECT COUNT(*) FROM symbols WHERE symbol_id = ?", (old_id,)
+    ).fetchone()[0] == 0
+
+
+def test_deleted_file_is_removed_from_index(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    (python_simple_repo / "app" / "main.py").unlink()
+    stats = run_update(layout, full=False)
+    assert stats["files_deleted"] == 1
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    paths = {row[0] for row in conn.execute("SELECT path FROM files")}
+    assert "app/main.py" not in paths
+    qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
+    assert "run" not in qnames
+
+
+def test_last_indexed_tree_hash_changes_when_content_changes(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    project_after_first = RuneLayout(repo_root=python_simple_repo)
+    from rune.core.storage.canonical import read_json_model
+    from rune.core.storage.models import ProjectFile
+
+    first = read_json_model(project_after_first.project_json, ProjectFile)
+    assert first.last_indexed_tree_hash is not None
+
+    (python_simple_repo / "app" / "main.py").write_text(
+        (python_simple_repo / "app" / "main.py").read_text(encoding="utf-8") + "\n# x\n",
+        encoding="utf-8",
+    )
+    run_update(layout, full=False)
+    second = read_json_model(project_after_first.project_json, ProjectFile)
+    assert second.last_indexed_tree_hash != first.last_indexed_tree_hash
+
+
+def test_rebuild_cache_full_rescan_matches_incremental_state(python_simple_repo: Path) -> None:
+    """rebuild-cache equivalence: a full rescan (`full=True`) must produce
+    the same logical code index as the incrementally-updated state, for
+    the same on-disk source.
+    """
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    (python_simple_repo / "app" / "services.py").write_text(
+        (python_simple_repo / "app" / "services.py").read_text(encoding="utf-8") + "\n# c\n",
+        encoding="utf-8",
+    )
+    incremental_stats = run_update(layout, full=False)
+
+    full_stats = run_update(layout, full=True)
+
+    assert incremental_stats["symbols"] == full_stats["symbols"]
+    assert incremental_stats["files"] == full_stats["files"]
+    assert incremental_stats["edges"] == full_stats["edges"]
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
+    assert "UserService.get_user" in qnames

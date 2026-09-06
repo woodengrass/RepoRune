@@ -104,7 +104,19 @@ Global Code Standards 支援欄位）。經過兩輪實測（第一輪自測、�
   標記、config 驗證錯誤路徑、`init --force` 的保留規則。
 
 ## Milestone 2 — Code index
-**模組**：`rune.core.index.scanner`、`rune.core.index.treesitter`、`rune.core.index.imports`。
+
+**目前狀態：已實作並通過測試**（`src/rune/core/index/`、`src/rune/core/update.py`，74 個測試全綠，
+`ruff check` 全綠，含兩個 fixture repo：`tests/integration/fixtures/{python-simple,ts-simple}`）。
+`rune rebuild-cache` 這次也改為真的做全量重新掃描＋解析（而不再只是「code index 保持空」的
+Milestone 1 占位行為）——因為 files/symbols/edges 完全從原始碼推導、沒有 canonical 檔案背書，
+「安全可重建」的唯一方式就是重新掃描一次，而這只是本機解析，沒有 LLM/網路成本，符合
+「rebuild-cache 零 LLM 呼叫」的要求。`rune update`（新指令）走 incremental 路徑：只有 content_hash
+改變的檔案會被重新丟進 tree-sitter，其餘檔案直接沿用 SQLite 裡既有的 symbols/edges。兩者共用同一個
+`core.update.run_update(layout, full=...)` 進入點與同一個 `materialize.rebuild_cache` 交易邏輯，只
+差在 `code_index` 的算法（全量 vs. diff-and-reuse）。
+
+**模組**：`rune.core.index.scanner`、`rune.core.index.treesitter`、`rune.core.index.imports`、
+`rune.core.update`。
 
 **交付項目：**
 - 依 include/exclude glob 走訪檔案；計算 content hash + git blob hash；與 SQLite `files` 表中先前索引
