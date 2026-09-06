@@ -805,5 +805,22 @@ text 解析）。
     的 `members.files`，不需人類確認、不觸發全庫重新分群。零個/多個候選、只有 best-effort reference
     命中、目標 scope 為 `locked`、任何移除 membership 或建立新 scope 的動作，一律落回人類確認流程。
     這個判準刻意比 clustering 建議嚴格，因為 incremental 自動併入是唯一無人把關的寫入路徑，只能使用
-    §4.3 明定的 high-confidence 訊號，不能讓 best-effort reference 的不確定性滲透進自動寫入動作。
-    `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響，實作於 Milestone 4。
+     §4.3 明定的 high-confidence 訊號，不能讓 best-effort reference 的不確定性滲透進自動寫入動作。
+     `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響，實作於 Milestone 4。
+
+### 第八輪實作記錄（Milestone 4）
+
+48. **Scope 實作採 canonical CRUD 加一次性 suggestion 的最小路徑**：新增
+    `core.scopes.model` 的 create/edit/delete/lock/unlock 與 import-only incremental assignment，
+    `heuristics` 的共同目錄候選，及 `clustering` 的 NetworkX connected-components。候選只在
+    `rune scope suggest` 的當次互動存在；接受後才以 `source=model` 寫入 `scopes.json`。Clustering
+    從 SQLite `edges` 讀取 `imports`/`calls`/`extends`/`implements`，但自動併入只接受新檔案指向
+    單一 unlocked scope member 的 `imports` + `confidence=1.0` edge。自我驗證涵蓋 CRUD、多 scope
+    membership、locked scope、零/多候選、reference-only 命中與拒絕 suggestion 不留 canonical 副作用。
+49. **真實 repo 實驗結果（2026-09-06）**：在 RepoRune 的乾淨暫存 clone（36 個索引檔）與
+    `兌換碼腳本` 的乾淨暫存 clone（7 個索引檔）執行 `rune scope suggest`，全部拒絕以確認無 canonical
+    副作用。RepoRune 的 path heuristic 產出 `src`（19 檔）與 `tests`（17 檔）兩個過寬候選，不宜直接採用；
+    graph 產出兩個 fixture app 的 2 檔候選，人工判定合理。第二個 repo 的 graph 產出 7 個緊耦合
+    application/test 檔案的單一候選，適合當起點但仍須人類拆分。此樣本共 5 個候選，2 個可直接採用、1 個
+    可作起點、2 個過寬；現階段保留「建議而非正確性需求」定位，不據此鎖死 threshold，後續以更多中型
+    repo 觀察是否需要將 path heuristic 從頂層目錄收斂到更細的共同前綴。

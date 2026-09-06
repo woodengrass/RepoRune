@@ -1,6 +1,6 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-06，commit `dba8d85`（Milestone 4 開工前設計決策記錄，尚未寫程式碼）
+最後更新：2026-09-06，Milestone 4 已實作並完成驗證（待 commit）。
 
 ## 專案是什麼
 
@@ -30,14 +30,15 @@ commit，全部已 push，沒有未提交的變更）。
 Decision/Constraint 語意、staleness 語意、agent-injection 語意的變更，都要求先更新文件、記錄決策
 理由，才能動程式碼。**接手的人／agent 請延續這個習慣**，不要跳過文件直接改 code。
 
-## 目前進度：Milestone 1-3 完成並通過測試；Milestone 4 設計決策已定案，程式碼尚未開始寫
+## 目前進度：Milestone 1-4 完成並通過測試
 
-**這是本次交接的重點**：上一個 session 沒有寫任何 Milestone 4 的程式碼，只做了「開工前先問清楚
-設計決策」這件事（延續本專案的既定工作方式，見下方「工作方式」第 5 條）。三個決策已經討論確認、
-寫進文件、commit + push（`dba8d85`），**下一個 session 應該直接開始實作 `rune.core.scopes`，不需要
-再重新討論這三個決策**，除非你重新審視後想推翻它們。
+Milestone 4 已實作 `rune.core.scopes.{model,heuristics,clustering}` 與 `rune scope`
+CLI（`list`/`create`/`edit`/`delete`/`lock`/`unlock`/`suggest`）。`networkx` 是新增的 runtime dependency。
+候選只在 `rune scope suggest` 互動期間存在；接受後才寫入 `scopes.json`，拒絕或結束 CLI 不留下副作用。
+`rune update` 對新增檔案實作唯一的無人確認寫入：只接受指向單一 unlocked scope member 的
+`imports`、`confidence=1.0` edge。詳見 IMPLEMENTATION_PLAN.md 第八輪實作記錄第 48-49 條。
 
-### Milestone 4 開工前確認的三個設計決策（第七輪修訂，見 ARCHITECTURE.md §4.4、
+### Milestone 4 已採用的三個設計決策（第七輪修訂，見 ARCHITECTURE.md §4.4、
 IMPLEMENTATION_PLAN.md 設計決策記錄第 45-47 條）
 
 1. **候選 scope（heuristic + clustering）不持久化，純一次性 CLI 互動**：`rune scope suggest` 當場
@@ -57,17 +58,13 @@ IMPLEMENTATION_PLAN.md 設計決策記錄第 45-47 條）
    建議嚴格，因為 incremental 自動併入是唯一無人把關的寫入路徑，只能用 high-confidence 訊號。
    `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響。
 
-### Milestone 4 下一步實作建議
+### Milestone 4 實作結果
 
-開工前先重讀一次：IMPLEMENTATION_PLAN.md 的 Milestone 4 整段（交付項目已依上述三個決策改寫）、
-ARCHITECTURE.md §4.4（含新增的決策段落）。模組落在 `rune.core.scopes.{model,heuristics,clustering}`，
-CLI 大概需要新增 `rune scope` 相關子命令（例如 `list`/`create`/`lock`/`unlock`/`suggest`），但**子
-命令的確切介面規格文件裡沒有寫死，屬於實作細節，可以邊做邊定**（跟前三個「會改變 scope model 語意」
-的決策不同層級，不需要先問過使用者）。建議先寫 `model.py`（Scope CRUD，`scopes.json` 讀寫）、再
-`heuristics.py`（路徑啟發式候選）、最後 `clustering.py`（NetworkX connected-components，注意
-`ParserAdapter`/`references.py` 已經有的 import/reference edge 可以直接從 SQLite `edges` 表讀取，
-不需要重新解析）。記得延續「自己寫腳本重現邊界情況」與「修完補 IMPLEMENTATION_PLAN.md 決策記錄」
-的習慣。
+`model.py` 提供 Scope CRUD 與嚴格的 import-only incremental assignment；`heuristics.py` 按共同頂層
+目錄產生候選；`clustering.py` 從 SQLite `edges` 讀取 import/reference edge 後以 NetworkX
+connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
+`rune scope list/create/edit/delete/lock/unlock/suggest`。第 49 條的真實 repo 實驗發現頂層目錄 heuristic
+偏寬，但其輸出保持人類審核的 ephemeral suggestion，故不是正確性或治理風險；未鎖定 threshold。
 
 ## 舊進度記錄（Milestone 1-3，供對照）
 
@@ -78,26 +75,30 @@ CLI 大概需要新增 `rune scope` 相關子命令（例如 `list`/`create`/`lo
 | 1. Core foundation | ✅ 完成 | canonical storage、config、project init、SQLite materialize、CLI 骨架 |
 | 2. Code index | ✅ 完成 | Tree-sitter 掃描/解析、symbol 擷取、import graph |
 | 3. References / graph | ✅ 完成 | best-effort calls/extends/implements 解析 |
-| 4. Scopes | ❌ 設計決策已定案，程式碼未開始 | **下一步（見上方「Milestone 4 開工前確認的三個設計決策」）** |
+| 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ❌ 未開始 | 便宜模型 scope summary |
 | 6. Policies & Memory | ❌ 未開始 | Decision/Constraint/Note 生命週期、search |
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**107 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**113 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
 
 ```text
 src/rune/
-├─ cli/main.py              # Typer app：init / status / update / rebuild-cache
+├─ cli/main.py              # Typer app：init / status / update / rebuild-cache / scope
 ├─ core/
 │  ├─ config.py             # .rune/config.toml 讀取/驗證（extra="forbid"，見下方「重要教訓」）
 │  ├─ hashing.py            # content_hash / git_blob_hash / working_tree_fingerprint
 │  ├─ project.py            # find_repo_root（真的呼叫 git，不是只看 .git 存不存在）、
 │  │                        # init_project（refuse/--force 語意）、RuneLayout（路徑集中管理）
 │  ├─ update.py             # run_update(layout, full) —— 整個 Milestone 2/3 的協調中心
+│  ├─ scopes/
+│  │  ├─ model.py            # Scope CRUD、import-only incremental membership assignment
+│  │  ├─ heuristics.py       # 路徑候選（一次性、非 canonical）
+│  │  └─ clustering.py       # SQLite edges -> NetworkX graph 候選（一次性、非 canonical）
 │  ├─ index/
 │  │  ├─ scanner.py         # include/exclude glob 走訪（自寫 **-aware matcher）、diff_against_previous
 │  │  ├─ treesitter.py      # ParserAdapter protocol + Python/JS/TS/TSX 實作
@@ -206,6 +207,5 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-見文件最上方「目前進度」段落的「Milestone 4 開工前確認的三個設計決策」與「Milestone 4 下一步實作
-建議」——設計決策已經定案並寫進 ARCHITECTURE.md §4.4、IMPLEMENTATION_PLAN.md，下一個 session 可以
-直接開始寫 `rune.core.scopes` 的程式碼，不需要重新走一次確認流程。
+Milestone 5（Semantic worker）。開工前重讀 DATA_MODEL.md §2.4、§6 與 IMPLEMENTATION_PLAN.md 的
+Milestone 5 段落；ScopeSummary 的 source hash 與 Decision/Constraint/Note staleness 是兩套獨立語意。

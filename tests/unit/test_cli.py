@@ -6,6 +6,8 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from rune.cli.main import app
+from rune.core.project import RuneLayout
+from rune.core.scopes.model import load_scopes
 
 runner = CliRunner()
 
@@ -56,3 +58,15 @@ def test_update_then_status_reports_fresh_again(git_repo: Path) -> None:
     payload = json.loads(result.output)
     assert payload["working_tree_fresh"] is True
     assert payload["files_modified"] == 0
+
+
+def test_scope_suggest_rejection_has_no_canonical_side_effect(git_repo: Path) -> None:
+    (git_repo / "app").mkdir()
+    (git_repo / "app" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (git_repo / "app" / "b.py").write_text("y = 2\n", encoding="utf-8")
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, ["scope", "suggest", "--path", str(git_repo)], input="n\n")
+
+    assert result.exit_code == 0, result.output
+    assert load_scopes(RuneLayout(git_repo)).scopes == []

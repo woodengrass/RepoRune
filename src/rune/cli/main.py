@@ -24,12 +24,26 @@ from rune.core.project import (
     find_repo_root,
     init_project,
 )
+from rune.core.scopes.clustering import suggest_from_graph
+from rune.core.scopes.heuristics import ScopeCandidate, suggest_from_paths
+from rune.core.scopes.model import (
+    ScopeAlreadyExistsError,
+    ScopeNotFoundError,
+    create_scope,
+    delete_scope,
+    load_scopes,
+    save_scopes,
+    set_scope_locked,
+    update_scope,
+)
 from rune.core.storage.canonical import read_json_model
-from rune.core.storage.models import ProjectFile
+from rune.core.storage.models import ProjectFile, Scope, ScopeSource
 from rune.core.storage.sqlite.materialize import CanonicalConflictError
 from rune.core.update import run_update
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
+scope_app = typer.Typer(help="Create, maintain, and review scope suggestions.")
+app.add_typer(scope_app, name="scope")
 
 
 def _err(message: str) -> None:
@@ -203,6 +217,183 @@ def rebuild_cache_cmd(
         raise typer.Exit(code=1) from exc
 
     typer.echo("Rebuilt cache: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+
+
+def _scope_layout(path: Path | None) -> RuneLayout:
+    return _require_layout(path or Path.cwd())
+
+
+def _print_scope(scope: Scope) -> None:
+    typer.echo(f"{scope.id}: {scope.name} ({'locked' if scope.locked else 'unlocked'}, {scope.source.value})")
+    if scope.description:
+        typer.echo(f"  {scope.description}")
+    typer.echo(f"  files: {', '.join(scope.members.files) or '(none)'}")
+    typer.echo(f"  symbols: {', '.join(scope.members.symbols) or '(none)'}")
+
+
+@scope_app.command("list")
+def scope_list(
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """List canonical scopes and their membership."""
+    try:
+        scopes = load_scopes(_scope_layout(path)).scopes
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    if not scopes:
+        typer.echo("No scopes defined.")
+        return
+    for scope in sorted(scopes, key=lambda item: item.id):
+        _print_scope(scope)
+
+
+@scope_app.command("create")
+def scope_create(
+    scope_id: str = typer.Argument(..., help="Stable kebab-case scope id."),
+    name: str = typer.Option(..., "--name"),
+    description: str = typer.Option("", "--description"),
+    files: list[str] = typer.Option([], "--file"),
+    symbols: list[str] = typer.Option([], "--symbol"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Create a human scope. Manual scopes start locked."""
+    try:
+        scope = create_scope(_scope_layout(path), scope_id, name, description, files, symbols)
+    except (NotAGitRepoError, _MissingLayoutError, ScopeAlreadyExistsError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    _print_scope(scope)
+
+
+@scope_app.command("edit")
+def scope_edit(
+    scope_id: str = typer.Argument(...),
+    name: str | None = typer.Option(None, "--name"),
+    description: str | None = typer.Option(None, "--description"),
+    add_files: list[str] = typer.Option([], "--add-file"),
+    remove_files: list[str] = typer.Option([], "--remove-file"),
+    add_symbols: list[str] = typer.Option([], "--add-symbol"),
+    remove_symbols: list[str] = typer.Option([], "--remove-symbol"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Edit a scope's human-controlled metadata or membership."""
+    try:
+        scope = update_scope(
+            _scope_layout(path), scope_id, name=name, description=description,
+            add_files=add_files, remove_files=remove_files,
+            add_symbols=add_symbols, remove_symbols=remove_symbols,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    _print_scope(scope)
+
+
+def _set_scope_lock(path: Path | None, scope_id: str, locked: bool) -> None:
+    try:
+        scope = set_scope_locked(_scope_layout(path), scope_id, locked)
+    except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    _print_scope(scope)
+
+
+@scope_app.command("lock")
+def scope_lock(
+    scope_id: str = typer.Argument(...),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Prevent all automatic scope membership changes."""
+    _set_scope_lock(path, scope_id, True)
+
+
+@scope_app.command("unlock")
+def scope_unlock(
+    scope_id: str = typer.Argument(...),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Allow only high-confidence incremental import assignment."""
+    _set_scope_lock(path, scope_id, False)
+
+
+@scope_app.command("delete")
+def scope_delete(
+    scope_id: str = typer.Argument(...),
+    yes: bool = typer.Option(False, "--yes", help="Delete without confirmation."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Delete a scope and its canonical membership."""
+    try:
+        layout = _scope_layout(path)
+        if not yes and not typer.confirm(f"Delete scope {scope_id!r}?"):
+            raise typer.Abort()
+        delete_scope(layout, scope_id)
+    except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Deleted scope {scope_id!r}.")
+
+
+def _unique_candidate_id(candidate: ScopeCandidate, used_ids: set[str]) -> str:
+    base = candidate.id or "suggested-scope"
+    candidate_id = base
+    suffix = 2
+    while candidate_id in used_ids:
+        candidate_id = f"{base}-{suffix}"
+        suffix += 1
+    return candidate_id
+
+
+@scope_app.command("suggest")
+def scope_suggest(
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Interactively review ephemeral path and graph scope suggestions."""
+    try:
+        layout = _scope_layout(path)
+        scopes_file = load_scopes(layout)
+        locked_files = {
+            file_path for scope in scopes_file.scopes if scope.locked for file_path in scope.members.files
+        }
+        conn = sqlite3.connect(str(layout.memory_db))
+        try:
+            symbol_files = dict(conn.execute("SELECT symbol_id, file FROM symbols"))
+            locked_files.update(
+                symbol_files[symbol_id]
+                for scope in scopes_file.scopes
+                if scope.locked
+                for symbol_id in scope.members.symbols
+                if symbol_id in symbol_files
+            )
+            files = [row[0] for row in conn.execute("SELECT path FROM files ORDER BY path")]
+            candidates = suggest_from_paths(files, locked_files) + suggest_from_graph(conn, locked_files)
+        finally:
+            conn.close()
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    used_ids = {scope.id for scope in scopes_file.scopes}
+    accepted = 0
+    for candidate in candidates:
+        scope_id = _unique_candidate_id(candidate, used_ids)
+        typer.echo(f"\n{scope_id}: {candidate.reason}")
+        typer.echo("  " + ", ".join(candidate.files))
+        if typer.confirm("Create this model-suggested scope?", default=False):
+            scopes_file.scopes.append(
+                Scope(
+                    id=scope_id,
+                    name=candidate.name,
+                    source=ScopeSource.model,
+                    members={"files": list(candidate.files)},
+                )
+            )
+            used_ids.add(scope_id)
+            accepted += 1
+    if accepted:
+        save_scopes(layout, scopes_file)
+    typer.echo(f"Accepted {accepted} scope suggestion(s).")
 
 
 def main() -> None:

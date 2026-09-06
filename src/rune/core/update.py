@@ -29,6 +29,11 @@ from rune.core.index.references import group_symbols_by_path, resolve_references
 from rune.core.index.scanner import ScannedFile, diff_against_previous, scan_files
 from rune.core.index.treesitter import RawReference, get_parser_adapter
 from rune.core.project import RuneLayout, utc_now_iso
+from rune.core.scopes.model import (
+    assign_new_files_from_imports,
+    load_scopes,
+    save_scopes,
+)
 from rune.core.storage.canonical import read_json_model, write_json_model
 from rune.core.storage.models import (
     Edge,
@@ -209,6 +214,18 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
         else None
     )
 
+    auto_assigned_scope_ids: list[str] = []
+    if not full and changeset.added:
+        scopes_file = load_scopes(layout)
+        auto_assigned_scope_ids = assign_new_files_from_imports(
+            scopes_file,
+            {scanned_file.path for scanned_file in changeset.added},
+            new_edges,
+            new_symbols,
+        )
+        if auto_assigned_scope_ids:
+            save_scopes(layout, scopes_file)
+
     stats = rebuild_cache(
         layout, code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges)
     )
@@ -236,6 +253,7 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
             "files_parsed": files_parsed,
             "files_reused": len(changeset.unchanged),
             "files_deleted": len(changeset.deleted_paths),
+            "scope_files_auto_assigned": len(auto_assigned_scope_ids),
         }
     )
     return stats

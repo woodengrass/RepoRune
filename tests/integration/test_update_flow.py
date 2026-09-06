@@ -232,6 +232,32 @@ def test_update_only_reparses_the_changed_file(python_simple_repo: Path) -> None
     assert stats["files_reused"] == 2
 
 
+def test_new_file_with_one_unlocked_import_scope_is_auto_assigned(python_simple_repo: Path) -> None:
+    from rune.core.storage.canonical import write_json_model
+    from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    run_update(layout, full=True)
+    (python_simple_repo / "app" / "new.py").write_text(
+        "from .services import UserService\n\nservice = UserService()\n", encoding="utf-8"
+    )
+
+    stats = run_update(layout, full=False)
+
+    assert stats["scope_files_auto_assigned"] == 1
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT scope_id FROM scope_files WHERE file = ?", ("app/new.py",)
+    ).fetchone() == ("app",)
+
+
 def test_symbol_rename_produces_new_id_and_removes_old(python_simple_repo: Path) -> None:
     layout = init_project(python_simple_repo)
     run_update(layout, full=True)
