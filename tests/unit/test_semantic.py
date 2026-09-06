@@ -361,6 +361,31 @@ def test_refresh_succeeds_on_first_attempt() -> None:
     assert len(provider.prompts_seen) == 1
 
 
+def test_refresh_reference_total_metric_ignores_malformed_non_list_field() -> None:
+    """Regression test: a model can return a non-list value for
+    `entry_points`/`important_symbols` (e.g. a bare string) despite the
+    schema asking for a list. `validation.py`'s `_as_str_list` already
+    guards against this (treats it as zero entries), but the
+    `reference_total` metric computed alongside it used bare `len(...)` --
+    which for a string counts *characters*, not list entries, wildly
+    inflating `reference_strip_rate`. Confirmed by hand: a string value
+    produced a double-digit `reference_total` for a summary whose
+    validated entry_points was correctly empty.
+    """
+    provider = FakeProvider(
+        "primary-model",
+        [json.dumps({"purpose": "p", "entry_points": "not-a-list-just-a-string"})],
+    )
+    outcome = refresh_scope_summary(
+        scope=_scope(), primary_provider=provider, fallback_provider=None,
+        source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
+        known_symbol_ids=set(), symbols=[], current=None,
+    )
+    assert outcome.summary.entry_points == []
+    assert outcome.metrics.reference_total == 0
+    assert outcome.metrics.reference_stripped == 0
+
+
 def test_refresh_succeeds_on_repair_retry() -> None:
     provider = FakeProvider("primary-model", ["not json at all", _good_json("fixed purpose")])
     outcome = refresh_scope_summary(
@@ -372,6 +397,51 @@ def test_refresh_succeeds_on_repair_retry() -> None:
     assert outcome.summary.purpose == "fixed purpose"
     assert len(provider.prompts_seen) == 2
     assert "failed validation" in provider.prompts_seen[1]
+
+
+def test_refresh_invalid_json_response_does_not_count_as_provider_error_metric() -> None:
+    """Regression test, same root cause as the retry-prompt fix above but
+    for the `provider_error` metric: a response that arrived but wasn't
+    valid JSON is a schema/parsing problem, not a transport failure --
+    `metrics.provider_error` (meant to track real ProviderError/network
+    failures per ARCHITECTURE.md §4.5's six metrics) must not be set for
+    it, or `provider_error_rate` would count "the model wrote bad JSON" as
+    if the provider itself were unreliable.
+    """
+    provider = FakeProvider("primary-model", ["not json at all", _good_json("fixed purpose")])
+    outcome = refresh_scope_summary(
+        scope=_scope(), primary_provider=provider, fallback_provider=None,
+        source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
+        known_symbol_ids=set(), symbols=[], current=None,
+    )
+    assert outcome.metrics.provider_error is False
+
+
+def test_refresh_after_provider_error_retries_with_unmodified_prompt_not_repair_prompt() -> None:
+    """Regression test: the retry after attempt 0 used to always build a
+    repair prompt ("your previous response failed validation for this
+    reason: ...") even when attempt 0 never got a response at all --
+    reason was a raw provider_error string (network/HTTP failure), which
+    got fed straight into the repair-prompt template. That's nonsensical
+    (there's no "previous response" to explain a fix for) and, confirmed
+    against the real OpenRouter API during Milestone 5 development, this
+    exact scenario happens for real: a transient 429 rate-limit on the
+    first call. The retry after a pure provider error must resend the
+    original prompt unchanged, not a repair-styled one.
+    """
+    provider = FakeProvider(
+        "primary-model", [ProviderError("HTTP 429: rate limited"), _good_json("recovered")]
+    )
+    outcome = refresh_scope_summary(
+        scope=_scope(), primary_provider=provider, fallback_provider=None,
+        source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
+        known_symbol_ids=set(), symbols=[], current=None,
+    )
+    assert outcome.summary.status == SemanticStatus.fresh
+    assert outcome.summary.purpose == "recovered"
+    assert len(provider.prompts_seen) == 2
+    assert provider.prompts_seen[0] == provider.prompts_seen[1]  # unmodified retry
+    assert "failed validation" not in provider.prompts_seen[1]
 
 
 def test_refresh_falls_back_to_fallback_model_after_repair_retry_fails() -> None:

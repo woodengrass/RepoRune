@@ -137,6 +137,22 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
+def _reference_list_len(raw: dict, key: str) -> int:
+    """Regression-safe count of a reference-list field for the
+    `reference_strip_rate` metric: must agree with `validation.py`'s own
+    `_as_str_list` guard (only a real JSON list counts as entries at all).
+    Without this, a malformed non-list value from the model -- e.g. the
+    model returning a bare string for `entry_points` instead of a list --
+    would make `len(...)` count that string's *characters* instead of 0
+    entries, since Python's `len()` doesn't care that a string isn't a
+    list. Confirmed by hand: a string value inflated `reference_total`
+    into the double digits while the validated summary correctly had zero
+    entries for that field.
+    """
+    values = raw.get(key)
+    return len(values) if isinstance(values, list) else 0
+
+
 @dataclass
 class ScopeRefreshMetrics:
     scope_id: str
@@ -273,14 +289,23 @@ def refresh_scope_summary(
         metrics.cost += cost
         metrics.latency_seconds += latency
         metrics.input_tokens += input_tokens
+        # "parsed is None" covers two different situations that must not be
+        # conflated: a true transport/HTTP failure (no response arrived at
+        # all -- `reason` is the "provider_error:..." string _attempt
+        # produces from a caught ProviderError) versus a response that DID
+        # arrive but wasn't valid JSON (there's a real "previous response"
+        # to point the repair prompt at). Only the former is a provider
+        # error for metrics purposes and only the former should retry with
+        # the prompt unchanged instead of a repair prompt.
+        attempt_was_provider_error = parsed is None and reason.startswith("provider_error:")
         if parsed is None:
-            metrics.provider_error = True
+            metrics.provider_error = metrics.provider_error or attempt_was_provider_error
             last_reason = reason
             local_log.append(f"[{scope.id}] attempt failed: {reason}")
         else:
             outcome = _validate(parsed)
-            metrics.reference_total += len(parsed.get("entry_points", []) or []) + len(
-                parsed.get("important_symbols", []) or []
+            metrics.reference_total += _reference_list_len(parsed, "entry_points") + _reference_list_len(
+                parsed, "important_symbols"
             )
             metrics.reference_stripped += len(outcome.stripped)
             if outcome.summary is not None:
@@ -292,9 +317,22 @@ def refresh_scope_summary(
             local_log.append(f"[{scope.id}] rejected: {last_reason}")
 
         if attempt_index == 0:
-            # Queue the repair-prompt retry against the same (primary)
-            # provider before ever trying the fallback model.
-            attempts.append((primary_provider, _build_repair_prompt(user_prompt, last_reason)))
+            # Queue the retry against the same (primary) provider before
+            # ever trying the fallback model. A repair prompt only makes
+            # sense after a real response failed *validation* -- there's
+            # something concrete to correct. A ProviderError means no
+            # response ever arrived (network/HTTP failure), so there's
+            # nothing to "fix"; retrying with the unmodified original
+            # prompt is the right move there, not appending a confusing
+            # "your previous response failed because: HTTP 429 ..." preface
+            # that has nothing to do with the model's own output. Confirmed
+            # by hand this exact case actually happens: a real OpenRouter
+            # 429 during Milestone 5 development fed straight into the
+            # repair-prompt template before this fix.
+            retry_prompt = user_prompt if attempt_was_provider_error else _build_repair_prompt(
+                user_prompt, last_reason
+            )
+            attempts.append((primary_provider, retry_prompt))
         elif attempt_index == 1 and fallback_provider is not None:
             attempts.append((fallback_provider, user_prompt))
             metrics.used_fallback = True

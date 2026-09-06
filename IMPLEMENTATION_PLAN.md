@@ -1,6 +1,6 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第十一輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+狀態：**已確認（第十二輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
 做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
 修訂」。第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
 持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認，細節見文末「第七輪
@@ -14,7 +14,10 @@ repo 品質實驗的第二個樣本改用真正中型的 repo、補齊 locked sc
 ARCHITECTURE.md §4.5。**第十一輪是 Milestone 5 的實作記錄**：`core.semantic.{provider,worker,
 validation,redaction}` 完整實作、接線進 `rune update`（`rebuild_cache` 新增 `semantic_override`
 比照 Milestone 4 的 `scopes_override` 模式）、以使用者提供的 OpenRouter API key 對
-`qwen/qwen3.8-flash` 做真實端到端驗證（不只 mock），細節見文末「第十一輪實作記錄」。將規格
+`qwen/qwen3.8-flash` 做真實端到端驗證（不只 mock），細節見文末「第十一輪實作記錄」。**第十二輪是
+使用者要求對 Milestone 5 做的品質複查**，逐條重現後修正 3 個問題（`reference_strip_rate` 指標被
+非 list 欄位灌水、provider 層級失敗被誤用 repair prompt 重試、同一根因導致的 `provider_error`
+指標誤判），細節見文末「第十二輪修訂」。將規格
 §70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
@@ -1086,3 +1089,50 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     16000 給思考留更多餘裕。同步更新 `SemanticConfig.max_tokens`、`worker.py` 兩處函式參數預設值
     （`refresh_scope_summary`/`run_semantic_refresh`，僅供未經 `config.toml` 呼叫時的保底值，
     `rune update` 一律走 config 值）、對應的 config 測試斷言。
+
+### 第十二輪修訂（使用者要求對 Milestone 5 做品質複查，發現並修正 3 個問題）
+
+改完第 63 條後，使用者要求針對 Milestone 5 的實作品質做一次複查。延續本專案「先寫最小重現腳本，
+確認是真的 bug 才動手」的方法論，逐一驗證，3 條都確認為真：其中 2 條（64、65）是本次複查才發現，
+不是外部轉述；1 條（66）是本次複查時才注意到、但實際上是 Milestone 5 一開始就存在的既有 bug（第 60
+條記錄的真實 API 呼叫當時已經觸發過這個路徑，只是沒人注意到 prompt 內容本身不對勁）。
+
+64. **中：`reference_strip_rate` 指標在模型回傳非 list 的 `entry_points`/`important_symbols` 時會被
+    嚴重灌水**：`worker.py` 算 `reference_total` 時直接對模型回傳的原始 JSON 值呼叫
+    `len(parsed.get("entry_points", []) or [])`，但 `validation.py` 的 `_as_str_list` 已經對「不是
+    list」的值做了防禦（視為 0 筆），兩處防禦不一致。實測重現：讓模型回傳
+    `{"entry_points": "not-a-list-just-a-string"}`（一個字串而非陣列），驗證後 `entry_points` 正確
+    是空陣列，但 `reference_total` 卻是 24——因為 Python 的 `len()` 對字串會算「字元數」而非「陣列
+    元素數」。這只影響 metrics（供未來比較 provider/model 表現用），不影響實際寫入 canonical 的
+    `ScopeSummary` 內容正確性，但仍會讓 `reference_strip_rate` 這個原本設計用來判斷「模型 hallucinate
+    比例」的數字失真。修法：新增 `_reference_list_len()` 輔助函式，套用跟 `_as_str_list` 相同的
+    `isinstance(values, list)` 防禦。新增回歸測試
+    `test_refresh_reference_total_metric_ignores_malformed_non_list_field`，修法前確認會失敗
+    （`reference_total == 24`）。
+65. **中：provider 端的真正失敗（HTTP 429／網路逾時）被誤用「repair prompt」重試，而非原樣重送**：
+    `refresh_scope_summary` 的 retry 迴圈把「`_attempt` 回傳 `parsed is None`」這一種情況無條件當作
+    「有一個失敗的回應，需要一個 repair prompt 告訴模型哪裡錯了」，但 `parsed is None` 其實涵蓋
+    兩種完全不同的情境：(1) provider 層級的真正失敗（連線都沒建立起來，`_attempt` 捕捉到
+    `ProviderError`）——這種情況根本沒有「上一次的回應」可以修正；(2) 回應確實到了，但不是合法
+    JSON——這種才是 repair prompt 真正該處理的情境。修法前的行為會把完整的 provider 錯誤訊息（例如
+    `"provider_error:ProviderError: HTTP 429: {原始上游錯誤 JSON}"`）整段塞進下一次呼叫的 user
+    prompt，變成一句對模型而言完全不知所云的「你上一次的回應驗證失敗，原因是：HTTP 429 rate
+    limited」——**這不是假設情境，是第 60 條記錄的真實 API 驗證裡實際發生過的路徑**（那次是 repair
+    retry 恰好還是成功了，模型夠聰明沒被那句沒頭沒尾的話搞混，但這是僥倖，不是設計上的保證）。修法：
+    區分 `parsed is None` 底下的兩種原因（用 `reason.startswith("provider_error:")` 判斷），
+    provider 層級失敗時原樣重送 `user_prompt`（不加任何 repair 文字），只有「回應到了但不合法」才用
+    repair prompt。新增回歸測試
+    `test_refresh_after_provider_error_retries_with_unmodified_prompt_not_repair_prompt`，修法前
+    確認會失敗（斷言兩次 prompt 相同，修法前第二次 prompt 多了 repair 文字）。
+66. **低，Milestone 5 一開始就有的既有 bug（本次複查才發現）：`response was not valid JSON`（合法
+    回應但非 JSON）被誤記為 `metrics.provider_error=True`**：跟第 65 條同一個「`parsed is None`
+    涵蓋兩種情境」的根因，但這條影響的是 metrics 而非 prompt 內容——`provider_error_rate` 這個
+    指標的設計用意是「provider 本身不可靠的比例」，如果連「模型好好回應了、只是寫的不是 JSON」都算
+    進去，這個指標就沒辦法真的用來判斷該不該換 provider。修法（跟第 65 條同一次改動）：只有真正的
+    `ProviderError` 才設定 `metrics.provider_error=True`。新增回歸測試
+    `test_refresh_invalid_json_response_does_not_count_as_provider_error_metric`，修法前確認會
+    失敗（`provider_error` 錯誤地變成 `True`）。修復第 65 條時，第一版修法把「`parsed is None`」
+    整個當成 provider error（沒有進一步區分原因），意外讓既有的
+    `test_refresh_succeeds_on_repair_retry` 測試失敗——這正是「連自己剛寫的修法都要重新驗證，不能
+    假設一次改對」的一個實例，發現後才補上更精確的區分邏輯。
+    162 個測試全綠，`ruff check` 全綠。

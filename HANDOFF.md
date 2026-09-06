@@ -28,6 +28,18 @@ PLAN.md 第 59-61 條，含 3 項刻意延後的已知未完成項目（`possibl
 （`{"enabled":false}` 讓 `qwen/qwen3.8-flash` 的 reasoning_tokens 從 36 降到 0）才接線，最後用
 `reasoning.enabled=False` 端到端跑過一次真實 API（`output_tokens=1`，沒有思考開銷）。
 
+**`max_tokens` 預設值改為 16000**（使用者要求，原本 4000 只是暫定值），同步更新 `worker.py` 兩處
+函式參數預設值與對應測試。
+
+**使用者接著要求對 Milestone 5 做品質複查（第十二輪修訂），逐條重現後發現並修正 3 個問題**（見
+IMPLEMENTATION_PLAN.md 第 64-66 條）：`reference_strip_rate` 指標在模型回傳非 list 的
+`entry_points`/`important_symbols` 時會被 `len()` 對字串算成字元數而嚴重灌水；provider 層級的真正
+失敗（HTTP 429／網路逾時）被誤當成「有回應但驗證失敗」，把原始錯誤訊息整段塞進下一次呼叫的
+repair prompt——**這不是假設情境，第 60 條記錄的真實 API 驗證裡實際發生過**，只是那次模型剛好夠
+聰明沒被搞混；同一根因也讓 `metrics.provider_error` 誤把「回應到了但不是合法 JSON」算成 provider
+本身不可靠。修復第二條時第一版改法過寬，意外讓既有測試失敗，重新精確區分「provider 層級失敗」與
+「回應到了但格式錯」才修好——連自己剛寫的修法都要重新驗證。162 個測試全綠，`ruff check` 全綠。
+
 **Milestone 6（Policies & Memory）是下一步。**
 
 ## 專案是什麼
@@ -109,7 +121,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**159 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**162 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
