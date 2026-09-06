@@ -80,14 +80,21 @@ def _parse_file(
     yields no symbols/edges for it — it must never abort the whole update
     (spec §62's failure-isolation principle, applied here to indexing).
 
-    Catches `Exception` broadly and deliberately: tree-sitter's grammars
-    are error-tolerant for genuinely malformed source (they produce ERROR/
-    partial nodes rather than raising), but a file that is unreadable in
-    some unexpected way, or an AST shape our walkers don't defensively
-    guard against (e.g. a `MISSING` node tree-sitter synthesizes during
-    error recovery, which can leave an expected field `None`), must still
-    degrade to "this one file didn't index" rather than take the whole
-    `rune update` down.
+    Two distinct ways a file ends up `parse_error`, both handled here:
+
+    1. An actual exception (unreadable file, or an AST shape our walkers
+       don't defensively guard against — e.g. a `MISSING` node tree-sitter
+       synthesizes during error recovery, which can leave an expected
+       field `None`). Caught broadly and deliberately: no symbols/edges
+       are kept for this file.
+    2. `adapter.has_syntax_error(source)` is True. tree-sitter's grammars
+       are error-tolerant for malformed source — they produce a tree with
+       ERROR/partial nodes rather than raising, so extraction can succeed
+       and return symbols that are individually well-formed but drawn
+       from a file that didn't fully parse. Those symbols are still kept
+       (best effort, same principle as unresolved imports), but the file
+       is flagged `parse_error` so this is visible rather than silently
+       reported as `ok`.
     """
     try:
         source = scanned.absolute_path.read_bytes()
@@ -95,9 +102,14 @@ def _parse_file(
         symbols = adapter.extract_symbols(scanned.path, source)
         raw_imports = adapter.extract_imports(scanned.path, source)
         edges = build_import_edges(repo_root, scanned.path, scanned.language, raw_imports)
+        status = (
+            IndexedFileStatus.parse_error
+            if adapter.has_syntax_error(source)
+            else IndexedFileStatus.ok
+        )
     except Exception:  # noqa: BLE001 - intentional: isolate one file's parse failure
         return [], [], IndexedFileStatus.parse_error
-    return symbols, edges, IndexedFileStatus.ok
+    return symbols, edges, status
 
 
 def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
@@ -134,20 +146,43 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
         new_symbols.extend(symbols)
         new_edges.extend(edges)
 
-    stats = rebuild_cache(
-        layout, code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges)
-    )
-
+    # Everything that can be computed without touching disk is done before
+    # the SQLite commit, so the only work left afterward is the one atomic
+    # write to project.json (minimizing what could go wrong in the window
+    # between "cache committed" and "freshness metadata recorded").
     tree_hash = working_tree_fingerprint({f.path: f.content_hash for f in new_files})
     project = read_json_model(layout.project_json, ProjectFile)
-    if project is not None:
-        updated_project = project.model_copy(
+    updated_project = (
+        project.model_copy(
             update={
                 "last_indexed_head": _git_head(repo_root),
                 "last_indexed_tree_hash": tree_hash,
                 "last_indexed_at": now,
             }
         )
+        if project is not None
+        else None
+    )
+
+    stats = rebuild_cache(
+        layout, code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges)
+    )
+
+    # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not
+    # atomic with the SQLite commit above — memory.db and project.json are
+    # two separate files, and true two-phase-commit across them is not
+    # worth the complexity for what it buys. If this write fails (e.g.
+    # disk full) after rebuild_cache already succeeded, memory.db is
+    # correctly up to date but project.json's last_indexed_* fields go
+    # stale, which only affects `rune status`'s freshness display — it
+    # does NOT corrupt future updates, because `read_current_code_index`
+    # (used for incremental diffing) reads the actual `files` table, never
+    # project.json. The next successful `rune update` recomputes and
+    # rewrites these fields regardless of what they said before, so this
+    # self-heals. The reverse ordering (write project.json first) would be
+    # worse: a subsequent rebuild_cache failure would leave project.json
+    # confidently reporting a fresh index that was never actually written.
+    if updated_project is not None:
         write_json_model(layout.project_json, updated_project)
 
     stats.update(

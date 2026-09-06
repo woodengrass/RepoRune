@@ -105,7 +105,7 @@ Global Code Standards 支援欄位）。經過兩輪實測（第一輪自測、�
 
 ## Milestone 2 — Code index
 
-**目前狀態：已實作並通過測試**（`src/rune/core/index/`、`src/rune/core/update.py`，78 個測試全綠，
+**目前狀態：已實作並通過測試**（`src/rune/core/index/`、`src/rune/core/update.py`，88 個測試全綠，
 `ruff check` 全綠，含兩個 fixture repo：`tests/integration/fixtures/{python-simple,ts-simple}`）。
 `rune rebuild-cache` 這次也改為真的做全量重新掃描＋解析（而不再只是「code index 保持空」的
 Milestone 1 占位行為）——因為 files/symbols/edges 完全從原始碼推導、沒有 canonical 檔案背書，
@@ -136,6 +136,56 @@ Milestone 1 占位行為）——因為 files/symbols/edges 完全從原始碼�
 parse-failure-isolation 測試直接替換整個 `_parse_file`，結果連同它想驗證的 try/except 保護一起替換
 掉了，測試在保護邏輯被刪除的情況下也會通過；修正後改成只替換 `get_parser_adapter`，讓真正的
 `_parse_file` try/except 留在呼叫路徑上）。
+
+**第二輪外部 code review（非本 agent 執行）又發現並修正 7 個問題**（皆已實際重現後才修）：
+
+1. **高：刪除被未變檔案 import 的目標檔會讓 `rune update` 崩潰**：未變檔案的 edge 被原樣沿用，但其
+   `target_file` 已不在本次的檔案集合裡，寫入時撞上 `target_file REFERENCES files(path)` 外鍵，
+   丟出 `IntegrityError`，整次 update 直接中止。已於 `_materialize_code_index` 補上防禦性過濾：
+   插入前檢查 `target_file`/`target_symbol` 是否還在本次的檔案/symbol 集合中，不在就置成 `NULL`
+   （語意等同「已解析過但現在失效」，與外部套件 import 的 unresolved 語意一致，不是刪掉這條 edge，
+   因為「這個檔案曾經 import 過東西」這件事本身仍然真實）。
+2. **高：SQLite cache 已 commit、project.json 才更新，兩者非原子**：確認且接受這是無法完全消除的
+   已知限制（`memory.db` 與 `project.json` 是兩個獨立檔案，做真正的兩階段提交不符合這個專案的複雜度
+   預算）。已將 `tree_hash`/`updated_project` 的計算全部移到呼叫 `rebuild_cache` 之前，讓 commit 後
+   唯一剩下的動作只有一次 `write_json_model`（縮小風險窗口，不是消除它）；並補上回歸測試證明：即使
+   這次寫入失敗，cache 本身仍正確、下一次 `run_update` 仍能正確運作（因為 incremental diff 永遠讀
+   `files` 表而非 `project.json`，不會被過期的 metadata 帶壞）。詳細取捨理由寫在
+   `core.update.run_update` 的程式碼註解裡。
+3. **中：Tree-sitter 語法錯誤不會被標記為 `parse_error`**：tree-sitter 對錯誤語法採 error-recovery（
+   回傳含 ERROR 節點的部分樹，不丟例外），先前程式碼只檢查是否拋出例外，導致有語法錯誤的檔案仍標記
+   `status=ok`、甚至寫入從錯誤區域擷取出的殘缺 symbol（例如簽章缺右括號）。已在 `ParserAdapter`
+   新增 `has_syntax_error(source) -> bool` 方法（各語言 adapter 各自用 `root_node.has_error`
+   實作），`_parse_file` 據此把有語法錯誤的檔案標記 `parse_error`，但仍保留已擷取出的 symbol
+   （best effort，不因為檔案有語法錯誤就整個丟棄，只是明確標記「這個檔案的索引可能不完整」）。
+4. **中：`ParserAdapter` 缺少規格要求的 `qualified_name` 方法**：先前的實作只有 `extract_symbols`/
+   `extract_imports`，`qualified_name` 完全沒實作，違反 ARCHITECTURE §4.2 的介面契約（也是 Milestone
+   3 reference 解析會需要的方法——給定任意一個 tree-sitter node，算出跟 `extract_symbols` 一致的
+   qualified name，用來把「呼叫點找到的 node」對應回已知的 symbol）。已補上：每個 adapter 實作一個
+   由下往上走 parent chain 的版本，並用測試驗證它跟 `extract_symbols` 由上往下算出來的名字一致
+   （兩條路徑對同一個 node 必須算出同一個名字，否則同一個邏輯 symbol 會因為用哪條路徑算名字而產生
+   不同 id）。
+5. **中：Python `from . import services` 誤解析為套件自己的 `__init__.py`**：`RawImport` 只擷取
+   `relative_import` 的點號前綴（specifier 是單獨的 `"."`），沒有擷取 `import` 後面實際的名稱列表，
+   導致 resolver 誤把它解析成目前套件的 `__init__.py`——對一個宣稱「high confidence」的 edge 類型
+   而言，這是一個自信滿滿的錯誤答案，比留白（unresolved）更糟。已修正：當 specifier 去掉點號後為空
+   字串時，直接回傳 `None`（誠實地標記為無法解析），不再用套件自己的 `__init__.py` 充數。
+6. **中：`scope_files`/`scope_symbols` 的外鍵仍未依承諾在 Milestone 2 補回**：第一輪 code review 就
+   已經記錄「等 Milestone 2 索引器落地後補上這兩個 FK」，這次確認 Milestone 2 已經讓 `files`/
+   `symbols` 有真實內容，兌現承諾補回兩個 FK。同時發現 `INSERT OR IGNORE` **不會**抑制外鍵違反（
+   只會抑制 UNIQUE 衝突，已用一個最小重現腳本親自驗證這件事，不是憑印象假設），所以在
+   `_materialize_scopes` 補上明確的前置過濾：scope 成員若沒對應到目前索引裡的任何 file/symbol，
+   直接跳過該筆 membership（不中止整個 materialize），並更新了一個因此不再成立的 Milestone 1 舊
+   測試（原本沒有搭配任何 `files` 資料就寫入 scope membership），新增一個「dangling membership 被
+   跳過而非讓整個 materialize 失敗」的回歸測試。
+7. **中：`rune status` 沒有回報規格要求的「已修改檔案數」**：先前的 CLI 只回報一個
+   `working_tree_fresh` boolean，之前自己刪掉了一段本來想算「修改了幾個檔案」卻寫錯邏輯的程式碼，
+   刪掉後沒有補回正確版本，導致這個 M2 明確要求的欄位一直沒有實作。已用既有的 `diff_against_previous`
+   補上 `files_modified`/`files_added`/`files_deleted` 三個欄位（`--json` 與純文字輸出都有），並新增
+   `tests/unit/test_cli.py` 用 Typer 的 `CliRunner` 驗證。
+
+第 8 點（`pyproject.toml`/`IMPLEMENTATION_PLAN.md` 的 Python 版本要求不一致）覆查後確認**已經在
+Python 3.12 切換那次 commit 修正過**，reviewer 看到的應該是切換前的舊快照，這次不需要任何動作。
 
 **模組**：`rune.core.index.scanner`、`rune.core.index.treesitter`、`rune.core.index.imports`、
 `rune.core.update`。

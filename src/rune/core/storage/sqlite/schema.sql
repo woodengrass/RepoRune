@@ -53,26 +53,23 @@ CREATE TABLE IF NOT EXISTS scopes (
     source      TEXT NOT NULL
 );
 
--- KNOWN, DELIBERATE DEVIATION from DATA_MODEL.md §5 (tracked, not an
--- oversight): the spec declares `file REFERENCES files(path)` and
--- `symbol_id REFERENCES symbols(symbol_id)` here. Those two FKs are
--- intentionally omitted in Milestone 1 because `files`/`symbols` stay
--- empty until Milestone 2's indexer runs, while `scopes.json` can already
--- carry file/symbol members in M1 (e.g. content preserved across
--- `init --force`). Enforcing the FK now — with `PRAGMA foreign_keys=ON`,
--- which IS enabled (materialize.py connect()) — would make any such scope
--- fail to materialize. Add both FKs once Milestone 2 populates the code
--- index, with a regression test covering scope membership over indexed
--- files/symbols.
+-- Restored in Milestone 2 (was deliberately deferred in Milestone 1 —
+-- see git history — because `files`/`symbols` stayed empty until the
+-- indexer landed). `_materialize_scopes` in materialize.py pre-filters
+-- out any scope member that doesn't match a currently-indexed file/
+-- symbol before inserting, since `INSERT OR IGNORE` does not suppress
+-- foreign-key violations in SQLite (only UNIQUE conflicts) — without
+-- that pre-filter, one stale/typo'd membership in scopes.json would
+-- abort the whole materialize.
 CREATE TABLE IF NOT EXISTS scope_files (
     scope_id TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
-    file     TEXT NOT NULL,
+    file     TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
     PRIMARY KEY (scope_id, file)
 );
 
 CREATE TABLE IF NOT EXISTS scope_symbols (
     scope_id  TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
-    symbol_id TEXT NOT NULL,
+    symbol_id TEXT NOT NULL REFERENCES symbols(symbol_id) ON DELETE CASCADE,
     PRIMARY KEY (scope_id, symbol_id)
 );
 

@@ -496,15 +496,13 @@ CREATE TABLE scope_symbols (
 );
 ```
 
-**已知、刻意的 Milestone 1 實作偏離（本輪 code review 發現，記錄於此，非遺漏）**：M1 的
-`schema.sql` **暫時不加**上面 `file`/`symbol_id` 的 `REFERENCES files(path)`／
-`REFERENCES symbols(symbol_id)`。原因：`files`/`symbols` 表要到 Milestone 2 才會被索引器填入，
-但 `scopes.json` 在 M1 就可能已經帶有 file/symbol membership（例如 `init --force` 保留下來的內容）；
-若現在就宣告並強制這兩個 FK（`PRAGMA foreign_keys=ON` 本輪已開啟），任何帶 file/symbol 成員的
-scope 都會 materialize 失敗。等 Milestone 2 的程式碼索引真正填入 `files`/`symbols` 後，補上這兩個
-FK，並補一個「scope membership 指向已索引 file/symbol」的回歸測試。M1 其餘所有既有 FK（
-`scopes`/`symbols.file`/`edges.*`/各 revision 衛星表）維持宣告即生效，因為它們的父列一律在
-子列之前寫入，不受此限制影響。
+**Milestone 1 曾暫時省略上面 `file`/`symbol_id` 的 FK**（`files`/`symbols` 表在 M1 還是空的，
+`scopes.json` 卻可能已經帶有 file/symbol membership），**已於 Milestone 2 索引器落地後補回**，
+如上面 schema 所示。補回後發現一個容易誤判的地方：`INSERT OR IGNORE` **不會**抑制外鍵違反（
+只抑制 UNIQUE 衝突，已用最小重現腳本驗證過），所以 `materialize._materialize_scopes` 在插入前會
+先查詢目前索引裡實際存在的 file path／symbol_id 集合，把不在其中的 scope 成員直接跳過（不中止整個
+materialize）——一個 typo 或指向已刪除檔案的 scope membership 只會讓那筆 membership 消失，不會讓
+`rune update`/`rune rebuild-cache` 整個失敗。
 
 ```sql
 -- semantic summary（只存目前一份；歷史留在 semantic.jsonl，非本檔案 revision 機制管轄）

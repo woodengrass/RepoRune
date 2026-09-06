@@ -41,6 +41,27 @@ class RawImport:
 class ParserAdapter(Protocol):
     def extract_symbols(self, path: str, source: bytes) -> list[Symbol]: ...
     def extract_imports(self, path: str, source: bytes) -> list[RawImport]: ...
+    def qualified_name(self, node: Node) -> str:
+        """Given an arbitrary tree-sitter node from this language's
+        grammar (e.g. one `core.index.references` finds independently in
+        Milestone 3, not necessarily one `extract_symbols` already
+        visited), computes the same dotted qualified name `extract_symbols`
+        would assign it — walking up the parent chain accumulating
+        enclosing class names, rather than the top-down scope-stack
+        threading `extract_symbols` uses internally. Both paths must agree
+        on the same name for the same node; see the cross-check test in
+        tests/unit/test_treesitter.py.
+        """
+        ...
+    def has_syntax_error(self, source: bytes) -> bool:
+        """True if tree-sitter's error-tolerant parser had to fall back to
+        an ERROR/MISSING node anywhere in the tree. `core.update` uses
+        this to mark the file `parse_error` even though `extract_symbols`
+        didn't raise and may have returned partial/best-effort symbols —
+        tree-sitter recovers from syntax errors by producing a tree, it
+        does not raise, so this is the only way to detect degraded output.
+        """
+        ...
 
 
 def symbol_id(path: str, qualified_name: str, kind: SymbolKind) -> str:
@@ -74,6 +95,23 @@ def _header_text(node: Node, source: bytes) -> str | None:
 class PythonParserAdapter:
     def __init__(self) -> None:
         self._parser = Parser(_PY_LANGUAGE)
+
+    def has_syntax_error(self, source: bytes) -> bool:
+        return self._parser.parse(source).root_node.has_error
+
+    def qualified_name(self, node: Node) -> str:
+        parts: list[str] = []
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            parts.append(name_node.text.decode("utf-8"))
+        current = node.parent
+        while current is not None:
+            if current.type == "class_definition":
+                cls_name = current.child_by_field_name("name")
+                if cls_name is not None:
+                    parts.append(cls_name.text.decode("utf-8"))
+            current = current.parent
+        return ".".join(reversed(parts))
 
     def extract_symbols(self, path: str, source: bytes) -> list[Symbol]:
         tree = self._parser.parse(source)
@@ -214,6 +252,23 @@ class PythonParserAdapter:
 class _JsFamilyParserAdapter:
     def __init__(self, language: Language) -> None:
         self._parser = Parser(language)
+
+    def has_syntax_error(self, source: bytes) -> bool:
+        return self._parser.parse(source).root_node.has_error
+
+    def qualified_name(self, node: Node) -> str:
+        parts: list[str] = []
+        name_node = node.child_by_field_name("name")
+        if name_node is not None:
+            parts.append(name_node.text.decode("utf-8"))
+        current = node.parent
+        while current is not None:
+            if current.type == "class_declaration":
+                cls_name = current.child_by_field_name("name")
+                if cls_name is not None:
+                    parts.append(cls_name.text.decode("utf-8"))
+            current = current.parent
+        return ".".join(reversed(parts))
 
     def extract_symbols(self, path: str, source: bytes) -> list[Symbol]:
         tree = self._parser.parse(source)

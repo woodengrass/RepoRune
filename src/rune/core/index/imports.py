@@ -35,6 +35,18 @@ def _resolve_python_import(repo_root: Path, source_path: str, specifier: str) ->
     if specifier.startswith("."):
         dots = len(specifier) - len(specifier.lstrip("."))
         remainder = specifier[dots:]
+        if not remainder:
+            # `from . import sibling` / `from .. import sibling`: our
+            # RawImport only captures the relative_import prefix (the
+            # dots), never the names after `import` -- we don't know
+            # whether "sibling" is a submodule (package/sibling.py) or a
+            # name defined in the package's __init__.py, since we don't
+            # capture imported-name lists (spec's "best effort" for
+            # imports, not full name resolution). Resolving this to the
+            # package's own __init__.py anyway would be a confident wrong
+            # answer for a "high confidence" edge type -- worse than
+            # leaving it unresolved, so: return None instead of guessing.
+            return None
         base = source_dir
         for _ in range(dots - 1):
             base = posixpath.dirname(base)

@@ -200,3 +200,60 @@ def test_symbol_id_is_pure_function_of_inputs() -> None:
     assert symbol_id("a.py", "Foo.bar", SymbolKind.method) != symbol_id(
         "a.py", "Foo.baz", SymbolKind.method
     )
+
+
+def test_python_has_syntax_error_true_for_malformed_source() -> None:
+    """Regression test: tree-sitter recovers from syntax errors by
+    producing a partial tree rather than raising, so `extract_symbols`
+    alone can't tell the caller anything went wrong -- it can even return
+    a symbol with a corrupted signature/range drawn from the malformed
+    region. `has_syntax_error` is the dedicated way to detect this.
+    """
+    adapter = PythonParserAdapter()
+    assert adapter.has_syntax_error(b"def foo(:\n    pass\n") is True
+    assert adapter.has_syntax_error(b"def foo():\n    pass\n") is False
+
+
+def test_javascript_has_syntax_error_true_for_malformed_source() -> None:
+    adapter = JavaScriptParserAdapter()
+    assert adapter.has_syntax_error(b"function foo( {\n") is True
+    assert adapter.has_syntax_error(b"function foo() {}\n") is False
+
+
+def _find_node(node, node_type: str):
+    if node.type == node_type:
+        return node
+    for child in node.children:
+        found = _find_node(child, node_type)
+        if found is not None:
+            return found
+    return None
+
+
+def test_python_qualified_name_matches_extract_symbols_for_same_node() -> None:
+    """The two qualified-name computation paths -- extract_symbols's
+    top-down scope-stack threading, and qualified_name's bottom-up parent
+    walk (added for future callers like Milestone 3's reference resolver,
+    which will hand it an arbitrary node rather than one it discovered
+    itself top-down) -- must agree, or the same logical symbol would get
+    two different ids depending on which path computed its name.
+    """
+    adapter = PythonParserAdapter()
+    tree = adapter._parser.parse(PY_SOURCE)
+    method_node = _find_node(tree.root_node, "function_definition")
+    # PY_SOURCE's first function_definition encountered in a top-down walk
+    # is AuthService.__init__ (module-level CONST_VALUE has no such node).
+    from_extract = {s.qualified_name for s in adapter.extract_symbols("a.py", PY_SOURCE)}
+    assert adapter.qualified_name(method_node) in from_extract
+
+
+def test_typescript_qualified_name_for_a_method_includes_class_name() -> None:
+    source = b"""
+class Widget {
+  render() { return 1; }
+}
+"""
+    adapter = TypeScriptParserAdapter()
+    tree = adapter._parser.parse(source)
+    method_node = _find_node(tree.root_node, "method_definition")
+    assert adapter.qualified_name(method_node) == "Widget.render"

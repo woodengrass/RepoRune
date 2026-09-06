@@ -20,6 +20,24 @@ def test_resolve_python_relative_import(tmp_path: Path) -> None:
     assert target == "app/services.py"
 
 
+def test_resolve_python_bare_dots_import_is_unresolved_not_package_init(tmp_path: Path) -> None:
+    """Regression test: `from . import services` extracts as the raw
+    specifier "." (RawImport only captures the relative_import prefix,
+    not the names after `import`). An earlier version resolved this to
+    the *package's own* __init__.py -- a confidently wrong answer (the
+    real target is normally a sibling submodule, not the current
+    package's init file) for what's supposed to be a high-confidence edge
+    type. Must resolve to None (honestly unresolved) instead of guessing.
+    """
+    _touch(tmp_path, "app/__init__.py")
+    _touch(tmp_path, "app/services.py")
+    target = resolve_import_target(tmp_path, "app/main.py", "python", ".")
+    assert target is None
+
+    target = resolve_import_target(tmp_path, "app/sub/main.py", "python", "..")
+    assert target is None
+
+
 def test_resolve_python_relative_import_to_package(tmp_path: Path) -> None:
     _touch(tmp_path, "app/sub/__init__.py")
     target = resolve_import_target(tmp_path, "app/main.py", "python", ".sub")

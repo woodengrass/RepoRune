@@ -9,6 +9,8 @@ import pytest
 from rune.core.project import init_project
 from rune.core.storage.canonical import append_jsonl, write_json_model
 from rune.core.storage.models import (
+    IndexedFile,
+    IndexedFileStatus,
     MemoryRevision,
     Note,
     NoteCategory,
@@ -25,7 +27,11 @@ from rune.core.storage.models import (
     ScopeSource,
     Severity,
 )
-from rune.core.storage.sqlite.materialize import CanonicalConflictError, rebuild_cache
+from rune.core.storage.sqlite.materialize import (
+    CanonicalConflictError,
+    CodeIndexData,
+    rebuild_cache,
+)
 
 
 def _decision(record_id: str, revision: int, status: RecordStatus) -> MemoryRevision:
@@ -95,6 +101,13 @@ def test_duplicate_revision_raises_conflict_and_preserves_old_cache(git_repo: Pa
     assert hashlib.sha256(layout.memory_db.read_bytes()).hexdigest() == good_hash
 
 
+def _indexed_file(path: str) -> IndexedFile:
+    return IndexedFile(
+        path=path, language="python", content_hash="sha256:x", size=1, mtime=0.0,
+        git_blob_hash=None, indexed_at="2026-01-01T00:00:00Z", status=IndexedFileStatus.ok,
+    )
+
+
 def test_scope_membership_supports_multiple_scopes_per_file(git_repo: Path) -> None:
     layout = init_project(git_repo)
     scopes = ScopesFile(
@@ -111,13 +124,44 @@ def test_scope_membership_supports_multiple_scopes_per_file(git_repo: Path) -> N
     )
     write_json_model(layout.scopes_json, scopes)
 
-    rebuild_cache(layout)
+    # scope_files.file now carries a real FK to files(path) (restored in
+    # Milestone 2) -- the member file must actually be indexed.
+    rebuild_cache(layout, code_index=CodeIndexData(files=[_indexed_file("src/shared.py")]))
 
     conn = sqlite3.connect(str(layout.memory_db))
     rows = conn.execute(
         "SELECT scope_id FROM scope_files WHERE file = ? ORDER BY scope_id", ("src/shared.py",)
     ).fetchall()
     assert [r[0] for r in rows] == ["api", "auth"]
+
+
+def test_scope_membership_referencing_a_nonindexed_file_is_dropped_not_fatal(
+    git_repo: Path,
+) -> None:
+    """A scope member that doesn't match any currently-indexed file (typo
+    in scopes.json, or the file was deleted from the repo) must not abort
+    materialize -- `scope_files.file` has a real FK to files(path), and
+    `INSERT OR IGNORE` does not suppress FK violations in SQLite, so this
+    only works because `_materialize_scopes` pre-filters. Confirmed by
+    reproducing the crash before adding that filter.
+    """
+    layout = init_project(git_repo)
+    scopes = ScopesFile(
+        scopes=[
+            Scope(
+                id="auth", name="Auth", source=ScopeSource.human,
+                members=ScopeMembers(files=["src/does_not_exist.py"]),
+            ),
+        ]
+    )
+    write_json_model(layout.scopes_json, scopes)
+
+    stats = rebuild_cache(layout)  # no code_index -> files table stays empty
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute("SELECT COUNT(*) FROM scope_files").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM scopes").fetchone()[0] == 1
+    assert stats["scopes"] == 1
 
 
 def test_note_current_revision_is_max(git_repo: Path) -> None:

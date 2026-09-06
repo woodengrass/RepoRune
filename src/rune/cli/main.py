@@ -16,7 +16,7 @@ import typer
 
 from rune.core.config import load_config
 from rune.core.hashing import working_tree_fingerprint
-from rune.core.index.scanner import scan_files
+from rune.core.index.scanner import diff_against_previous, scan_files
 from rune.core.project import (
     AlreadyInitializedError,
     NotAGitRepoError,
@@ -100,20 +100,27 @@ def status(
         raise typer.Exit(code=1)
 
     file_count = symbol_count = 0
+    previous_hashes: dict[str, str] = {}
     cache_exists = layout.memory_db.exists()
     if cache_exists:
         conn = sqlite3.connect(str(layout.memory_db))
         try:
             file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+            previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
         finally:
             conn.close()
 
     current_tree_hash: str | None = None
+    modified_count = added_count = deleted_count = 0
     try:
         config = load_config(layout.config_path)
         scanned = scan_files(layout.repo_root, config.index)
         current_tree_hash = working_tree_fingerprint({f.path: f.content_hash for f in scanned})
+        changeset = diff_against_previous(scanned, previous_hashes)
+        modified_count = len(changeset.modified)
+        added_count = len(changeset.added)
+        deleted_count = len(changeset.deleted_paths)
     except Exception:  # noqa: BLE001 - status must never crash on a scan hiccup
         current_tree_hash = None
 
@@ -131,6 +138,9 @@ def status(
         "files_indexed": file_count,
         "symbols_indexed": symbol_count,
         "working_tree_fresh": is_fresh,
+        "files_modified": modified_count,
+        "files_added": added_count,
+        "files_deleted": deleted_count,
     }
 
     if json_output:
@@ -144,6 +154,11 @@ def status(
     typer.echo(f"Files indexed: {file_count}")
     typer.echo(f"Symbols indexed: {symbol_count}")
     typer.echo(f"Working tree: {'fresh' if is_fresh else 'modified since last index'}")
+    if not is_fresh:
+        typer.echo(
+            f"  {modified_count} modified, {added_count} added, {deleted_count} deleted "
+            f"(relative to the last index)"
+        )
 
 
 @app.command()

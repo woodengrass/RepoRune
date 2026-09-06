@@ -198,6 +198,9 @@ def test_one_file_parse_failure_does_not_abort_the_whole_update(
                 raise RuntimeError("simulated parser crash")
             return real_adapter.extract_imports(path, source)
 
+        def has_syntax_error(self, source: bytes) -> bool:
+            return real_adapter.has_syntax_error(source)
+
     monkeypatch.setattr(
         update_module, "get_parser_adapter", lambda language, path="": FlakyAdapter()
     )
@@ -218,3 +221,48 @@ def test_one_file_parse_failure_does_not_abort_the_whole_update(
     }
     assert other_statuses == {"ok"}
     assert stats["files"] == 3
+
+
+def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Known limitation documented in core.update.run_update: the SQLite
+    commit and the project.json write are not atomic with each other. If
+    project.json's write fails right after a successful cache commit, the
+    cache itself must still be correct, and the next `run_update` call
+    must still behave correctly (it diffs against the `files` table, not
+    against project.json, so a stale project.json cannot corrupt it).
+    """
+    import rune.core.update as update_module
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    def failing_write_json_model(path, model):
+        raise OSError("simulated disk-full failure")
+
+    monkeypatch.setattr(update_module, "write_json_model", failing_write_json_model)
+
+    (python_simple_repo / "app" / "services.py").write_text(
+        (python_simple_repo / "app" / "services.py").read_text(encoding="utf-8") + "\n# x\n",
+        encoding="utf-8",
+    )
+    try:
+        run_update(layout, full=False)
+        raise AssertionError("expected the simulated project.json write failure to propagate")
+    except OSError:
+        pass
+
+    # the cache itself was still correctly committed despite the metadata
+    # write failing afterward
+    conn = sqlite3.connect(str(layout.memory_db))
+    qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
+    assert "UserService.get_user" in qnames
+
+    # a subsequent, unpatched update must still work correctly: it diffs
+    # against the files table (already up to date), not the stale
+    # project.json, so nothing is corrupted by the earlier failure
+    monkeypatch.undo()
+    stats = run_update(layout, full=False)
+    assert stats["files_parsed"] == 0  # nothing changed since the failed attempt
+    assert stats["files_reused"] == 3

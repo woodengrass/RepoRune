@@ -106,6 +106,21 @@ def _group_current_by_id(
 
 
 def _materialize_scopes(conn: sqlite3.Connection, scopes_file: ScopesFile) -> None:
+    # `scope_files.file`/`scope_symbols.symbol_id` now carry a real FK to
+    # files/symbols (restored in Milestone 2, per the deferral tracked in
+    # schema.sql and DATA_MODEL.md §5 since Milestone 1). `_materialize_
+    # code_index` runs before this function in `rebuild_cache`, so the
+    # current code index is already visible on `conn` — query it rather
+    # than threading the sets through the call chain. A scope member that
+    # doesn't match anything currently indexed (deleted file, renamed
+    # symbol, typo in scopes.json) is silently dropped from membership
+    # here rather than raising: `INSERT OR IGNORE` does NOT suppress
+    # foreign-key violations in SQLite (verified — it only suppresses
+    # UNIQUE conflicts), so without this pre-filter a single stale
+    # membership would abort the whole materialize.
+    valid_files = {row[0] for row in conn.execute("SELECT path FROM files")}
+    valid_symbols = {row[0] for row in conn.execute("SELECT symbol_id FROM symbols")}
+
     for scope in scopes_file.scopes:
         conn.execute(
             "INSERT INTO scopes (id, name, description, locked, source) "
@@ -113,11 +128,15 @@ def _materialize_scopes(conn: sqlite3.Connection, scopes_file: ScopesFile) -> No
             (scope.id, scope.name, scope.description, int(scope.locked), scope.source.value),
         )
         for file_path in scope.members.files:
+            if file_path not in valid_files:
+                continue
             conn.execute(
                 "INSERT OR IGNORE INTO scope_files (scope_id, file) VALUES (?, ?)",
                 (scope.id, file_path),
             )
         for symbol_id in scope.members.symbols:
+            if symbol_id not in valid_symbols:
+                continue
             conn.execute(
                 "INSERT OR IGNORE INTO scope_symbols (scope_id, symbol_id) VALUES (?, ?)",
                 (scope.id, symbol_id),
@@ -286,6 +305,9 @@ class CodeIndexData:
 
 
 def _materialize_code_index(conn: sqlite3.Connection, code_index: CodeIndexData) -> None:
+    file_paths = {f.path for f in code_index.files}
+    symbol_ids = {s.symbol_id for s in code_index.symbols}
+
     for f in code_index.files:
         conn.execute(
             "INSERT INTO files "
@@ -307,12 +329,23 @@ def _materialize_code_index(conn: sqlite3.Connection, code_index: CodeIndexData)
             ),
         )
     for e in code_index.edges:
+        # An edge reused from an *unchanged* file can point at a file/
+        # symbol that this same run just dropped (e.g. the file it used
+        # to import was deleted, or the target symbol was renamed away).
+        # Null out a stale target rather than inserting it: `target_file
+        # REFERENCES files(path)` would otherwise raise IntegrityError and
+        # abort the whole update over one dangling edge. This is the same
+        # "unresolved" representation already used for bare package
+        # imports (confidence stays 1.0 — the import statement itself is
+        # still real, only its resolved target became stale).
+        target_file = e.target_file if e.target_file in file_paths else None
+        target_symbol = e.target_symbol if e.target_symbol in symbol_ids else None
         conn.execute(
             "INSERT INTO edges "
             "(source_symbol, source_file, target_symbol, target_file, edge_type, confidence) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (
-                e.source_symbol, e.source_file, e.target_symbol, e.target_file,
+                e.source_symbol, e.source_file, target_symbol, target_file,
                 e.edge_type.value, e.confidence,
             ),
         )
