@@ -31,10 +31,165 @@ def test_python_simple_fixture_indexes_expected_symbols(python_simple_repo: Path
 
     # the unresolvable stdlib import must still be recorded, just unresolved
     stdlib_edges = conn.execute(
-        "SELECT COUNT(*) FROM edges WHERE source_file = ? AND target_file IS NULL",
+        "SELECT COUNT(*) FROM edges WHERE source_file = ? AND edge_type = 'imports' "
+        "AND target_file IS NULL",
         ("app/main.py",),
     ).fetchone()[0]
     assert stdlib_edges == 1
+
+
+def test_python_simple_fixture_resolves_calls_across_files(python_simple_repo: Path) -> None:
+    """Hand-verified reference query (Milestone 3's explicitly-permitted
+    exception to "no hand-checked fixtures", since best-effort resolution
+    can't be judged any other way): app/main.py's `run()` calls
+    `UserService(...)` and `service.get_user(1)`, both of which should
+    resolve into app/services.py via the import edge between the two
+    files. `self.db.fetch(...)` inside get_user has no matching symbol
+    anywhere and must be recorded unresolved, not dropped.
+    """
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    run_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'run'"
+    ).fetchone()[0]
+    user_service_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'UserService'"
+    ).fetchone()[0]
+    get_user_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'UserService.get_user'"
+    ).fetchone()[0]
+
+    calls_from_run = {
+        row[0]
+        for row in conn.execute(
+            "SELECT target_symbol FROM edges WHERE edge_type = 'calls' AND source_symbol = ?",
+            (run_id,),
+        )
+    }
+    assert calls_from_run == {user_service_id, get_user_id}
+
+    unresolved_calls_in_get_user = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE edge_type = 'calls' AND source_symbol = ? "
+        "AND target_symbol IS NULL",
+        (get_user_id,),
+    ).fetchone()[0]
+    assert unresolved_calls_in_get_user == 1  # self.db.fetch(...)
+
+
+def test_extends_and_implements_resolve_end_to_end(tmp_path: Path) -> None:
+    """A small hand-built repo (not the shared fixtures, to avoid coupling
+    every other fixture-based test's symbol/edge counts to this one) that
+    exercises `extends`/`implements` through the full init -> update ->
+    materialize pipeline, not just the unit-level extraction tests.
+    """
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "shapes.ts").write_text(
+        "export interface Shape { area(): number; }\n"
+        "export class Base {}\n"
+        "export class Circle extends Base implements Shape {\n"
+        "  area(): number { return 0; }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "-q", "-m", "init"],
+        cwd=repo, check=True,
+    )
+
+    layout = init_project(repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    circle_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'Circle'"
+    ).fetchone()[0]
+    base_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'Base'"
+    ).fetchone()[0]
+    shape_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'Shape'"
+    ).fetchone()[0]
+
+    extends_target = conn.execute(
+        "SELECT target_symbol FROM edges WHERE edge_type = 'extends' AND source_symbol = ?",
+        (circle_id,),
+    ).fetchone()[0]
+    implements_target = conn.execute(
+        "SELECT target_symbol FROM edges WHERE edge_type = 'implements' AND source_symbol = ?",
+        (circle_id,),
+    ).fetchone()[0]
+    assert extends_target == base_id
+    assert implements_target == shape_id
+
+
+def test_reference_resolution_entirely_unresolved_does_not_break_update(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """ARCHITECTURE.md §4.3's resilience requirement: Scope/Constraint
+    (and everything else) must not depend on the reference graph being
+    complete. Simulated here by forcing every single reference to come
+    back unresolved (as if resolution matched nothing at all) and
+    confirming `rune update` still completes, the cache is still
+    consistent, and scope membership (which never depended on references
+    in the first place, per Milestone 1's design) is unaffected.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import write_json_model
+    from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
+
+    def always_unresolved(file_path, raw_references, symbols_by_path, imported_files):
+        from rune.core.storage.models import Edge
+
+        return [
+            Edge(
+                source_symbol=None, source_file=file_path,
+                target_symbol=None, target_file=None,
+                edge_type=ref.edge_type, confidence=0.0,
+            )
+            for ref in raw_references
+        ]
+
+    monkeypatch.setattr(update_module, "resolve_references", always_unresolved)
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(
+            scopes=[
+                Scope(
+                    id="app", name="App", source=ScopeSource.human,
+                    members=ScopeMembers(files=["app/main.py"]),
+                )
+            ]
+        ),
+    )
+
+    stats = run_update(layout, full=True)  # must not raise
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    unresolved_refs = conn.execute(
+        "SELECT COUNT(*) FROM edges WHERE edge_type = 'calls' AND target_symbol IS NULL"
+    ).fetchone()[0]
+    assert unresolved_refs > 0  # the forced-unresolved path actually ran
+
+    # scope membership, which never depends on the reference graph, is
+    # completely unaffected by references being 100% unresolved
+    scope_row = conn.execute(
+        "SELECT file FROM scope_files WHERE scope_id = 'app'"
+    ).fetchone()
+    assert scope_row == ("app/main.py",)
+    assert stats["files"] == 3
 
 
 def test_ts_simple_fixture_indexes_expected_symbols_and_edge(ts_simple_repo: Path) -> None:
@@ -197,6 +352,11 @@ def test_one_file_parse_failure_does_not_abort_the_whole_update(
             if path.endswith("services.py"):
                 raise RuntimeError("simulated parser crash")
             return real_adapter.extract_imports(path, source)
+
+        def extract_references(self, path: str, source: bytes) -> list:
+            if path.endswith("services.py"):
+                raise RuntimeError("simulated parser crash")
+            return real_adapter.extract_references(path, source)
 
         def has_syntax_error(self, source: bytes) -> bool:
             return real_adapter.has_syntax_error(source)

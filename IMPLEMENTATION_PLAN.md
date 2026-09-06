@@ -220,21 +220,44 @@ Python 3.12 切換那次 commit 修正過**，reviewer 看到的應該是切換�
   下游如 Decision 不受影響，這條 hash 本身必須精確）。
 
 ## Milestone 3 — References / graph
+
+**目前狀態：已實作並通過測試**（`src/rune/core/index/references.py`，106 個測試全綠，`ruff check`
+全綠）。`ParserAdapter` 新增 `extract_references`，每語言各自擷取呼叫點（`call`/`call_expression`
+的 function 欄位，含 `attribute`/`member_expression` 的屬性存取）與繼承關係（Python 的
+`superclasses`、TS 的 `class_heritage` 的 `extends_clause`/`implements_clause`）。解析分兩階段：
+擷取（純語法，各檔案獨立）與 `core.index.references.resolve_references` 解析（跨檔案，需要完整的
+symbol table，故在 `core.update.run_update` 收集完所有檔案的 symbol 後才統一做一次解析），符合
+`qualified_name` 已經確立的「輸出形狀固定、演算法各自實作」原則。信心分級：本檔案內命中 0.8、
+透過 import 關係命中的其他檔案 0.6、完全無法比對 0.3（**仍記錄，不捨棄**）。
+
 **模組**：`rune.core.index.references`。
 
 **交付項目：**
-- Best-effort reference 解析（`edge_type=references`/`calls`/`extends`/`implements`），帶
-  `confidence` 分數；無法解析的 reference 記錄為 `target_symbol/target_file = NULL`，不刪除、不報錯。
-- 查詢輔助：「誰引用了 symbol X」，基於 `edges` 表。
+- Best-effort reference 解析（`edge_type=calls`/`extends`/`implements`；`references` 保留給
+  未來更細的識別字引用，V1 尚未產生這個 edge_type），帶 `confidence` 分數；無法解析的 reference
+  記錄為 `target_symbol/target_file = NULL`，不刪除、不報錯。
+- 查詢輔助：「誰引用了 symbol X」——`find_referencing_edges(conn, symbol_id)`，基於 `edges` 表
+  （M6 的 `core.retrieval` 落地前的暫時介面，純 SQL，無額外抽象）。
 
 **驗收標準：**
-- 在 fixture repo 上，一組人工驗證過的 reference 查詢回傳正確結果（這是唯一允許使用小型手動核對
-  expected-output fixture 的 milestone，因為「best effort」本質上無法用其他方式做客觀測試）。
-- 模糊或無法解析的 reference 不會造成 crash/abort——規格明確要求不得視為失敗。
-- **回歸測試證明 reference 解析大範圍失敗時 rune 仍可運作**（本輪新增，對應 ARCHITECTURE §4.3 的
-  信任層級原則）：人工把某 fixture repo 的 reference 解析結果清空／改為全部 unresolved，`rune
-  update`/`rune search`/scope membership 查詢仍正常完成，不因為 reference graph 缺漏而失敗——證明
-  Scope/Constraint 系統沒有把 reference graph 當唯一依據。
+- 在 fixture repo（`python-simple`）與一個手工建立的最小 repo（TS 的 extends/implements）上，一組
+  人工驗證過的 reference 查詢回傳正確結果——`run()` 呼叫 `UserService(...)`/`service.get_user(1)`
+  正確解析到 `app/services.py`，`self.db.fetch(...)` 正確標記為無法解析（不是被丟棄）；
+  `Circle extends Base implements Shape` 正確產生兩條分開的 edge。
+- 模糊或無法解析的 reference 不會造成 crash/abort。
+- **回歸測試證明 reference 解析大範圍失敗時 rune 仍可運作**（對應 ARCHITECTURE §4.3 的信任層級
+  原則）：monkeypatch `resolve_references` 讓所有 reference 一律回傳 unresolved，`rune update`
+  仍正常完成，scope membership 查詢完全不受影響（因為它從未依賴 reference graph）。
+
+**自我複查發現並修正 1 個問題**（在寫「誰引用了 symbol X」的手動驗證腳本時，用不同的
+`PYTHONHASHSEED` 連續跑了 5 次同一段程式碼才發現）：當一個呼叫名稱同時比對到**兩個以上**匯入檔案裡
+的同名 symbol 時，原本直接對 Python `set`（`imported_files`）做迭代來挑第一個命中的候選——但字串的
+`set` 迭代順序在不同行程之間會因為 hash 隨機化而不同，導致完全相同的原始碼在不同次 `rune update`
+呼叫之間可能解析出不同的目標，違反這個專案一路建立起來的「相同狀態輸入、相同結果輸出」保證（`rebuild
+-cache` 等價性正是建立在這個保證上）。修法是先 `sorted()` 再挑，讓結果與行程的 hash seed 無關。
+回歸測試刻意用 `subprocess` 搭配五個不同的 `PYTHONHASHSEED` 值執行同一段解析邏輯，確認全部回傳同一個
+答案——單一行程內重複呼叫測不出這個 bug（CPython 同一行程內的 hash 快取讓 set 順序在行程存活期間保持
+穩定），必須真的跨行程才會顯現。
 
 ## Milestone 4 — Scopes
 **模組**：`rune.core.scopes.{model,heuristics,clustering}`。

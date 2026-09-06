@@ -18,7 +18,7 @@ import tree_sitter_python as _ts_python
 import tree_sitter_typescript as _ts_typescript
 from tree_sitter import Language, Node, Parser
 
-from rune.core.storage.models import Symbol, SymbolKind
+from rune.core.storage.models import EdgeType, Symbol, SymbolKind
 
 _PY_LANGUAGE = Language(_ts_python.language())
 _JS_LANGUAGE = Language(_ts_javascript.language())
@@ -38,9 +38,30 @@ class RawImport:
     line: int
 
 
+@dataclass(frozen=True)
+class RawReference:
+    """A not-yet-resolved call/inheritance reference as written in source.
+    `core.index.references` resolves `name` against this file's own
+    symbols and the symbols of files it imports (or leaves it unresolved)
+    — this module never does that resolution itself, only extraction.
+    """
+
+    name: str
+    edge_type: EdgeType  # calls | extends | implements
+    line: int
+
+
 class ParserAdapter(Protocol):
     def extract_symbols(self, path: str, source: bytes) -> list[Symbol]: ...
     def extract_imports(self, path: str, source: bytes) -> list[RawImport]: ...
+    def extract_references(self, path: str, source: bytes) -> list[RawReference]:
+        """Best-effort call/inheritance sites (ARCHITECTURE.md §4.3): a
+        call expression's target name, or a class's superclass/interface
+        name. Purely syntactic — no attempt at type inference or binding
+        resolution, which is why resolution (in core.index.references) is
+        confidence-scored and allowed to come back unresolved.
+        """
+        ...
     def qualified_name(self, node: Node) -> str:
         """Given an arbitrary tree-sitter node from this language's
         grammar (e.g. one `core.index.references` finds independently in
@@ -242,6 +263,47 @@ class PythonParserAdapter:
         for child in node.children:
             self._collect_imports(child, imports)
 
+    def extract_references(self, path: str, source: bytes) -> list[RawReference]:
+        tree = self._parser.parse(source)
+        refs: list[RawReference] = []
+        self._collect_references(tree.root_node, refs)
+        return refs
+
+    def _collect_references(self, node: Node, refs: list[RawReference]) -> None:
+        if node.type == "call":
+            fn = node.child_by_field_name("function")
+            name = self._call_target_name(fn) if fn is not None else None
+            if name is not None:
+                refs.append(
+                    RawReference(name=name, edge_type=EdgeType.calls, line=node.start_point[0] + 1)
+                )
+        elif node.type == "class_definition":
+            superclasses = node.child_by_field_name("superclasses")
+            if superclasses is not None:
+                for child in superclasses.children:
+                    # skip `metaclass=Meta`-style keyword_argument entries —
+                    # only plain identifiers are real base classes
+                    if child.type == "identifier":
+                        refs.append(
+                            RawReference(
+                                name=child.text.decode("utf-8"),
+                                edge_type=EdgeType.extends,
+                                line=node.start_point[0] + 1,
+                            )
+                        )
+        for child in node.children:
+            self._collect_references(child, refs)
+
+    @staticmethod
+    def _call_target_name(fn_node: Node) -> str | None:
+        if fn_node.type == "identifier":
+            return fn_node.text.decode("utf-8")
+        if fn_node.type == "attribute":
+            attr = fn_node.child_by_field_name("attribute")
+            if attr is not None:
+                return attr.text.decode("utf-8")
+        return None
+
 
 # --------------------------------------------------------------------------
 # JavaScript / TypeScript (shared walk — same grammar family, TS/TSX just
@@ -437,6 +499,57 @@ class _JsFamilyParserAdapter:
                         )
         for child in node.children:
             self._collect_imports(child, imports)
+
+    def extract_references(self, path: str, source: bytes) -> list[RawReference]:
+        tree = self._parser.parse(source)
+        refs: list[RawReference] = []
+        self._collect_references(tree.root_node, refs)
+        return refs
+
+    def _collect_references(self, node: Node, refs: list[RawReference]) -> None:
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            name = self._call_target_name(fn) if fn is not None else None
+            if name is not None:
+                refs.append(
+                    RawReference(name=name, edge_type=EdgeType.calls, line=node.start_point[0] + 1)
+                )
+        elif node.type == "class_declaration":
+            heritage = next((c for c in node.children if c.type == "class_heritage"), None)
+            if heritage is not None:
+                for clause in heritage.children:
+                    if clause.type == "extends_clause":
+                        value = clause.child_by_field_name("value")
+                        if value is not None and value.type in ("identifier", "type_identifier"):
+                            refs.append(
+                                RawReference(
+                                    name=value.text.decode("utf-8"),
+                                    edge_type=EdgeType.extends,
+                                    line=node.start_point[0] + 1,
+                                )
+                            )
+                    elif clause.type == "implements_clause":
+                        for c in clause.children:
+                            if c.type == "type_identifier":
+                                refs.append(
+                                    RawReference(
+                                        name=c.text.decode("utf-8"),
+                                        edge_type=EdgeType.implements,
+                                        line=node.start_point[0] + 1,
+                                    )
+                                )
+        for child in node.children:
+            self._collect_references(child, refs)
+
+    @staticmethod
+    def _call_target_name(fn_node: Node) -> str | None:
+        if fn_node.type == "identifier":
+            return fn_node.text.decode("utf-8")
+        if fn_node.type == "member_expression":
+            prop = fn_node.child_by_field_name("property")
+            if prop is not None:
+                return prop.text.decode("utf-8")
+        return None
 
 
 def _string_literal_value(node: Node) -> str | None:

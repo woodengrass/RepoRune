@@ -7,7 +7,7 @@ from rune.core.index.treesitter import (
     get_parser_adapter,
     symbol_id,
 )
-from rune.core.storage.models import SymbolKind
+from rune.core.storage.models import EdgeType, SymbolKind
 
 PY_SOURCE = b"""
 CONST_VALUE = 42
@@ -106,6 +106,49 @@ def test_python_extracts_absolute_and_relative_imports() -> None:
     assert "..pkg" in specifiers
 
 
+def test_python_extracts_call_and_attribute_call_references() -> None:
+    source = b"""
+class Foo(Base):
+    def method(self):
+        helper()
+        self.other()
+        obj.thing()
+"""
+    adapter = PythonParserAdapter()
+    refs = adapter.extract_references("a.py", source)
+    calls = {r.name for r in refs if r.edge_type == EdgeType.calls}
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    assert calls == {"helper", "other", "thing"}
+    assert extends == {"Base"}
+
+
+def test_python_extends_ignores_keyword_arguments() -> None:
+    """`class Foo(Base, metaclass=Meta):` -- only `Base` is a real
+    superclass reference; `metaclass=Meta` is a keyword_argument node, not
+    a plain identifier, and must not be reported as an `extends` edge.
+    """
+    adapter = PythonParserAdapter()
+    refs = adapter.extract_references("a.py", b"class Foo(Base, metaclass=Meta):\n    pass\n")
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    assert extends == {"Base"}
+
+
+def test_python_multiple_inheritance_produces_one_extends_ref_per_base() -> None:
+    adapter = PythonParserAdapter()
+    refs = adapter.extract_references("a.py", b"class Foo(Base1, Base2):\n    pass\n")
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    assert extends == {"Base1", "Base2"}
+
+
+def test_typescript_multiple_implements_produces_one_ref_per_interface() -> None:
+    adapter = TypeScriptParserAdapter()
+    refs = adapter.extract_references(
+        "a.ts", b"class Foo implements A, B {\n}\n"
+    )
+    implements = {r.name for r in refs if r.edge_type == EdgeType.implements}
+    assert implements == {"A", "B"}
+
+
 def test_javascript_extracts_function_class_method_and_arrow_const() -> None:
     source = b"""
 function add(a, b) { return a + b; }
@@ -164,6 +207,39 @@ const pkg = require("some-package");
     imports = adapter.extract_imports("src/widget.js", source)
     specifiers = {i.specifier for i in imports}
     assert specifiers == {"./foo", "../bar", "some-package"}
+
+
+def test_javascript_extracts_call_and_member_call_references() -> None:
+    source = b"""
+function helper() {}
+class Foo {
+  method() {
+    helper();
+    this.other();
+    obj.thing();
+  }
+}
+"""
+    adapter = JavaScriptParserAdapter()
+    refs = adapter.extract_references("a.js", source)
+    calls = {r.name for r in refs if r.edge_type == EdgeType.calls}
+    assert calls == {"helper", "other", "thing"}
+
+
+def test_typescript_extracts_extends_and_implements_references() -> None:
+    source = b"""
+interface Reducer { reduce(): number; }
+class Base {}
+class Foo extends Base implements Reducer {
+  reduce(): number { return 0; }
+}
+"""
+    adapter = TypeScriptParserAdapter()
+    refs = adapter.extract_references("a.ts", source)
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    implements = {r.name for r in refs if r.edge_type == EdgeType.implements}
+    assert extends == {"Base"}
+    assert implements == {"Reducer"}
 
 
 def test_typescript_extracts_interface_and_type_alias() -> None:
