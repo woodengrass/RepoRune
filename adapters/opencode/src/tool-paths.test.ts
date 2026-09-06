@@ -9,7 +9,7 @@ test("edit/write/read tools yield their filePath argument", () => {
   assert.deepEqual(extractPathsFromToolArgs("read", { file_path: "app/utils.py" }), ["app/utils.py"]);
 });
 
-test("apply_patch extracts every Add/Update/Delete File marker", () => {
+test("apply_patch extracts every Add/Update/Delete/Move marker", () => {
   const patchText = [
     "*** Begin Patch",
     "*** Update File: app/services.py",
@@ -19,11 +19,12 @@ test("apply_patch extracts every Add/Update/Delete File marker", () => {
     "*** Add File: app/new_module.py",
     "+content",
     "*** Delete File: app/old_module.py",
+    "*** Move to: app/moved_module.py",
     "*** End Patch",
   ].join("\n");
   assert.deepEqual(
     extractPathsFromToolArgs("apply_patch", { patchText }).sort(),
-    ["app/new_module.py", "app/old_module.py", "app/services.py"],
+    ["app/moved_module.py", "app/new_module.py", "app/old_module.py", "app/services.py"],
   );
 });
 

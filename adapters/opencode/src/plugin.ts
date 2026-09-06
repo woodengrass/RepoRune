@@ -17,6 +17,8 @@
 import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin/tool";
 import type { Event } from "@opencode-ai/sdk";
+import { stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import {
   bootstrapHard,
@@ -33,6 +35,10 @@ import {
 import { mergeRuneBlock, renderSoftBootstrap, RuneSessionContext } from "./rune-context.js";
 import { extractPathsFromToolArgs } from "./tool-paths.js";
 
+const TITLE_GENERATION_SYSTEM_MARKER =
+  "You are a title generator. You output ONLY a thread title. Nothing else.";
+const RUNE_PLUGIN_BUILD = "directory-normalization-host-debug-20260907-a";
+
 /**
  * The subset of rune-cli.ts this module calls, factored out as an
  * injectable interface purely so tests can supply a fake instead of
@@ -47,6 +53,11 @@ export interface RuneClient {
   changedFilesFromGitStatus(directory: string): Promise<string[]>;
 }
 
+interface RuneHookOptions {
+  acceptanceLog?: (message: string, extra: Record<string, unknown>) => Promise<void>;
+  acceptanceSentinel?: string;
+}
+
 const defaultRuneClient: RuneClient = {
   scopeFor, bootstrapHard, bootstrapSoft, changedFilesFromGitStatus,
 };
@@ -57,8 +68,34 @@ const defaultRuneClient: RuneClient = {
  * construct one directly without going through OpenCode's own plugin
  * loading machinery.
  */
-export function createRuneHooks(directory: string, client: RuneClient = defaultRuneClient): Hooks {
+export function createRuneHooks(
+  directory: string,
+  client: RuneClient = defaultRuneClient,
+  options: RuneHookOptions = {},
+): Hooks {
   const sessions = new Map<string, RuneSessionContext>();
+  const activatedPaths = new Map<string, Set<string>>();
+  let systemTransformCount = 0;
+
+  const logAcceptance = async (message: string, extra: Record<string, unknown>): Promise<void> => {
+    try {
+      await options.acceptanceLog?.(message, extra);
+    } catch {
+      // Acceptance logging is diagnostic only.
+    }
+  };
+
+  const failOpen = async (hook: string, error: unknown, extra: Record<string, unknown> = {}): Promise<void> => {
+    try {
+      await logAcceptance("hook.error", {
+        hook,
+        error_type: error instanceof Error ? error.name : typeof error,
+        ...extra,
+      });
+    } catch {
+      // Observability must never make an injection hook block the host.
+    }
+  };
 
   const getSession = (sessionID: string): RuneSessionContext => {
     let ctx = sessions.get(sessionID);
@@ -75,7 +112,20 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
   }
 
   async function activateScopesForPath(sessionID: string, path: string): Promise<void> {
-    const result = await client.scopeFor(directory, path);
+    const scopePath = pathForScopeLookup(directory, path);
+    if (!scopePath) {
+      await logAcceptance("scope-activation.skipped", {
+        session_id: sessionID,
+        path,
+        reason: "path_outside_repository",
+      });
+      return;
+    }
+    const seenPaths = activatedPaths.get(sessionID) ?? new Set<string>();
+    if (seenPaths.has(scopePath)) return;
+    const result = await client.scopeFor(directory, scopePath);
+    seenPaths.add(scopePath);
+    activatedPaths.set(sessionID, seenPaths);
     const ctx = getSession(sessionID);
     for (const scope of result.scopes) {
       ctx.addActiveScope(scope);
@@ -85,27 +135,67 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
   async function handleEvent(event: Event): Promise<void> {
     if (event.type === "session.created") {
       const sessionID = event.properties.info.id;
-      await seedHardBootstrap(sessionID);
-      const soft = await client.bootstrapSoft(directory);
-      getSession(sessionID).enqueuePendingEvent(renderSoftBootstrap(soft));
+      try {
+        await seedHardBootstrap(sessionID);
+      } catch (error) {
+        await failOpen("bootstrap.hard", error, { session_id: sessionID });
+      }
+      try {
+        const soft = await client.bootstrapSoft(directory);
+        getSession(sessionID).enqueuePendingEvent(renderSoftBootstrap(soft));
+      } catch (error) {
+        await failOpen("bootstrap.soft", error, { session_id: sessionID });
+      }
     } else if (event.type === "session.compacted") {
       // "Possible amnesia event" (ARCHITECTURE §7.3): hard bootstrap is
       // always re-fetched and re-rendered from here on, never assumed to
       // have survived the compacted summary. Soft bootstrap is
       // deliberately NOT re-queued -- it's a session.created-only payload.
-      await seedHardBootstrap(event.properties.sessionID);
+      try {
+        await seedHardBootstrap(event.properties.sessionID);
+      } catch (error) {
+        await failOpen("bootstrap.hard", error, { session_id: event.properties.sessionID });
+      }
     }
   }
 
   return {
     event: async ({ event }) => {
-      await handleEvent(event);
+      await logAcceptance("event", {
+        event_type: event.type,
+        session_id: event.type === "session.created"
+          ? event.properties.info.id
+          : "sessionID" in event.properties ? event.properties.sessionID : undefined,
+        event_property_keys: Object.keys(event.properties),
+        event_info_keys: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+          ? Object.keys(event.properties.info)
+          : [],
+        event_role: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+          ? (event.properties.info as { role?: unknown }).role
+          : undefined,
+        event_agent: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+          ? (event.properties.info as { agent?: unknown }).agent
+          : undefined,
+      });
+      try {
+        await handleEvent(event);
+      } catch (error) {
+        await failOpen("event", error, { event_type: event.type });
+      }
     },
 
     "tool.execute.before": async (input, output) => {
       if (input.tool === "bash") return; // handled post-hoc in tool.execute.after
-      for (const path of extractPathsFromToolArgs(input.tool, output.args)) {
-        await activateScopesForPath(input.sessionID, path);
+      try {
+        const paths = extractPathsFromToolArgs(input.tool, output.args);
+        await logAcceptance("tool.execute.before", {
+          tool: input.tool, session_id: input.sessionID, tool_call_id: input.callID,
+          arg_keys: output.args && typeof output.args === "object" ? Object.keys(output.args) : [],
+          extracted_paths: paths, paths_are_absolute: paths.map((path) => /^(?:[A-Za-z]:[\\/]|\/)/.test(path)),
+        });
+        for (const path of paths) await activateScopesForPath(input.sessionID, path);
+      } catch (error) {
+        await failOpen("tool.execute.before", error, { tool: input.tool, session_id: input.sessionID });
       }
     },
 
@@ -114,8 +204,15 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
       // V1 deliberately never parses shell command semantics to predict
       // what a `bash` call will touch (ARCHITECTURE §6) -- instead this
       // detects what actually changed, after the fact, via `git status`.
-      for (const path of await client.changedFilesFromGitStatus(directory)) {
-        await activateScopesForPath(input.sessionID, path);
+      try {
+        const paths = await client.changedFilesFromGitStatus(directory);
+        await logAcceptance("tool.execute.after", {
+          tool: input.tool, session_id: input.sessionID, tool_call_id: input.callID,
+          extracted_paths: paths, paths_are_absolute: paths.map((path) => /^(?:[A-Za-z]:[\\/]|\/)/.test(path)),
+        });
+        for (const path of paths) await activateScopesForPath(input.sessionID, path);
+      } catch (error) {
+        await failOpen("tool.execute.after", error, { tool: input.tool, session_id: input.sessionID });
       }
     },
 
@@ -123,7 +220,35 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
       if (!input.sessionID) return;
       const ctx = sessions.get(input.sessionID);
       if (!ctx) return; // no session.created seen yet for this id -- nothing to inject
-      mergeRuneBlock(output.system, ctx.render());
+      if (output.system.some((entry) => entry.includes(TITLE_GENERATION_SYSTEM_MARKER))) {
+        await logAcceptance("experimental.chat.system.transform", {
+          session_id: input.sessionID,
+          title_generation: true,
+          rune_block_present: output.system.some((entry) => entry.includes("<!-- rune-context:start -->")),
+        });
+        return;
+      }
+      try {
+        const beforeLength = output.system.length;
+        const context = options.acceptanceSentinel
+          ? `${ctx.render()}\n\n[RUNE_HOST_ACCEPTANCE_TEST]\n${options.acceptanceSentinel}` : ctx.render();
+        mergeRuneBlock(output.system, context);
+        systemTransformCount += 1;
+        await logAcceptance("experimental.chat.system.transform", {
+        invocation: systemTransformCount,
+        session_id: input.sessionID,
+        title_generation: false,
+        system_length_before: beforeLength,
+        system_length_after: output.system.length,
+        rune_block_present: output.system.some((entry) => entry.includes("<!-- rune-context:start -->")),
+        model_keys: input.model && typeof input.model === "object" ? Object.keys(input.model) : [],
+        model_id: input.model && typeof input.model === "object"
+          ? (input.model as { id?: unknown }).id
+          : undefined,
+        });
+      } catch (error) {
+        await failOpen("experimental.chat.system.transform", error, { session_id: input.sessionID });
+      }
     },
 
     tool: {
@@ -136,10 +261,14 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
           content: tool.schema.string(),
           rationale: tool.schema.string().optional(),
           scopes: tool.schema.array(tool.schema.string()).optional(),
+          files: tool.schema.array(tool.schema.string()).optional(),
+          symbols: tool.schema.array(tool.schema.string()).optional(),
           critical: tool.schema
             .boolean()
             .optional()
             .describe("Eligible for hard bootstrap -- reserve for genuinely load-bearing decisions."),
+          source_document: tool.schema.string().optional(),
+          source_section: tool.schema.string().optional(),
         },
         execute: async (args, context) => {
           const result = await decisionPropose(context.directory, args);
@@ -159,6 +288,11 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
           rationale: tool.schema.string().optional(),
           scopes: tool.schema.array(tool.schema.string()).optional(),
           files: tool.schema.array(tool.schema.string()).optional(),
+          symbols: tool.schema.array(tool.schema.string()).optional(),
+          expires_at: tool.schema.string().optional(),
+          source_document: tool.schema.string().optional(),
+          source_section: tool.schema.string().optional(),
+          machine_check_hint: tool.schema.string().optional(),
         },
         execute: async (args, context) => {
           const result = await constraintPropose(context.directory, args);
@@ -178,6 +312,11 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
           why_persist: tool.schema.string(),
           scopes: tool.schema.array(tool.schema.string()).optional(),
           files: tool.schema.array(tool.schema.string()).optional(),
+          symbols: tool.schema.array(tool.schema.string()).optional(),
+          importance: tool.schema.number().optional(),
+          confidence: tool.schema.number().optional(),
+          evidence: tool.schema.array(tool.schema.string()).optional(),
+          expires_at: tool.schema.string().optional(),
         },
         execute: async (args, context) => {
           const result = await noteAdd(context.directory, args);
@@ -186,6 +325,54 @@ export function createRuneHooks(directory: string, client: RuneClient = defaultR
       }),
     },
   };
+}
+
+/** Converts a host tool path to Rune's repo-relative, POSIX CLI contract.
+ * Paths outside the plugin directory are rejected rather than mapped to an
+ * unrelated scope. */
+export function pathForScopeLookup(directory: string, path: string): string | null {
+  const absolutePath = isAbsolute(path) ? path : resolve(directory, path);
+  const relativePath = relative(directory, absolutePath);
+  if (
+    relativePath.length === 0 ||
+    relativePath === ".." ||
+    relativePath.startsWith(`..${sep}`) ||
+    isAbsolute(relativePath)
+  ) {
+    return null;
+  }
+  return relativePath.split(sep).join("/");
+}
+
+export async function isRuneProject(directory: string): Promise<boolean> {
+  try {
+    return (await stat(join(directory, ".rune"))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Finds the enclosing Rune repository so a workspace opened in a subdirectory
+ * matches the CLI's upward project discovery. */
+export async function findRuneProjectDirectory(directory: string): Promise<string | null> {
+  let current = resolve(directory);
+  while (true) {
+    if (await isRuneProject(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+/** Normalizes the live host's workspace-directory object at the adapter boundary. */
+export function pluginDirectoryPath(directory: unknown): string | null {
+  if (typeof directory === "string") return directory;
+  if (!directory || typeof directory !== "object") return null;
+  for (const key of ["directory", "path", "root", "cwd"]) {
+    const value = (directory as Record<string, unknown>)[key];
+    if (typeof value === "string") return value;
+  }
+  return null;
 }
 
 /**
@@ -212,7 +399,49 @@ export async function injectViaPromptFallback(
 }
 
 export const RunePlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  return createRuneHooks(input.directory);
+  const acceptance = process.env.RUNE_OPENCODE_ACCEPTANCE === "1";
+  const logAcceptance = async (message: string, extra: Record<string, unknown>): Promise<void> => {
+    if (!acceptance) return;
+    await input.client.app.log({
+      body: {
+        service: "rune-opencode-acceptance",
+        level: "info",
+        message,
+        extra,
+      },
+    });
+  };
+
+  const rawDirectory: unknown = input.directory;
+  const inputDirectory = pluginDirectoryPath(rawDirectory);
+  const directory = inputDirectory === null ? null : await findRuneProjectDirectory(inputDirectory);
+  if (acceptance) {
+    console.error("[RepoRune loaded]", {
+      build: RUNE_PLUGIN_BUILD,
+      module: import.meta.url,
+      directoryType: typeof rawDirectory,
+      directoryKeys: rawDirectory && typeof rawDirectory === "object"
+        ? Object.keys(rawDirectory)
+        : [],
+      normalizedDirectory: directory,
+    });
+  }
+  const enabled = directory !== null && await isRuneProject(directory);
+  await logAcceptance("plugin.loaded", {
+    enabled,
+    directory: directory ?? "unrecognized",
+    worktree: input.worktree,
+    opencode_plugin_api: "classic-hooks",
+    node: process.version,
+    platform: process.platform,
+    fallback_used: false,
+  });
+  if (!enabled || directory === null) return {};
+
+  return createRuneHooks(directory, defaultRuneClient, {
+    acceptanceLog: logAcceptance,
+    acceptanceSentinel: acceptance ? "RUNE_SENTINEL_7A91F" : undefined,
+  });
 };
 
 export default RunePlugin;

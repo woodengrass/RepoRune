@@ -702,8 +702,8 @@ TypeScript，保持薄。**第十四輪對照官方 `@opencode-ai/plugin` npm �
 
 **Hard bootstrap 的 dedup 機制不能沿用 `active_scope_ids`（本輪新增）**：同一 session 可能被 compact
 多次，每次 compaction 都必須重新注入 hard bootstrap（見第 7 節），但同一次 compaction 之後、下一次
-compaction 之前，不需要重複注入。因此 adapter 另外維護一個 `hard_context_generation` 計數器：
-`session.created` 是 generation 1，每次 `session.compacted` 遞增一代，**每個 generation 只送一次
+compaction 之前也必須持續可見。因此 adapter **不維護** `hard_context_generation` 計數器：
+`session.created` 與每次 `session.compacted` 都重新取得 hard bootstrap，並在每個正常 LLM request 重繪
 hard bootstrap**，與追蹤 scope 是否已注入過的 `active_scope_ids` 完全獨立，不可混用同一個旗標。
 
 **Hard bootstrap 的注入層級應優先使用 system/instruction-level context，而非普通訊息（本輪新增）**：
@@ -771,19 +771,25 @@ current+visible 的 MUST/SHOULD constraint（INFO severity 不主動注入，見
     compaction 清空**（這點比舊版設計更安全：因為每次 LLM 呼叫都重繪整份 context，scope 的
     constraint 不可能被 compaction 悄悄漏掉，不像舊版設計依賴「只注入一次」的訊息可能被 compaction
     摘要掉）。
-  - `pendingEvents`：一次性佇列，目前只用來放 soft bootstrap（`session.created` 才 enqueue 一次，
-    compaction 不重新 enqueue，符合 §7.3「soft bootstrap 只在 session.created 注入一次」），render
-    後立刻清空，不重複出現。
-- **`experimental.chat.system.transform` 每次呼叫都重新 render 整份持續狀態**，用一組固定的
+   - `pendingEvents`：一次性佇列，目前只用來放 soft bootstrap（`session.created` 才 enqueue 一次，
+     compaction 不重新 enqueue，符合 §7.3「soft bootstrap 只在 session.created 注入一次」）。真實
+     OpenCode 1.18.29 classic Hooks 未公開 request-kind discriminator；V1 因此使用真 host 觀察到的完整
+     title system prompt marker `You are a title generator. You output ONLY a thread title. Nothing else.` 作為
+     **host compatibility rule**（不是 Rune core semantics）：任一 `output.system` entry 含完整 marker 時，
+     視為 internal title-generation，Rune transform 完全 no-op，不注入 hard/scoped/soft，也不 drain pending
+     soft。marker 不存在才視為 normal session request，正常 render hard/active scopes，並在 render 成功後
+     一次性送出 soft。不得以 first-transform、model identity、時間或短字串猜測；若未來 OpenCode 公開正式
+     request discriminator，優先改用正式欄位。
+- **`experimental.chat.system.transform` 每次呼叫都重新 render hard bootstrap 與 active scopes**，用一組固定的
   `<!-- rune-context:start/end -->` marker 包裹，`mergeRuneBlock()`
   （同檔案）**原地覆寫**已存在的 marker 區塊，或附加到現有的最後一個 system 字串——**絕不對
   `output.system` 陣列 push 新元素**（跟使用者確認：部分 OpenAI-compatible provider 會拒絕帶超過
   一個 system-role 訊息的請求，見規格）。這保證：同一份 context 重繪 N 次，`system` 陣列長度不變、
   不重複、也不會意外製造出第二個 system 角色訊息。
-- **`client.session.prompt({noReply: true})` 只保留為降級 fallback**（`adapters/opencode/src/
-  plugin.ts` 的 `injectViaPromptFallback`，型別已對照確認存在，**未對照真實 host 驗證過**，沒有
-  接入主要流程，只是留一個文件化但未啟用的備案）——如果未來發現 `experimental.chat.system.transform`
-  不可靠或被移除，才切換過去，V1 預設不用。
+- **`client.session.prompt({noReply: true})` 不作 V1 的 soft bootstrap delivery**：真實 host 驗證發現它仍會
+  產生額外 assistant turn，違反「不觸發模型回覆」的前提。它保留為未接入 helper；若未來
+  `experimental.chat.system.transform` 對 hard/scoped context 不可靠或被移除，是否使用或擴大 fallback 仍需
+  先重新確認 agent-injection semantics。
 
 `RuneSessionContext`／`mergeRuneBlock()` 是純邏輯，`adapters/opencode/src/rune-context.test.ts`
 用 Node 內建 `node:test` 涵蓋：全域 MUST 每次呼叫都在、scoped constraint 跨多次呼叫持續存在、
@@ -884,8 +890,8 @@ MUST 規則對應到 CODE_STANDARDS.md 的哪一段」，避免兩份文件語�
 觸發時機（本輪明定，見 §6）：
 
 ```text
-session.created   → 注入 hard bootstrap（generation 1）
-session.compacted → 重新注入 hard bootstrap（generation +1）
+session.created   → 取得 hard bootstrap；每個正常 LLM request 重繪
+session.compacted → 重新取得 hard bootstrap；每個正常 LLM request 重繪
 ```
 
 **Soft Bootstrap**——只在 `session.created` 注入一次，compaction 後不自動整份重送（避免浪費

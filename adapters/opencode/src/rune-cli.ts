@@ -263,16 +263,17 @@ export async function noteAdd(directory: string, args: NoteAddArgs): Promise<Not
  */
 export async function changedFilesFromGitStatus(directory: string): Promise<string[]> {
   const { stdout } = await execFileAsync(
-    "git", ["-C", directory, "status", "--porcelain=v1", "--untracked-files=all"],
+    "git", ["-c", "core.quotePath=false", "-C", directory, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
     { encoding: "utf-8" },
   );
   const paths: string[] = [];
-  for (const line of stdout.split("\n")) {
+  const entries = stdout.split("\0");
+  for (let index = 0; index < entries.length; index += 1) {
+    const line = entries[index];
     if (line.length < 4) continue;
-    // porcelain v1: "XY path" or "XY orig -> path" for renames.
-    const rest = line.slice(3);
-    const arrow = rest.indexOf(" -> ");
-    paths.push(arrow === -1 ? rest.trim() : rest.slice(arrow + 4).trim());
+    // In -z porcelain v1 a rename is "XY new\0old\0"; retain the destination.
+    paths.push(line.slice(3));
+    if (line[0] === "R" || line[0] === "C" || line[1] === "R" || line[1] === "C") index += 1;
   }
   return paths;
 }

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
-import { createRuneHooks, type RuneClient } from "./plugin.js";
+import { createRuneHooks, isRuneProject, pathForScopeLookup, pluginDirectoryPath, type RuneClient } from "./plugin.js";
 import type { HardBootstrapResult, ScopeForResult, SoftBootstrapResult } from "./rune-cli.js";
 
 function fakeClient(overrides: Partial<RuneClient> = {}): RuneClient {
@@ -135,4 +138,110 @@ test("separate sessions do not leak Rune state into each other", async () => {
   await hooks["experimental.chat.system.transform"]!({ sessionID: "s2", model: {} as never }, s2Output);
 
   assert.deepEqual(s2Output.system, []);
+});
+
+test("acceptance sentinel is injected only when explicitly enabled", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient(), { acceptanceSentinel: "RUNE_SENTINEL_7A91F" });
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  const output = await fireSystemTransform(hooks, "s1");
+  assert.match(output[0], /RUNE_HOST_ACCEPTANCE_TEST/);
+  assert.match(output[0], /RUNE_SENTINEL_7A91F/);
+});
+
+test("soft bootstrap is rendered once and then drained", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient());
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  const first = await fireSystemTransform(hooks, "s1");
+  const second = await fireSystemTransform(hooks, "s1");
+  assert.match(first[0], /Project: demo/);
+  assert.doesNotMatch(second[0], /Project: demo/);
+});
+
+test("title generation leaves Rune state untouched until the first normal request", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient());
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  await hooks["tool.execute.before"]!(
+    { tool: "read", sessionID: "s1", callID: "c1" },
+    { args: { filePath: "app/services.py" } },
+  );
+
+  const titleOutput = {
+    system: ["You are a title generator. You output ONLY a thread title. Nothing else."],
+  };
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, titleOutput);
+  assert.equal(titleOutput.system.length, 1);
+  assert.doesNotMatch(titleOutput.system[0], /rune-context/);
+
+  const firstNormal = await fireSystemTransform(hooks, "s1");
+  assert.match(firstNormal[0], /Project: demo/);
+  assert.match(firstNormal[0], /no bare except/);
+  assert.match(firstNormal[0], /prefer repository pattern/);
+
+  const secondNormal = await fireSystemTransform(hooks, "s1");
+  assert.doesNotMatch(secondNormal[0], /Project: demo/);
+  assert.match(secondNormal[0], /no bare except/);
+  assert.match(secondNormal[0], /prefer repository pattern/);
+});
+
+test("a partial title marker remains a normal request", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient());
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  const output = { system: ["You are a title generator."] };
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, output);
+  assert.match(output.system[0], /rune-context/);
+  assert.match(output.system[0], /Project: demo/);
+});
+
+test("Rune project detection only enables directories with a .rune directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rune-opencode-plugin-"));
+  try {
+    assert.equal(await isRuneProject(root), false);
+    await mkdir(join(root, ".rune"));
+    assert.equal(await isRuneProject(root), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host paths are converted to Rune's repo-relative CLI contract", () => {
+  assert.equal(
+    pathForScopeLookup("C:\\repo", "C:\\repo\\src\\service.py"),
+    "src/service.py",
+  );
+  assert.equal(pathForScopeLookup("C:\\repo", "src\\service.py"), "src/service.py");
+  assert.equal(pathForScopeLookup("C:\\repo", "C:\\outside\\secret.py"), null);
+});
+
+test("plugin directory boundary accepts host directory objects and rejects unknown shapes", () => {
+  assert.equal(pluginDirectoryPath("C:/repo"), "C:/repo");
+  assert.equal(pluginDirectoryPath({ directory: "C:/repo" }), "C:/repo");
+  assert.equal(pluginDirectoryPath({ path: "C:/repo" }), "C:/repo");
+  assert.equal(pluginDirectoryPath({ unknown: "C:/repo" }), null);
+});
+
+test("CLI failures in lifecycle hooks fail open and still deliver independent soft bootstrap", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient({ bootstrapHard: async () => { throw new Error("rune unavailable"); } }));
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  const output = await fireSystemTransform(hooks, "s1");
+  assert.match(output[0], /Project: demo/);
+});
+
+test("bash post-hook activates changed scopes without blocking the bash call", async () => {
+  let scopeCalls = 0;
+  const hooks = createRuneHooks("/repo", fakeClient({
+    changedFilesFromGitStatus: async () => ["app/services.py"],
+    scopeFor: async (_directory, path) => {
+      scopeCalls += 1;
+      return fakeClient().scopeFor("/repo", path);
+    },
+  }));
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s1", callID: "c1", args: {} }, {} as never);
+  await hooks["tool.execute.after"]!({ tool: "bash", sessionID: "s1", callID: "c2", args: {} }, {} as never);
+  const output = await fireSystemTransform(hooks, "s1");
+  assert.match(output[0], /prefer repository pattern/);
+  assert.equal(scopeCalls, 1);
 });

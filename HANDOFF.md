@@ -1,13 +1,17 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成、再經一輪純設計文件修訂之後，
-使用者又轉述一份涵蓋 Milestone 6/7 core 的 code review（6 條 finding，逐條重現後全部確認為真並
-修正，見 IMPLEMENTATION_PLAN.md 第 148-153 條）：`model_copy(update=...)` 繞過 Pydantic 驗證可
-毒化 canonical（高，`note_update`/`proposal edit`）、0-byte/損毀 `memory.db` 讓 `status`/
-`bootstrap`/所有寫入指令原始崩潰（中）、`approve()` 崩潰重試在 `--by` 不同時冪等失效並重複寫入
-（中）、CLI `note update` 無法用空清單清空 scopes/files/symbols/evidence（低）。327 個 Python
-測試全綠。**Milestone 7 尚未接過真實 OpenCode host 驗收**，是目前唯一剩下的實作工作，細節見文末
-「立刻可以做的下一步」。以下段落按時間順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原
+最後更新：2026-09-07，Milestone 7 真實 OpenCode host 驗收第一輪已完成（OpenCode／plugin `1.18.29`、
+Windows、host Node `v24.3.0`、`coreloop/gpt-5.6`）：正式 adapter 成功載入，`system.transform` context
+真的被模型看見，`read`/`apply_patch` args shape 已觀察；已修正 host 絕對 Windows path 必須轉為 Rune
+repo-relative path、非 Rune repo silent no-op、`apply_patch` 的 `*** Move to:` marker。soft/title 策略採
+使用者確認的完整 title system-prompt marker compatibility rule；`session.prompt({noReply:true})` 已真實
+證實會產生額外 assistant turn，未接入。**M7 仍未完成**：尚待真實 `write`/`edit`/`bash`、custom tools、
+compaction、跨 session isolation 與完整 marker-strategy smoke test。後續 artifact 調查已證明 `[object Object]`
+不是 stale artifact 或 runtime `directory` object：OpenCode 對 configured entry 的**每個 function export**當作 plugin
+factory；直接設定 `dist/plugin.js` 時，unit-test helper `createRuneHooks` 被錯誤執行，input object 被當成 directory。
+改由唯一 default export 的 `dist/host-entry.js` wrapper 載入後，fresh `opencode run --print-logs` 顯示新 fingerprint、
+預期 module path 與 string directory，bootstrap 不再有該錯誤。global config 有未使用的 plugin SDK `1.18.16`，但 adapter
+local dependency 與 runtime executable 均為 `1.18.29`；這是版本 skew 記錄，非本問題根因。以下段落按時間順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原
 「為什麼是這樣做」的完整脈絡；只要看結論，直接跳到「立刻可以做的下一步」即可。
 
 之後兩輪自我複查／使用者轉述
@@ -211,7 +215,7 @@ scopes/files/symbols/importance/confidence/expires_at 參數（以上四條皆�
 current+visible 過濾規則，唯一新規則是 INFO severity 不主動注入）。新增最小 TypeScript adapter
 骨架 `adapters/opencode/`，對照一個手工建立的暫存 repo 實際跑過
 「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條路徑，含
-dedup 邏輯，確認可行——沒有連到真實 OpenCode host。303 個 Python 測試全綠。
+ dedup 邏輯，確認可行——當時尚未連到真實 OpenCode host。303 個 Python 測試全綠。
 
 **Milestone 7（第二輪）：`rune bootstrap` 完成**：見 IMPLEMENTATION_PLAN.md「Milestone 7 開工」
 第 132-133 條、ARCHITECTURE.md §14（第十四輪）。新增 `core.retrieval.context`
@@ -242,7 +246,7 @@ tool 自己的參數），型別定義裡唯一的 system-level 通道是 experi
 TypeScript regression test**（Node 內建 `node:test`，涵蓋使用者要求的六個場景：全域 MUST 每次呼叫
 都在、scoped constraint 跨呼叫持續存在、不重複累積、compaction 後確實換新、不產生第二個 system
 訊息、session 之間不互相洩漏）與 4 個 Python regression test。317 個 Python 測試全綠、20 個
-TypeScript 測試全綠、`tsc`/`ruff check` 全綠。**依然沒有連到真實 OpenCode host**（使用者本輪明確
+ TypeScript 測試全綠、`tsc`/`ruff check` 全綠。**當時依然沒有連到真實 OpenCode host**（使用者本輪明確
 指示不需要）——`tool.execute.before` 參數欄位名稱的猜測、`experimental.chat.system.transform` 的
 實際執行時機，都只驗證到型別檢查通過，還沒驗證到真實行為，這是 Milestone 7 交付前最後需要用真實
 host 驗收的部分。
@@ -353,7 +357,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
-| 7. OpenCode Adapter | 🚧 全量開發完成，待真實 host 驗收 | `rune scope-for`/`rune bootstrap`/session hook/`tool.execute.before`/custom tool 皆已實作並有 20 個 TS + 4 個 Python 測試；未連過真實 OpenCode host（使用者指示本階段不需要） |
+| 7. OpenCode Adapter | 🚧 真實 host 驗收進行中 | 已完成正式 host、path、bash/scope smoke；尚待 custom tools、isolation、title/soft 與 compaction。 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
@@ -560,7 +564,7 @@ staleness}`、`core.retrieval.{search,check}`、FTS5 索引、CLI 子命令
 TypeScript 骨架（`package.json`/`tsconfig.json`/`src/rune-cli.ts`/`src/spike.ts`）已對照一個
 手工建立、有真實 scope/constraint/note 的暫存 repo 實際跑過
 「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條路徑，含
-`active_scope_ids` dedup（同一 scope 同一 session 只注入一次），確認可行。**沒有連到真實 OpenCode
+`active_scope_ids` dedup（同一 scope 同一 session 只注入一次），確認可行。**當時沒有連到真實 OpenCode
 host**（沒有可用的 OpenCode 執行環境），只驗證機制本身，不是真的部署。
 
 **`rune bootstrap --mode hard|soft --json` 已完成**（見上方「Milestone 7（第二輪）」與
@@ -576,7 +580,7 @@ regression test 直接斷言），JSON 格式逐字對照 ARCHITECTURE §7.6。3
 `tool.execute.after`（bash 事後偵測）/三個 custom tool（`decision_propose`/`constraint_propose`/
 `note_add`）全部實作完成，20 個 TypeScript 測試 + 4 個 Python 測試全綠。
 
-**下一步是用真實 OpenCode host 驗收**（`adapters/opencode/` 目前只驗證到「型別檢查通過、單元測試
+**當時下一步是用真實 OpenCode host 驗收**（`adapters/opencode/` 當時只驗證到「型別檢查通過、單元測試
 綠」，從未連過真實 host）：需要確認 (1) `extractPathsFromToolArgs()` 猜測的 `filePath`/`path`/
 `file_path` 參數欄位名稱是否命中真實內建 tool 的實際參數形狀（猜錯會 fail open，完全不注入，而不是
 注入到錯的路徑，但仍需要修正）；(2) `experimental.chat.system.transform` 是否真的在每次 LLM

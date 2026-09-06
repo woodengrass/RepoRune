@@ -26,10 +26,11 @@ function firstStringArg(args: unknown, keys: string[]): string | undefined {
 
 /** Matches the file-path markers used by Codex-style `apply_patch` patch
  * text (`*** Add File: <path>`, `*** Update File: <path>`, `*** Delete
- * File: <path>`), plus a plain unified-diff `diff --git a/<path> b/<path>`
+ * File: <path>`, `*** Move to: <path>`), plus a plain unified-diff `diff --git a/<path> b/<path>`
  * header as a fallback for other patch formats. */
 const APPLY_PATCH_FILE_MARKERS = [
   /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm,
+  /^\*\*\* Move to: (.+)$/gm,
   /^diff --git a\/(\S+) b\/\S+$/gm,
 ];
 

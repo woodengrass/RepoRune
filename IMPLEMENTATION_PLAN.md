@@ -519,8 +519,8 @@ text 解析）。
   `--mode soft --json`，分別注入 hard/soft context。不在此自動觸發昂貴的 `rune update`（規格 §54）。
 - **Session-compaction hook（`session.compacted`，本輪新增）**：只重新呼叫
   `rune bootstrap --mode hard --json` 並重新注入，不重送 soft context。Adapter 維護
-  `hard_context_generation` 計數器（`session.created`=generation 1，每次 compaction +1），**每個
-  generation 只送一次 hard bootstrap**，此計數器與 `active_scope_ids`（scope 是否已注入過）完全獨立
+   hard bootstrap 在每個正常 LLM request 持久重繪；`session.created`/compaction 僅負責重新取得資料，
+   不採用 `hard_context_generation` one-shot 計數器。
   維護，不可共用同一個旗標（ARCHITECTURE §6）。
 - **Constraint delivery（scoped constraint）掛在 `tool.execute.before`，不是 `file.edited`**：
   `file.edited` 在檔案已經被改完後才觸發，時機太晚；`tool.execute.before` 才能在 agent 碰檔案
@@ -2101,3 +2101,40 @@ DATA_MODEL.md／IMPLEMENTATION_PLAN.md／HANDOFF.md 四份文件，本輪明確�
 staleness 語意或 agent-injection 語意——全部是既有已定案行為（「validator 必須真的擋住不合法
 資料」「memory.db 永遠可以安全丟棄重建」「崩潰重試不該重複寫入」「CLI 選項要能做到 help 文字說的
 事」）的正確性修復，不是新設計決策，因此本輪未修改 ARCHITECTURE.md/DATA_MODEL.md。
+
+### Milestone 7 真實 OpenCode host 驗收（第一輪，進行中）
+
+154. **觀察到的 host contract 與最小修正**：在 OpenCode `1.18.29`、`@opencode-ai/plugin` `1.18.29`、
+     Windows host Node `v24.3.0`、`coreloop/gpt-5.6`，temporary Rune-enabled git repo 成功載入正式 adapter。
+     acceptance sentinel 被模型回覆，證明 `experimental.chat.system.transform` 的原地 system mutation 真正進入
+     model context，且 `output.system` 前後維持一個 entry。真實 `read` 是
+     `args.filePath=<absolute Windows path>`，原 adapter 原樣呼叫要求 repo-relative 的 `rune scope-for`，讓
+     scoped activation fail open；修成安全的 repo-relative POSIX normalisation（repo 外 fail-open）後，read
+     scope-a 的下一個 request 真實看到 scope-a MUST。真實修改工具是 `apply_patch` 的 `args.patchText`；補齊
+     `*** Move to:`。另補 `.rune/` enablement check 與 acceptance-only safe logging/sentinel。
+155. **Soft/title compatibility rule 與 fallback 結論**：cold startup 觀察到 title-generation 可能走
+     transform；使用者確認只接受完整 marker `You are a title generator. You output ONLY a thread title. Nothing else.`
+     判定 internal title call。命中時 Rune no-op、不 inject 或 consume soft；normal request 才 render hard/
+     scoped 並一次性 consume soft。禁止 first-transform/model/timing/短字串 heuristic；未來 host 提供正式
+     discriminator 優先替換。`session.prompt({noReply:true})` 真 host 測試仍產生額外 assistant turn，故不接
+     production fallback。新增 title/soft、partial marker、path normalisation、Move marker、`.rune` no-op tests；
+     TypeScript `npm test`（含 tsc）26 tests 全綠。
+156. **仍待完成，不得標記 M7 完成**：host build agent 未暴露獨立 `write`/`edit` tool，不能假稱已驗證；仍需
+     驗收 bash post-change、custom tools、compaction、session isolation，以及以 title marker 策略重跑完整
+     host smoke test，最後跑全量 Python/TypeScript verification。
+157. **Artifact / duplicate-plugin 根因與最小修正**：fresh `opencode run --print-logs` 證明 host 每次建立新 instance，
+     project config 唯一 local file entry，沒有 Rune npm/cache entry；雖有三個既存 `opencode.exe` process，fresh run 不 reuse
+     它們。source 與 `dist/plugin.js` 都含 fingerprint `directory-normalization-host-debug-20260907-a` 和
+     `pluginDirectoryPath()`，而 host 實際印出該 fingerprint 及 `file:///C:/Users/maste/PycharmProjects/pmem/adapters/
+     opencode/dist/plugin.js`。根因是 OpenCode 將 configured entry module 的每個 function export 視為 plugin factory：
+     `plugin.js` 亦 export unit-test helpers，host 依序執行，`createRuneHooks` 把 PluginInput object 誤作 directory，造成
+     `[object Object]`；`injectViaPromptFallback` 還造成 `client.session.prompt` undefined。新增只 default-export 的
+     `src/host-entry.ts`，acceptance config 改指向 `dist/host-entry.js`；Node proof entry exports 只有 default，fresh host
+     顯示 `directoryType=string`、normalized real path，session.created bootstrap 不再失敗。runtime executable/local SDK 都為
+     `1.18.29`；`~/.config/opencode/node_modules` 有獨立 `1.18.16`，記為非根因 version skew。最後 LLM request 因 provider
+     HTTP 503 中止，故 bash/scope live revalidation 仍待 provider 恢復後執行。
+158. **OpenRouter bash/scope 真 host 回歸**：改用 `openrouter/z-ai/glm-5.3` 後，fresh wrapper entry 成功載入；bash
+     實際修改 `scope_a.py`，`tool.execute.after` 的 `git status` 回報 repo-relative `scope_a.py`（以及預期的 Rune
+     untracked files），沒有 `[object Object]`。同 session 的下一個 `system.transform` 維持一個 system entry，模型回覆
+     `GLOBAL_ACCEPTANCE_MUST SCOPE_A_ACCEPTANCE_MUST`，證實 hard bootstrap、bash post-change scope activation 與 scoped
+     constraint injection 均恢復。第 157 條的 HTTP 503 僅為舊 provider 可用性，不再是 M7 host blocker。
