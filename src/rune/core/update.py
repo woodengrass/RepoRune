@@ -130,6 +130,7 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
 
     previous = CodeIndexData() if full else read_current_code_index(layout)
     previous_hashes = {f.path: f.content_hash for f in previous.files}
+    previous_status_by_path = {f.path: f.status for f in previous.files}
     symbols_by_path: dict[str, list[Symbol]] = defaultdict(list)
     for s in previous.symbols:
         symbols_by_path[s.file].append(s)
@@ -151,7 +152,16 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
     pending_references: dict[str, list[RawReference]] = {}
 
     for scanned_file in changeset.unchanged:
-        new_files.append(_to_indexed_file(scanned_file, now, IndexedFileStatus.ok))
+        # A file's content_hash is unchanged, but that says nothing about
+        # whether it previously parsed cleanly — carry its actual last
+        # status forward rather than assuming `ok`. Content-hash-equal
+        # means "not re-parsed", not "known good": a file that was
+        # `parse_error` last time is *still* `parse_error` until it's
+        # actually re-parsed (i.e. until its content changes), otherwise
+        # a no-op `rune update` would silently launder a known-bad file
+        # back to `ok` without re-running the parser at all.
+        previous_status = previous_status_by_path.get(scanned_file.path, IndexedFileStatus.ok)
+        new_files.append(_to_indexed_file(scanned_file, now, previous_status))
         new_symbols.extend(symbols_by_path.get(scanned_file.path, []))
         new_edges.extend(edges_by_path.get(scanned_file.path, []))
 

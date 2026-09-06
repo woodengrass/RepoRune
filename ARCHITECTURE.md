@@ -147,7 +147,21 @@ adapter      server
 ### 4.2 Code Indexer（`core.index.treesitter`、`core.index.imports`、`core.index.references`）
 對每個變更檔案：以對應語言的 Tree-sitter grammar 解析，擷取 symbol（function/class/method/interface/type/
 variable/constant/component）、擷取 import、best-effort 擷取 reference。單一檔案解析失敗不會讓整次 update
-失敗——該檔案標記 `status=parse_error` 並跳過，不視為致命錯誤（與 semantic 失敗隔離的精神一致，規格 §62）。
+失敗，但 `status=parse_error` 具體代表什麼**分兩種情況**（本輪修正先前「標記後跳過」這句過於簡化、與
+Milestone 2/3 實際行為不符的敘述）：
+
+1. **真的丟例外**（檔案讀不到、或 tree-sitter 的 `MISSING` 節點讓某個必要欄位變成 `None`
+   導致我方 walker 出錯）：該檔案標記 `parse_error`，symbol/edge 一律為空——這才是真正的「跳過」。
+2. **`adapter.has_syntax_error(source)` 為真，但擷取本身沒有丟例外**：tree-sitter 對語法錯誤採
+   error-recovery（回傳含 ERROR 節點的部分樹，不丟例外），此時擷取到的 symbol 可能是從錯誤區域附近
+   算出來的、不完全可信，但仍然**保留**（best effort，比照 unresolved import 的處理原則），只是把
+   檔案標記 `parse_error` 讓這個不確定性對下游可見，而不是靜默當作 `ok`。
+
+不論哪種情況都不視為致命錯誤（與 semantic 失敗隔離的精神一致，規格 §62）。另外，`status=parse_error`
+會**持續存在**直到該檔案真的被重新解析：一個 content_hash 沒變的檔案（`rune update` 認定為
+「unchanged」、不會再丟進 tree-sitter）必須沿用它上一次的真實狀態，不能因為「這次沒有重新解析」就
+預設它是 `ok`——否則一個曾經解析失敗的檔案，只要之後沒有人去動它，反而會在下一次無修改的
+`rune update` 之後看起來像是「已修好」。
 
 Symbol rename 在 V1 視為「刪除舊 symbol + 建立新 symbol」（`symbol_id` 由 `path + qualified_name + kind`
 推導，rename 自然產生新 ID），不做 fuzzy rename 追蹤——刻意選擇，避免引入誤配對風險。

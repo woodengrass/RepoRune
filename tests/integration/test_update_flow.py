@@ -383,6 +383,47 @@ def test_one_file_parse_failure_does_not_abort_the_whole_update(
     assert stats["files"] == 3
 
 
+def test_unchanged_file_keeps_its_previous_parse_error_status(tmp_path: Path) -> None:
+    """Regression test: content_hash-unchanged means "not re-parsed this
+    run", not "known good". A file that previously failed to parse
+    (status=parse_error) must still show parse_error after a no-op
+    `rune update` -- an earlier version hardcoded IndexedFileStatus.ok for
+    every file in the `unchanged` bucket, so a single content-unchanged
+    `rune update` would silently launder a known-bad file's status back
+    to ok without the parser ever running again. Reproduced end to end:
+    first update correctly marks a syntactically broken file parse_error,
+    a second no-op update was flipping it to ok.
+    """
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "bad.py").write_text("def foo(:\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "-q", "-m", "init"],
+        cwd=repo, check=True,
+    )
+
+    layout = init_project(repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute("SELECT status FROM files").fetchone()[0] == "parse_error"
+
+    # no-op incremental update: bad.py's content hasn't changed, so it's
+    # never re-parsed -- its status must still reflect the last real
+    # parse attempt, not silently reset
+    run_update(layout, full=False)
+    conn2 = sqlite3.connect(str(layout.memory_db))
+    assert conn2.execute("SELECT status FROM files").fetchone()[0] == "parse_error"
+
+
 def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
     python_simple_repo: Path, monkeypatch
 ) -> None:

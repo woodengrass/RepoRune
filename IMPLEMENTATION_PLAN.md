@@ -221,7 +221,7 @@ Python 3.12 切換那次 commit 修正過**，reviewer 看到的應該是切換�
 
 ## Milestone 3 — References / graph
 
-**目前狀態：已實作並通過測試**（`src/rune/core/index/references.py`，106 個測試全綠，`ruff check`
+**目前狀態：已實作並通過測試**（`src/rune/core/index/references.py`，107 個測試全綠，`ruff check`
 全綠）。`ParserAdapter` 新增 `extract_references`，每語言各自擷取呼叫點（`call`/`call_expression`
 的 function 欄位，含 `attribute`/`member_expression` 的屬性存取）與繼承關係（Python 的
 `superclasses`、TS 的 `class_heritage` 的 `extends_clause`/`implements_clause`）。解析分兩階段：
@@ -258,6 +258,25 @@ symbol table，故在 `core.update.run_update` 收集完所有檔案的 symbol �
 回歸測試刻意用 `subprocess` 搭配五個不同的 `PYTHONHASHSEED` 值執行同一段解析邏輯，確認全部回傳同一個
 答案——單一行程內重複呼叫測不出這個 bug（CPython 同一行程內的 hash 快取讓 set 順序在行程存活期間保持
 穩定），必須真的跨行程才會顯現。
+
+**外部 code review 又發現並修正 2 個問題（皆已實測重現）：**
+
+1. **中：`parse_error` 狀態在下一次無修改的 `rune update` 被重設為 `ok`**：`run_update` 對
+   `changeset.unchanged`（content_hash 沒變、本次不會重新解析）的檔案，原本無條件寫入
+   `IndexedFileStatus.ok`，完全忽略這個檔案上一次真正解析出來的狀態。實測重現：第一次索引一個語法
+   錯誤的檔案，正確標記 `parse_error`；接著在檔案完全沒改動的情況下再跑一次 `rune update`，狀態變成
+   `ok`——等於「什麼都沒做卻看起來像修好了」。原因是「content_hash 沒變」只代表「這次不會重新解析」，
+   不代表「上次解析是乾淨的」。修法是在建構 unchanged 檔案的 `IndexedFile` 時，改用上一次
+   materialize 出來的實際 `status`（從 `read_current_code_index` 的結果查表），而不是寫死
+   `ok`。回歸測試：對同一個語法錯誤檔案連續跑兩次 `rune update`（第二次是無修改的 no-op），確認
+   `parse_error` 在兩次之間都維持不變。
+2. **中，文件間契約衝突**：ARCHITECTURE.md §4.2 原本寫「該檔案標記 `status=parse_error` 並跳過」，
+   只描述了「真的丟例外」這一種情況；但 Milestone 2/3 實際實作（也是 IMPLEMENTATION_PLAN.md 已經
+   記錄的行為）是：語法錯誤但沒丟例外時，`status=parse_error` 但**保留**已擷取出的 symbol，不是
+   「跳過」。兩份文件對同一件事的敘述互相矛盾，等於沒有單一版本的契約可以宣稱「符合」。已更新
+   ARCHITECTURE.md §4.2，把「真的丟例外」與「語法錯誤但擷取成功」兩種情況分開寫清楚，並明確加上
+   本次一併修正的「`parse_error` 狀態必須沿用到檔案真的被重新解析為止」這條規則，讓兩份文件的敘述
+   一致。
 
 ## Milestone 4 — Scopes
 **模組**：`rune.core.scopes.{model,heuristics,clustering}`。
