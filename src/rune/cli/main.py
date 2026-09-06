@@ -352,6 +352,9 @@ def scope_suggest(
     """Interactively review ephemeral path and graph scope suggestions."""
     try:
         layout = _scope_layout(path)
+        if not layout.memory_db.exists():
+            _err(f"{layout.memory_db} does not exist yet. Run `rune update` first.")
+            raise typer.Exit(code=1)
         scopes_file = load_scopes(layout)
         locked_files = {
             file_path for scope in scopes_file.scopes if scope.locked for file_path in scope.members.files

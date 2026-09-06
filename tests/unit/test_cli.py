@@ -69,4 +69,30 @@ def test_scope_suggest_rejection_has_no_canonical_side_effect(git_repo: Path) ->
     result = runner.invoke(app, ["scope", "suggest", "--path", str(git_repo)], input="n\n")
 
     assert result.exit_code == 0, result.output
+
+
+def test_scope_suggest_before_cache_exists_fails_cleanly(git_repo: Path) -> None:
+    """Regression test: a repo can legitimately have `.rune/scopes.json`
+    committed while `.rune/cache/` (gitignored) doesn't exist yet on a
+    fresh clone -- e.g. before the first `rune update`. `scope suggest`
+    used to call `sqlite3.connect` unconditionally, which either raised an
+    unhandled `OperationalError: unable to open database file` (cache
+    directory missing) or silently created a stray empty `memory.db` and
+    then crashed with `OperationalError: no such table: symbols` (cache
+    directory present but the file itself missing) -- both reproduced by
+    hand before this test was written. `status` already guarded this with
+    `layout.memory_db.exists()`; `scope suggest` now does the same.
+    """
+    from rune.core.project import init_project
+    from rune.core.update import run_update
+
+    layout = init_project(git_repo)
+    run_update(layout, full=True)
+    layout.memory_db.unlink()
+
+    result = runner.invoke(app, ["scope", "suggest", "--path", str(git_repo)])
+
+    assert result.exit_code == 1
+    assert not layout.memory_db.exists()  # no stray file left behind
+    assert RuneLayout(git_repo).rune_dir.exists()  # sanity: didn't touch anything else
     assert load_scopes(RuneLayout(git_repo)).scopes == []

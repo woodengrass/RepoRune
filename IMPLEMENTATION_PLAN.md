@@ -805,8 +805,8 @@ text 解析）。
     的 `members.files`，不需人類確認、不觸發全庫重新分群。零個/多個候選、只有 best-effort reference
     命中、目標 scope 為 `locked`、任何移除 membership 或建立新 scope 的動作，一律落回人類確認流程。
     這個判準刻意比 clustering 建議嚴格，因為 incremental 自動併入是唯一無人把關的寫入路徑，只能使用
-     §4.3 明定的 high-confidence 訊號，不能讓 best-effort reference 的不確定性滲透進自動寫入動作。
-     `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響，實作於 Milestone 4。
+    §4.3 明定的 high-confidence 訊號，不能讓 best-effort reference 的不確定性滲透進自動寫入動作。
+    `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響，實作於 Milestone 4。
 
 ### 第八輪實作記錄（Milestone 4）
 
@@ -824,3 +824,23 @@ text 解析）。
     application/test 檔案的單一候選，適合當起點但仍須人類拆分。此樣本共 5 個候選，2 個可直接採用、1 個
     可作起點、2 個過寬；現階段保留「建議而非正確性需求」定位，不據此鎖死 threshold，後續以更多中型
     repo 觀察是否需要將 path heuristic 從頂層目錄收斂到更細的共同前綴。
+
+**下一個 session 對已完成的 Milestone 4 做自我複查發現並修正 1 個問題**（實際跑 CLI 重現後才修，
+不是憑讀程式碼猜測）：
+
+50. **中：`rune scope suggest` 在 cache 不存在時未處理即崩潰，且會留下副作用**：`scope_suggest` 直接
+    `sqlite3.connect(str(layout.memory_db))` 沒有先檢查檔案是否存在，跟同一支檔案裡 `status` 指令
+    已經在用的 `layout.memory_db.exists()` 防護寫法不一致。實測重現兩種情境：(1) `.rune/cache/`
+    整個目錄不存在時，`sqlite3.connect` 直接丟 `OperationalError: unable to open database file`；
+    (2) cache 目錄存在但 `memory.db` 被刪除時，`sqlite3.connect` 會**先靜默建立一個 0-byte 的空檔案
+    當副作用**，接著在後續 `SELECT ... FROM symbols` 撞上 `OperationalError: no such table: symbols`
+    才崩潰——兩種情況都是未攔截的 traceback，不是乾淨的 CLI 錯誤訊息。這不是純假設情境：
+    `.rune/cache/` 本來就是 `.gitignore` 排除的衍生目錄，一個新 clone 這個 repo、還沒跑過
+    `rune update`/`rune init` 的人，直接跑 `rune scope suggest` 就會踩到；既有的
+    `test_scope_suggest_rejection_has_no_canonical_side_effect` 測試只覆蓋了 `init` 之後的路徑，沒
+    覆蓋這個情境。修法：在 `scope_suggest` 開頭比照 `status` 指令，先檢查
+    `layout.memory_db.exists()`，不存在就印出「先跑 `rune update`」的友善錯誤並 `typer.Exit(1)`，不
+    進 SQLite 連線。新增回歸測試 `test_scope_suggest_before_cache_exists_fails_cleanly`：先跑一次
+    `rune update` 建立 cache 再手動刪除 `memory.db`，驗證指令乾淨地以 exit code 1 結束、不留下任何
+    新的 `memory.db` 副作用；透過暫時 `git stash` 掉修法本身確認這個測試在修法之前確實會失敗（而非
+    誤測了不存在的東西），才確定它真的在測這個 bug。

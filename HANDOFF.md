@@ -1,6 +1,7 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-06，Milestone 4 已實作並完成驗證（待 commit）。
+最後更新：2026-09-06，Milestone 4 已實作、完成驗證、commit `edd87d8`，並經下一個 session 自我複查
+修正 1 個 `rune scope suggest` 的崩潰 bug（見 IMPLEMENTATION_PLAN.md 第 50 條）。
 
 ## 專案是什麼
 
