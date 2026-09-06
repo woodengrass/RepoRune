@@ -9,6 +9,7 @@ from rune.core.semantic.provider import (
     OpenAICompatibleProvider,
     ProviderError,
     ProviderResponse,
+    reasoning_payload,
 )
 from rune.core.semantic.redaction import redact_raw_scope_summary, redact_text
 from rune.core.semantic.validation import validate_and_build_scope_summary
@@ -20,6 +21,7 @@ from rune.core.semantic.worker import (
     run_semantic_refresh,
 )
 from rune.core.storage.models import (
+    ReasoningConfig,
     Scope,
     ScopeMembers,
     ScopeSource,
@@ -121,6 +123,63 @@ def test_provider_raises_on_transport_error() -> None:
     )
     with pytest.raises(ProviderError, match="request failed"):
         provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
+
+
+def test_provider_sends_configured_reasoning_payload() -> None:
+    """Config-driven reasoning control (added after confirming by hand
+    against the real OpenRouter API that {"effort": ...}/{"enabled": False}/
+    {"max_tokens": ...} all measurably change qwen/qwen3.8-flash's
+    reasoning_tokens usage): whatever `reasoning` dict the provider was
+    constructed with must actually appear in the request body.
+    """
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m",
+        client=_client(handler), reasoning={"effort": "low"},
+    )
+    provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
+    assert captured["body"]["reasoning"] == {"effort": "low"}
+
+
+def test_provider_omits_reasoning_key_when_not_configured() -> None:
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=_client(handler)
+    )
+    provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
+    assert "reasoning" not in captured["body"]
+
+
+def test_reasoning_payload_none_when_config_is_default() -> None:
+    """An all-default ReasoningConfig (enabled=True, nothing else set) must
+    not force anything -- omit the field entirely so the model's own
+    default behavior is untouched.
+    """
+    assert reasoning_payload(None) is None
+    assert reasoning_payload(ReasoningConfig()) is None
+
+
+def test_reasoning_payload_disabled_takes_priority_over_effort() -> None:
+    config = ReasoningConfig(enabled=False, effort="high", max_tokens=999)
+    assert reasoning_payload(config) == {"enabled": False}
+
+
+def test_reasoning_payload_includes_only_set_fields() -> None:
+    assert reasoning_payload(ReasoningConfig(effort="low")) == {"effort": "low"}
+    assert reasoning_payload(ReasoningConfig(max_tokens=500)) == {"max_tokens": 500}
+    assert reasoning_payload(ReasoningConfig(effort="high", max_tokens=200)) == {
+        "effort": "high", "max_tokens": 200,
+    }
 
 
 # --------------------------------------------------------------------------

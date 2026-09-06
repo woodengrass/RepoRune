@@ -10,7 +10,7 @@ scope 自動併入在 `rebuild_cache` 之前就寫入 canonical `scopes.json`（
 121 個測試全綠，`ruff check` 全綠。Milestone 3、4 目前已重新確認完成，沒有已知未修的問題。
 
 **Milestone 5（Semantic worker）已實作並通過測試**（`core.semantic.{provider,worker,validation,
-redaction}`，152 個測試全綠）。開工前先修正 `ScopeSummary` 生成失敗語意的自相矛盾（新增 `revision`
+redaction}`，159 個測試全綠）。開工前先修正 `ScopeSummary` 生成失敗語意的自相矛盾（新增 `revision`
 欄位，比照 Decision/Constraint/Note，`last_error` 收斂為清洗過的分類字串，原始錯誤另存不進 git 的
 `.rune/logs/semantic.log`——見 IMPLEMENTATION_PLAN.md 第 57-58 條、DATA_MODEL.md §2.4、
 ARCHITECTURE.md §4.5）。`rune update` 的接線比照 Milestone 4 的 `scopes_override` 模式，`semantic.
@@ -19,8 +19,16 @@ OpenRouter API key 對 `qwen/qwen3.8-flash` 做過真實端到端驗證**（不�
 `reasoning` 欄位會吃掉 `max_tokens`、真的踩過一次上游 429 rate-limit 並確認 fallback ladder 正確
 處理、真的讓模型 hallucinate 出不存在的 symbol 並確認 strip 邏輯正確踢掉。細節見 IMPLEMENTATION_
 PLAN.md 第 59-61 條，含 3 項刻意延後的已知未完成項目（`possibly_stale` 沒有觸發邏輯、無退避的
-無限重試、CLI 輸出六項 metrics 沒有端對端測試——都不是遺漏，是誠實記錄的取捨）。**Milestone 6
-（Policies & Memory）是下一步。**
+無限重試、CLI 輸出六項 metrics 沒有端對端測試——都不是遺漏，是誠實記錄的取捨）。
+
+**同一輪追加（第 62 條）**：使用者問「思考強度、模型這些設定放在哪」才發現 `max_tokens` 沒有進
+`config.toml`（寫死在 `worker.py`），而且完全沒有管道能關掉/調低 reasoning 模型的思考量。已補
+`SemanticConfig.max_tokens` 與 `SemanticConfig.reasoning`（`ReasoningConfig`：`enabled`/`effort`/
+`max_tokens`）。同樣先用真實 API 驗證 OpenRouter 的 `reasoning` request 欄位真的有效
+（`{"enabled":false}` 讓 `qwen/qwen3.8-flash` 的 reasoning_tokens 從 36 降到 0）才接線，最後用
+`reasoning.enabled=False` 端到端跑過一次真實 API（`output_tokens=1`，沒有思考開銷）。
+
+**Milestone 6（Policies & Memory）是下一步。**
 
 ## 專案是什麼
 
@@ -101,7 +109,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**152 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**159 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

@@ -378,12 +378,37 @@ class SemanticBudget(StrictModel):
     max_input_tokens_per_run: int = 150_000
 
 
+class ReasoningConfig(StrictModel):
+    """Controls "thinking"/reasoning-token spend for reasoning-capable
+    models (confirmed against the real OpenRouter API with
+    qwen/qwen3.8-flash — `reasoning.enabled=False` drops reasoning_tokens
+    to 0, `effort` and `max_tokens` both measurably reduce it). All three
+    fields are optional and independent; `provider.py` only includes what's
+    actually set in the request payload, leaving the model's own default
+    behavior untouched when nothing here is configured.
+    """
+
+    enabled: bool = True
+    effort: Literal["low", "medium", "high"] | None = None
+    max_tokens: int | None = None
+    # A hard cap on reasoning tokens specifically (distinct from
+    # SemanticConfig.max_tokens, which caps the whole completion —
+    # reasoning + content combined).
+
+
 class SemanticConfig(StrictModel):
     enabled: bool = True
     provider: str = "openrouter"
     model: str = ""
     fallback_model: str | None = None
     budget: SemanticBudget = Field(default_factory=SemanticBudget)
+    max_tokens: int = 4000
+    # Per-call completion token budget. For a reasoning model, this is
+    # shared between the `reasoning` and `content` fields — confirmed by
+    # hand that a too-small value can starve `content` entirely (see
+    # provider.py's empty-content ProviderError). `reasoning.max_tokens`
+    # below caps reasoning specifically, leaving headroom for `content`.
+    reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
 
 
 class NotesConfig(StrictModel):

@@ -19,6 +19,8 @@ from typing import Protocol
 
 import httpx
 
+from rune.core.storage.models import ReasoningConfig
+
 
 class ProviderError(Exception):
     """Raised for any provider-level failure: transport error, non-2xx
@@ -65,11 +67,20 @@ class OpenAICompatibleProvider:
         extra_headers: dict[str, str] | None = None,
         timeout: float = 60.0,
         client: httpx.Client | None = None,
+        reasoning: dict | None = None,
     ) -> None:
         self.model = model
         self._api_key = api_key
         self._extra_headers = extra_headers or {}
         self._client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
+        self._reasoning = reasoning
+        # `reasoning` is an OpenRouter extension (confirmed by hand: {"effort":
+        # "low"}/{"enabled": False}/{"max_tokens": N} all measurably change
+        # qwen/qwen3.8-flash's reasoning_tokens usage). Sent through unchanged
+        # for any OpenAI-compatible base_url, but only OpenRouter is confirmed
+        # to honor it — an OpenAI-proper endpoint would likely just ignore an
+        # unrecognized field, not error, so this is left generic rather than
+        # gated to one subclass.
 
     def complete(self, *, system_prompt: str, user_prompt: str, max_tokens: int) -> ProviderResponse:
         headers = {"Authorization": f"Bearer {self._api_key}", **self._extra_headers}
@@ -81,6 +92,8 @@ class OpenAICompatibleProvider:
             ],
             "max_tokens": max_tokens,
         }
+        if self._reasoning is not None:
+            payload["reasoning"] = self._reasoning
         try:
             resp = self._client.post("/chat/completions", json=payload, headers=headers)
         except httpx.HTTPError as exc:
@@ -119,16 +132,38 @@ class OpenAICompatibleProvider:
 
 
 class OpenRouterProvider(OpenAICompatibleProvider):
-    def __init__(self, *, api_key: str, model: str, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        client: httpx.Client | None = None,
+        reasoning: dict | None = None,
+    ) -> None:
         super().__init__(
-            base_url="https://openrouter.ai/api/v1", api_key=api_key, model=model, client=client
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            model=model,
+            client=client,
+            reasoning=reasoning,
         )
 
 
 class OpenAIProvider(OpenAICompatibleProvider):
-    def __init__(self, *, api_key: str, model: str, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        client: httpx.Client | None = None,
+        reasoning: dict | None = None,
+    ) -> None:
         super().__init__(
-            base_url="https://api.openai.com/v1", api_key=api_key, model=model, client=client
+            base_url="https://api.openai.com/v1",
+            api_key=api_key,
+            model=model,
+            client=client,
+            reasoning=reasoning,
         )
 
 
@@ -143,7 +178,28 @@ _ENV_VAR_BY_PROVIDER = {
 }
 
 
-def build_provider(*, provider_name: str, model: str) -> ModelProvider:
+def reasoning_payload(config: ReasoningConfig | None) -> dict | None:
+    """Translates `SemanticConfig.reasoning` into the request-body shape
+    OpenRouter expects. Returns None (omit the field entirely, use the
+    model's own default) when nothing is actually configured — `enabled`
+    defaults to True and an all-default `ReasoningConfig` shouldn't force
+    anything.
+    """
+    if config is None:
+        return None
+    if not config.enabled:
+        return {"enabled": False}
+    payload: dict = {}
+    if config.effort is not None:
+        payload["effort"] = config.effort
+    if config.max_tokens is not None:
+        payload["max_tokens"] = config.max_tokens
+    return payload or None
+
+
+def build_provider(
+    *, provider_name: str, model: str, reasoning: ReasoningConfig | None = None
+) -> ModelProvider:
     env_var = _ENV_VAR_BY_PROVIDER.get(provider_name)
     if env_var is None:
         raise ProviderError(
@@ -153,6 +209,7 @@ def build_provider(*, provider_name: str, model: str) -> ModelProvider:
     api_key = os.environ.get(env_var)
     if not api_key:
         raise ProviderError(f"{env_var} is not set in the environment")
+    reasoning_dict = reasoning_payload(reasoning)
     if provider_name == "openrouter":
-        return OpenRouterProvider(api_key=api_key, model=model)
-    return OpenAIProvider(api_key=api_key, model=model)
+        return OpenRouterProvider(api_key=api_key, model=model, reasoning=reasoning_dict)
+    return OpenAIProvider(api_key=api_key, model=model, reasoning=reasoning_dict)

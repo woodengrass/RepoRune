@@ -1061,3 +1061,22 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     - `rune bootstrap`/`rune search` 等會真正「顯示」semantic summary（含 `unavailable`/`stale`
       的可見性規則）的 retrieval 邏輯是 Milestone 6 的範圍，本輪只確保寫入端（worker + materialize）
       正確，沒有涉及讀取端。
+62. **補上第 61 條沒做完的兩項設定（同輪追加，2026-09-06）**：使用者問「思考強度、模型這些設定放在
+    哪」時發現 `max_tokens`（單次呼叫的輸出上限）先前是寫死在 `worker.py` 函式參數預設值
+    （`4000`），沒有進 `config.toml`；且完全沒有任何管道能控制 reasoning-capable 模型（例如
+    `qwen/qwen3.8-flash`）的思考量，即使上一輪已經在真實 API 上親眼看過這個模型把 `max_tokens`
+    燒在 `reasoning` 欄位上。已補：`SemanticConfig` 新增 `max_tokens: int = 4000`；新增
+    `ReasoningConfig`（`enabled`/`effort`/`max_tokens` 三個獨立欄位，皆選填，`enabled=False` 優先
+    於其他兩者）掛在 `SemanticConfig.reasoning` 底下。`provider.py` 新增 `reasoning_payload()` 把
+    這個設定翻譯成 OpenRouter 的 `reasoning` request 欄位——**先用真實 API 驗證這個 request 欄位
+    真的有效才動手接線**：`{"effort":"low"}` 讓 `qwen/qwen3.8-flash` 的 `reasoning_tokens` 從
+    36 降到 25，`{"enabled":false}` 直接降到 0，`{"max_tokens":10}` 精確卡在 10——三種都用真實
+    OpenRouter API 呼叫驗證過，不是憑 API 文件猜的。`build_provider()`／`OpenRouterProvider`／
+    `OpenAIProvider` 都新增 `reasoning: dict | None` 建構參數；`update.py` 的
+    `_build_semantic_providers` 把 `config.semantic.reasoning` 一併傳給 primary 與 fallback
+    provider（兩者共用同一個 reasoning 設定，沒有分開設計，因為這是「整體要花多少在思考」的政策，
+    不是特定模型才有的細節）。最後用 `reasoning.enabled=False` 對真實 API 端到端驗證一次：模型
+    立刻回應、`output_tokens=1`、完全沒有 reasoning 開銷。新增 6 個單元測試
+    （`test_provider_sends_configured_reasoning_payload` 等，`tests/unit/test_semantic.py`）與
+    2 個 config 測試（`tests/unit/test_config.py`，含「未知欄位拒絕」延伸到
+    `[semantic.reasoning]` 這個新的巢狀區塊）。159 個測試全綠。

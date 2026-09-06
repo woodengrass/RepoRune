@@ -17,6 +17,27 @@ def test_write_default_config_then_load_roundtrips(tmp_path: Path) -> None:
     assert config.bootstrap.hard_budget_tokens == 3000
     assert config.bootstrap.soft_budget_tokens == 8000
     assert config.bootstrap.must_count_warn_threshold == 30
+    assert config.semantic.max_tokens == 4000
+    assert config.semantic.reasoning.enabled is True
+    assert config.semantic.reasoning.effort is None
+    assert config.semantic.reasoning.max_tokens is None
+
+
+def test_load_config_accepts_custom_reasoning_section(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[semantic]\n"
+        'provider = "openrouter"\n'
+        'model = "qwen/qwen3.8-flash"\n'
+        "max_tokens = 8000\n"
+        "[semantic.reasoning]\n"
+        'effort = "low"\n',
+        encoding="utf-8",
+    )
+    config = load_config(path)
+    assert config.semantic.max_tokens == 8000
+    assert config.semantic.reasoning.effort == "low"
+    assert config.semantic.reasoning.enabled is True  # untouched default
 
 
 def test_load_config_missing_file_raises(tmp_path: Path) -> None:
@@ -54,6 +75,17 @@ def test_load_config_rejects_unknown_nested_field(tmp_path: Path) -> None:
     path.write_text(
         "[semantic]\n"
         'provider = "openrouter"\n'
+        "typo_field = true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_unknown_reasoning_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[semantic.reasoning]\n"
         "typo_field = true\n",
         encoding="utf-8",
     )

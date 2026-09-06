@@ -183,14 +183,20 @@ def _build_semantic_providers(config: RuneConfig) -> tuple[ModelProvider | None,
     if not config.semantic.enabled or not config.semantic.model:
         return None, None
     try:
-        primary = build_provider(provider_name=config.semantic.provider, model=config.semantic.model)
+        primary = build_provider(
+            provider_name=config.semantic.provider,
+            model=config.semantic.model,
+            reasoning=config.semantic.reasoning,
+        )
     except ProviderError:
         return None, None
     fallback = None
     if config.semantic.fallback_model:
         try:
             fallback = build_provider(
-                provider_name=config.semantic.provider, model=config.semantic.fallback_model
+                provider_name=config.semantic.provider,
+                model=config.semantic.fallback_model,
+                reasoning=config.semantic.reasoning,
             )
         except ProviderError:
             fallback = None
@@ -351,6 +357,7 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]
             primary_provider=primary_provider,
             fallback_provider=fallback_provider,
             max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
+            max_tokens_per_call=config.semantic.max_tokens,
             pricing=config.pricing,
         )
         new_semantic_revisions = refresh_result.new_revisions
