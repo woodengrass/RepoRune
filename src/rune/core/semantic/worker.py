@@ -231,7 +231,7 @@ def refresh_scope_summary(
     known_symbol_ids: set[str],
     symbols: list[Symbol],
     current: ScopeSummary | None,
-    max_tokens: int = 4000,
+    max_tokens: int = 16000,
     pricing: PricingConfig | None = None,
 ) -> RefreshOutcome:
     """Runs the full fallback-policy ladder for one scope (ARCHITECTURE.md
@@ -382,7 +382,7 @@ def run_semantic_refresh(
     primary_provider: ModelProvider,
     fallback_provider: ModelProvider | None,
     max_input_tokens_per_run: int,
-    max_tokens_per_call: int = 4000,
+    max_tokens_per_call: int = 16000,
     pricing: PricingConfig | None = None,
 ) -> SemanticRefreshResult:
     """Refreshes every scope whose summary `needs_refresh`, stopping once

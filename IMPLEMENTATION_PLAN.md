@@ -1080,3 +1080,9 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     （`test_provider_sends_configured_reasoning_payload` 等，`tests/unit/test_semantic.py`）與
     2 個 config 測試（`tests/unit/test_config.py`，含「未知欄位拒絕」延伸到
     `[semantic.reasoning]` 這個新的巢狀區塊）。159 個測試全綠。
+63. **`max_tokens` 預設值調整為 16000（使用者要求，2026-09-06）**：原本 `4000` 是本輪一開始隨手訂的
+    暫定值，使用者實際使用後要求調高，改為 `16000`——理由與第 62 條記錄的「reasoning 模型會佔用同一個
+    預算」一致：預設值越低，思考佔用完 `max_tokens` 導致 `content=None`（`ProviderError`）的機率越高，
+    16000 給思考留更多餘裕。同步更新 `SemanticConfig.max_tokens`、`worker.py` 兩處函式參數預設值
+    （`refresh_scope_summary`/`run_semantic_refresh`，僅供未經 `config.toml` 呼叫時的保底值，
+    `rune update` 一律走 config 值）、對應的 config 測試斷言。

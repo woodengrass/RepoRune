@@ -402,7 +402,7 @@ class SemanticConfig(StrictModel):
     model: str = ""
     fallback_model: str | None = None
     budget: SemanticBudget = Field(default_factory=SemanticBudget)
-    max_tokens: int = 4000
+    max_tokens: int = 16000
     # Per-call completion token budget. For a reasoning model, this is
     # shared between the `reasoning` and `content` fields — confirmed by
     # hand that a too-small value can starve `content` entirely (see
