@@ -13,12 +13,14 @@ from __future__ import annotations
 import uuid
 from typing import Literal
 
+from pydantic import ValidationError
+
 from rune.core.memory.hashes import compute_scope_membership_hash, compute_source_hashes
 from rune.core.memory.records import current_by, current_by_record_id
 from rune.core.memory.records import refresh_cache as _refresh_cache
 from rune.core.project import RuneLayout, utc_now_iso
 from rune.core.scopes.model import load_scopes
-from rune.core.storage.canonical import append_jsonl, read_jsonl
+from rune.core.storage.canonical import append_jsonl, read_jsonl, validated_copy
 from rune.core.storage.models import (
     MemoryRevision,
     PersistenceMode,
@@ -126,29 +128,37 @@ def propose(
     """
     _validate_payload_shape(type, severity, persistence_mode, expires_at, critical, machine_check_hint)
     now = utc_now_iso()
-    payload = MemoryRevision(
-        record_id=record_id,
-        revision=1,  # placeholder -- the real decisions/constraints.jsonl
-        # revision number is only known at approval time (it depends on
-        # how many revisions record_id already has), so this field is
-        # meaningless until then and gets overwritten by approve().
-        type=type,
-        status=RecordStatus.active,  # placeholder, same reason
-        content=content,
-        rationale=rationale,
-        scopes=sorted(set(scopes)),
-        files=sorted(set(files)),
-        symbols=sorted(set(symbols)),
-        severity=severity,
-        persistence_mode=persistence_mode,
-        expires_at=expires_at,
-        critical=critical,
-        source_document=source_document,
-        source_section=source_section,
-        machine_check_hint=machine_check_hint,
-        created_by=RevisionAuthor.agent if created_by == "agent" else RevisionAuthor.human,
-        created_at=now,
-    )
+    try:
+        payload = MemoryRevision(
+            record_id=record_id,
+            revision=1,  # placeholder -- the real decisions/constraints.jsonl
+            # revision number is only known at approval time (it depends on
+            # how many revisions record_id already has), so this field is
+            # meaningless until then and gets overwritten by approve().
+            type=type,
+            status=RecordStatus.active,  # placeholder, same reason
+            content=content,
+            rationale=rationale,
+            scopes=sorted(set(scopes)),
+            files=sorted(set(files)),
+            symbols=sorted(set(symbols)),
+            severity=severity,
+            persistence_mode=persistence_mode,
+            expires_at=expires_at,
+            critical=critical,
+            source_document=source_document,
+            source_section=source_section,
+            machine_check_hint=machine_check_hint,
+            created_by=RevisionAuthor.agent if created_by == "agent" else RevisionAuthor.human,
+            created_at=now,
+        )
+    except ValidationError as exc:
+        # A raw pydantic traceback (e.g. a naive, non-UTC `--expires-at`)
+        # isn't useful CLI output -- nothing has been written yet at this
+        # point, so this is purely about giving the same clean error
+        # contract every other rejection path here already has
+        # (`_validate_payload_shape`).
+        raise ProposalValidationError(str(exc)) from exc
     proposal = Proposal(
         proposal_id=str(uuid.uuid4()),
         revision=1,
@@ -200,12 +210,42 @@ def _next_record_revision(layout: RuneLayout, record_type: RecordType, record_id
 # Fields that fully determine "the content this approval would write",
 # excluding `revision`/`created_at` (which differ on every attempt by
 # construction) -- used by `approve()`'s retry-after-crash idempotency
-# check below.
+# check below. Deliberately excludes `approved_by`: that field records
+# *who ran this particular call*, not what was approved, and the crash-
+# recovery scenario this check exists for is specifically "the write
+# already happened, someone (possibly a different human than whoever
+# hit the crash) is completing the stuck approval" -- confirmed by hand
+# that including `approved_by` here meant a retry with a different
+# `--by` than the crashed attempt appended a second, fully duplicate
+# revision instead of recognizing it as the same content already
+# written. `created_by` stays in the comparison: unlike `approved_by`
+# it's derived from the proposal's own `created_by`/whether this is an
+# edit, not from the resolver's identity, so it's stable across retries
+# by construction.
+#
+# Known accepted false-positive (low severity, not fixed here -- doing
+# so would need `MemoryRevision` to track which `proposal_id` produced
+# it, a schema change out of scope for a content-heuristic bug fix):
+# two genuinely independent, still-pending proposals for the *same*
+# `record_id` that happen to carry byte-identical content in every
+# field below (a realistic way this happens: someone proposes the same
+# fix twice, e.g. copy-pasted `decision propose` commands) will, if both
+# get approved, have the second approval silently reuse the first's
+# already-written revision instead of erroring or appending a second
+# one -- the second proposal ends up marked `approved` but pointing at
+# the first's revision. Dropping `approved_by` from this comparison (to
+# fix the retry-with-different-`--by` bug above) makes this marginally
+# easier to hit than before, since two independent approvals no longer
+# need the same `--by` to collide here either. Accepted since the two
+# proposals' content was identical anyway -- the record ends up with
+# the same content either way, just attributed to one proposal instead
+# of two -- and a near-zero-impact edge case doesn't justify a new
+# schema field.
 _APPROVAL_CONTENT_FIELDS = (
     "content", "rationale", "scopes", "files", "symbols", "severity",
     "persistence_mode", "expires_at", "critical", "source_document",
     "source_section", "machine_check_hint", "source_hashes", "scope_hashes",
-    "created_by", "approved_by", "status",
+    "created_by", "status",
 )
 
 
@@ -237,6 +277,24 @@ def approve(
 
     payload = edited_payload if edited_payload is not None else proposal.payload
     if edited_payload is not None:
+        # `edited_payload` is typically built by a caller (the CLI's
+        # `proposal edit`) via `model.model_copy(update=...)`, which
+        # Pydantic does not re-validate -- so an invalid field (e.g. a
+        # naive, non-UTC `--expires-at`) can arrive here having never
+        # been checked at all. Re-validating through `validated_copy`
+        # (no-op update, purely to force every field's validator to run
+        # again) makes `approve()` itself the actual integrity gate for
+        # this write, rather than trusting whatever construction method
+        # the caller happened to use -- confirmed by hand: without this,
+        # `proposal edit --expires-at <naive>` wrote the bad value
+        # straight into `decisions.jsonl`/`constraints.jsonl`, and every
+        # later `note`/`decision`/`constraint`/`search` command reading
+        # that file crashed with a raw pydantic traceback until the
+        # JSONL line was hand-edited.
+        try:
+            payload = validated_copy(payload, {})
+        except ValidationError as exc:
+            raise ProposalValidationError(str(exc)) from exc
         # An [E]dit is allowed to change content/rationale/scopes/files/
         # symbols/severity/persistence_mode/expires_at/etc, but never
         # which record it's approving into or what kind of record it is
@@ -339,10 +397,12 @@ def approve(
     # every approval-derived field of the revision this call *would*
     # write against the record's actual current revision (excluding
     # `revision`/`created_at`, which legitimately differ by construction
-    # on every attempt) -- an exact match on all of them is essentially
-    # only possible when this is that same retry, not two independent
-    # approvals that coincidentally produced byte-identical content
-    # across every field including `approved_by`.
+    # on every attempt, and `approved_by`, which identifies whoever is
+    # running *this* call rather than what content was approved -- see
+    # `_APPROVAL_CONTENT_FIELDS`'s own comment) -- an exact match on all
+    # of them is essentially only possible when this is that same retry,
+    # not two independent approvals that coincidentally produced
+    # byte-identical content.
     if current_before is not None and all(
         getattr(current_before, field) == getattr(new_memory_revision, field)
         for field in _APPROVAL_CONTENT_FIELDS

@@ -671,9 +671,21 @@ def note_update_cmd(
     why_persist: str | None = typer.Option(None, "--why-persist"),
     status: NoteStatus | None = typer.Option(None, "--status"),
     evidence: list[str] = typer.Option([], "--evidence", help="Replaces the full evidence list if given."),
+    clear_evidence: bool = typer.Option(
+        False, "--clear-evidence", help="Replace the evidence list with an empty one."
+    ),
     scopes: list[str] = typer.Option([], "--scope", help="Replaces the full scopes list if given."),
+    clear_scopes: bool = typer.Option(
+        False, "--clear-scopes", help="Replace the scopes list with an empty one."
+    ),
     files: list[str] = typer.Option([], "--file", help="Replaces the full files list if given."),
+    clear_files: bool = typer.Option(
+        False, "--clear-files", help="Replace the files list with an empty one."
+    ),
     symbols: list[str] = typer.Option([], "--symbol", help="Replaces the full symbols list if given."),
+    clear_symbols: bool = typer.Option(
+        False, "--clear-symbols", help="Replace the symbols list with an empty one."
+    ),
     importance: float | None = typer.Option(None, "--importance"),
     confidence: float | None = typer.Option(None, "--confidence"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
@@ -691,10 +703,19 @@ def note_update_cmd(
     try:
         layout = _scope_layout(path)
         config = load_config(layout.config_path)
+        # `evidence or None` alone can't tell "no --evidence given, leave
+        # untouched" apart from "user wants to clear it" -- both produce
+        # the CLI's [] default. The --clear-* flags (mirroring the
+        # existing --clear-expires-at) make that explicit; without one,
+        # an empty list stays None (untouched), matching every existing
+        # caller's behavior before these flags existed.
         updated = core_note_update(
             layout, note_id, content=content, why_persist=why_persist, status=status,
-            evidence=evidence or None, scopes=scopes or None, files=files or None,
-            symbols=symbols or None, importance=importance, confidence=confidence,
+            evidence=(evidence or ([] if clear_evidence else None)),
+            scopes=(scopes or ([] if clear_scopes else None)),
+            files=(files or ([] if clear_files else None)),
+            symbols=(symbols or ([] if clear_symbols else None)),
+            importance=importance, confidence=confidence,
             expires_at=expires_at, clear_expires_at=clear_expires_at, source=source,
             redact_secrets=config.security.redact_secrets,
             recompute_source_hashes=recompute_source_hashes,

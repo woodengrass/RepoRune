@@ -10,6 +10,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
+from pydantic import ValidationError
+
 from rune.core.config import load_config
 from rune.core.memory.hashes import compute_source_hashes
 from rune.core.memory.records import current_by_note_id
@@ -17,7 +19,7 @@ from rune.core.memory.records import refresh_cache as _refresh_cache
 from rune.core.project import RuneLayout, utc_now_iso
 from rune.core.scopes.model import load_scopes
 from rune.core.semantic.redaction import redact_text
-from rune.core.storage.canonical import append_jsonl, read_jsonl
+from rune.core.storage.canonical import append_jsonl, read_jsonl, validated_copy
 from rune.core.storage.models import (
     Note,
     NoteCategory,
@@ -139,25 +141,33 @@ def note_add(
         config = load_config(layout.config_path)
         expires_at = _default_ttl_expiry(category, config.notes)
 
-    note = Note(
-        id=str(uuid.uuid4()),
-        revision=1,
-        category=category,
-        content=_redact(content, enabled=redact_secrets),
-        why_persist=_redact(why_persist, enabled=redact_secrets),
-        scopes=sorted(set(scopes)),
-        files=sorted(set(files)),
-        symbols=sorted(set(symbols)),
-        importance=importance,
-        confidence=confidence,
-        source=RevisionAuthor.agent if source == "agent" else RevisionAuthor.human,
-        evidence=[_redact(e, enabled=redact_secrets) for e in evidence],
-        created_at=now,
-        last_verified_at=now,
-        expires_at=expires_at,
-        source_hashes=source_hashes,
-        status=NoteStatus.active,
-    )
+    try:
+        note = Note(
+            id=str(uuid.uuid4()),
+            revision=1,
+            category=category,
+            content=_redact(content, enabled=redact_secrets),
+            why_persist=_redact(why_persist, enabled=redact_secrets),
+            scopes=sorted(set(scopes)),
+            files=sorted(set(files)),
+            symbols=sorted(set(symbols)),
+            importance=importance,
+            confidence=confidence,
+            source=RevisionAuthor.agent if source == "agent" else RevisionAuthor.human,
+            evidence=[_redact(e, enabled=redact_secrets) for e in evidence],
+            created_at=now,
+            last_verified_at=now,
+            expires_at=expires_at,
+            source_hashes=source_hashes,
+            status=NoteStatus.active,
+        )
+    except ValidationError as exc:
+        # A raw pydantic traceback (e.g. a naive, non-UTC `--expires-at`,
+        # or `--importance`/`--confidence` outside [0, 1]) isn't useful
+        # CLI output -- nothing has been written yet at this point, so
+        # this is purely about a clean error contract, matching
+        # `NoteValidationError`'s other raise sites below.
+        raise NoteValidationError(str(exc)) from exc
     append_jsonl(layout.notes_jsonl, note)
     _refresh_cache(layout)
     return note
@@ -268,7 +278,15 @@ def note_update(
     elif expires_at is not None:
         updates["expires_at"] = expires_at
 
-    updated = current.model_copy(update=updates)
+    try:
+        updated = validated_copy(current, updates)
+    except ValidationError as exc:
+        # See `note_add`'s equivalent wrap above -- `validated_copy`
+        # (unlike plain `model_copy`) re-runs every field validator, so a
+        # bad `--expires-at`/`--importance`/`--confidence` fails loudly
+        # right here instead of silently writing an invalid line to
+        # `notes.jsonl` that only crashes on the *next* read.
+        raise NoteValidationError(str(exc)) from exc
     append_jsonl(layout.notes_jsonl, updated)
     _refresh_cache(layout)
     return updated

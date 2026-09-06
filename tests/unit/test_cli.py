@@ -46,6 +46,26 @@ def test_status_reports_modified_added_and_deleted_counts(git_repo: Path) -> Non
     assert payload["files_deleted"] == 1
 
 
+def test_status_survives_a_corrupt_memory_db(git_repo: Path) -> None:
+    """Relayed review, reproduced by hand: `compute_status` used a raw
+    `sqlite3.connect` (not `connect_for_read`, unlike `rune search`/
+    `check`/`bootstrap`), so a 0-byte `memory.db` crashed `rune status`
+    with a raw `sqlite3.OperationalError: no such table: files` instead
+    of the same clean-degrade contract those other readers already had.
+    """
+    (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    memory_db = git_repo / ".rune" / "cache" / "memory.db"
+    memory_db.write_bytes(b"")
+
+    result = runner.invoke(app, ["status", "--path", str(git_repo), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["cache_exists"] is True
+    assert payload["files_indexed"] == 0
+    assert payload["symbols_indexed"] == 0
+
+
 def test_update_then_status_reports_fresh_again(git_repo: Path) -> None:
     """Tests working-tree freshness reporting, not semantic -- explicitly
     disables semantic so this doesn't get tangled up in the (correct,
@@ -231,6 +251,37 @@ def test_note_update_cli_exposes_scopes_files_symbols_and_expiry(git_repo: Path)
     )
     assert result.exit_code == 0, result.output
     assert "rev2" in result.output
+
+
+def test_note_update_cli_clear_flags_replace_lists_with_empty(git_repo: Path) -> None:
+    """Relayed review, reproduced by hand: `note update`'s CLI layer used
+    `evidence or None` to decide whether to touch the evidence/scopes/
+    files/symbols lists -- which meant "explicitly clear the list" and
+    "didn't mention this flag at all" were indistinguishable (both are
+    Typer's `[]` default for a repeatable option), so there was no way to
+    clear one via the CLI even though `core.memory.notes.note_update`
+    already supports `[]` meaning "replace with empty" (as opposed to
+    `None` meaning "leave untouched"). Fixed with explicit `--clear-*`
+    flags, mirroring the existing `--clear-expires-at`.
+    """
+    import json as json_module
+
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    add_output = runner.invoke(
+        app, ["note", "add", "--category", "pitfall", "--content", "c", "--why-persist", "w",
+              "--evidence", "e1", "--evidence", "e2", "--path", str(git_repo)]
+    ).output
+    note_id = add_output.split()[2]
+
+    result = runner.invoke(
+        app, ["note", "update", note_id, "--clear-evidence", "--path", str(git_repo)]
+    )
+    assert result.exit_code == 0, result.output
+
+    lines = (git_repo / ".rune" / "notes.jsonl").read_text(encoding="utf-8").splitlines()
+    revisions = [json_module.loads(line) for line in lines if line.strip()]
+    latest = max(revisions, key=lambda r: r["revision"])
+    assert latest["evidence"] == []
 
 
 def test_scope_for_cli_json_round_trip(git_repo: Path) -> None:

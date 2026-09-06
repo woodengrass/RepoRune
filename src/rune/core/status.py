@@ -9,7 +9,6 @@ the only caller) when Milestone 7 needed the same computation from core.
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 
 from rune.core.config import load_config
@@ -18,6 +17,7 @@ from rune.core.index.scanner import diff_against_previous, scan_files
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model
 from rune.core.storage.models import ProjectFile
+from rune.core.storage.sqlite.materialize import CacheUnusableError, connect_for_read
 
 
 @dataclass(frozen=True)
@@ -52,13 +52,25 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
     previous_hashes: dict[str, str] = {}
     cache_exists = layout.memory_db.exists()
     if cache_exists:
-        conn = sqlite3.connect(str(layout.memory_db))
+        # `connect_for_read` (not a raw `sqlite3.connect`), same as
+        # `rune search`/`check`/`bootstrap` -- a 0-byte or truncated
+        # `memory.db` used to surface a raw `sqlite3.OperationalError`
+        # here (confirmed by hand: `no such table: files`) instead of
+        # the clean "run rebuild-cache" contract every other cache
+        # reader already has. Treated like the scan-failure branch
+        # below: report zero counts rather than crash, since a corrupt
+        # cache genuinely has nothing usable to count.
         try:
-            file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-            previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
-        finally:
-            conn.close()
+            conn = connect_for_read(layout)
+        except CacheUnusableError:
+            conn = None
+        if conn is not None:
+            try:
+                file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+                symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+                previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
+            finally:
+                conn.close()
 
     current_tree_hash: str | None = None
     modified_count = added_count = deleted_count = 0

@@ -2010,3 +2010,94 @@ DATA_MODEL.md／IMPLEMENTATION_PLAN.md／HANDOFF.md 四份文件，本輪明確�
 
 本輪未新增任何測試（沒有程式碼變更可測）；317 個 Python 測試、20 個 TypeScript 測試維持上一輪的
 綠燈狀態不變。
+
+## 使用者轉述的 code review，涵蓋 Milestone 6/7 core（6 條 finding，逐條重現後全部確認為真並修正）
+
+148. **（高）`model_copy(update=...)` 繞過 Pydantic 驗證，可毒化 canonical**：`note_update`
+    （`notes.py`）與 CLI 的 `proposal edit`（`main.py`，最終流入 `approve()`）都用
+    `current.model_copy(update=updates)`／`payload.model_copy(update=updates)` 組出新 revision——
+    Pydantic 明文記載 `model_copy` 不會重新跑 validator。親自重現：`note update --expires-at
+    2026-09-07T12:00:00`（naive timestamp，沒有 tzinfo）成功把這行寫進 `notes.jsonl`，直到下一次
+    `refresh_cache` 重讀該檔案（`read_jsonl` 才會 validate）才炸開，且**炸開之後 `note list`/
+    `note add` 全部 raw `ValidationError`，canonical 已經永久壞掉，只能手改 JSONL**。`proposal
+    edit --expires-at` 走同一個 bug class（CLI 端 `proposal.payload.model_copy(update=updates)`）。
+    `--importance 9.9`/`--confidence -2.0`（超出 `Field(ge=0.0, le=1.0)`）親自重現也是同一機制，
+    一樣先寫入後炸。修法：`storage/canonical.py` 新增 `validated_copy()`（`model.model_dump() |
+    updates` 再丟回 `model_validate()`，強制重新跑一次每個欄位的 validator），取代 `notes.py`／
+    `approve()` 內的裸 `model_copy`；`approve()` 額外在收到 `edited_payload` 時無條件用
+    `validated_copy(payload, {})` 重新驗證一次——這保護的是 `approve()` 這個唯一合法寫入路徑本身，
+    不管呼叫者（目前是 CLI，未來可能是 MCP 或其他呼叫端）用什麼方式組出 `edited_payload`，都無法
+    繞過驗證。4 個 regression test（`test_note_update_rejects_naive_expires_at_without_poisoning_
+    canonical`、`test_note_update_rejects_out_of_range_importance_and_confidence`、
+    `test_approve_rejects_edited_payload_with_naive_expires_at_without_poisoning_canonical` 等）
+    直接斷言拒絕後 canonical 檔案行數不變、current revision 未受影響。
+149. **（中）0-byte／損毀 `memory.db` 讓 `rune status`、`bootstrap --mode soft`、所有寫入指令
+    原始崩潰**：`rune search`/`check`/`bootstrap`（透過 `connect_for_read`）已經有「memory.db
+    壞了就給清楚錯誤、指向 `rune rebuild-cache`」的乾淨契約，但 `core.status.compute_status`
+    直接用裸 `sqlite3.connect()`（不是 `connect_for_read`），`read_current_code_index`
+    （`core.update` 的 incremental diff、以及每次 propose/approve/note 寫入後
+    `refresh_cache` 都會呼叫）也是裸 `connect()`。親自重現：把 `memory.db` 寫成 0-byte 後，
+    `rune status` 拋 `no such table: files`；`note add` 經 `refresh_cache` ->
+    `read_current_code_index` -> `rebuild_cache` 一路原始崩潰。修法分三層：
+    (1) `status.py` 改用 `connect_for_read`，抓到 `CacheUnusableError` 時比照既有的「掃描失敗」
+    分支，回報零值而不是崩潰；(2) `read_current_code_index` 用 `sqlite3.DatabaseError` 包住
+    `connect()` 呼叫與查詢區塊，壞掉時回傳空的 `CodeIndexData`（跟「memory.db 還不存在」同一種
+    處理），**刻意比 `connect_for_read` 窄**——只抓「根本打不開」，不抓「舊 schema_version」，
+    因為 `core.update` 依賴這個函式能讀到舊 shape 的 cache，讓 `rebuild_cache` 自己的
+    `_ensure_compatible_cache_schema` 之後才 self-heal；(3) `rebuild_cache`（寫入路徑，
+    `memory.db` 「永遠可以安全丟棄重建」這個既有原則真正的執行者）自己的 `connect()` 呼叫也會被同一種
+    壞檔案炸到，補上同款 `except sqlite3.DatabaseError` 分支，直接丟棄重建——跟
+    `_ensure_compatible_cache_schema` 已經在做的「舊 shape 就丟棄重建」是同一招，只是提前攔截在
+    連線失敗這一步。**修的過程中發現 `connect()` 本身還有一個 Windows-only 的連環 bug**：PRAGMA
+    失敗時沒有關閉已經建立的 `sqlite3.Connection`，這個洩漏的檔案 handle 會讓
+    `rebuild_cache` 接下來想刪除壞檔案時在 Windows 上收到 `PermissionError`（POSIX 不會，因為
+    POSIX 允許刪除仍被開啟的檔案）——親自用真實 Windows 環境重現，修法是 `connect()` 的 PRAGMA
+    區塊包 `try/except BaseException: conn.close(); raise`。3 個 regression test
+    （`test_status_survives_a_corrupt_memory_db`、`test_rebuild_cache_self_heals_a_corrupt_
+    memory_db`、`test_read_current_code_index_survives_a_corrupt_memory_db`）涵蓋讀路徑與寫路徑
+    兩邊，讀路徑保持乾淨零值、寫路徑確實 self-heal 出一個可用的新 cache。
+150. **（低，隨第 148 條一併修）`note_add`/`propose` 的驗證錯誤是原始 pydantic traceback**：
+    `Note(...)`／`MemoryRevision(...)` 直接建構失敗時，沒有走這兩個模組其餘所有拒絕路徑共用的
+    `NoteValidationError`/`ProposalValidationError` 清楚錯誤契約，CLI 因此印出完整 pydantic
+    traceback 而非一行訊息。因為建構失敗發生在任何 `append_jsonl` 之前，這條本身不會毒化
+    canonical，純粹是錯誤訊息品質問題，隨第 148 條的修法一起用 `try/except ValidationError` 包起來
+    改拋網域例外。
+151. **（中）`approve()` 崩潰後重試，若 `--by` 不同，冪等檢查會失效並附加重複 revision**：
+    `_APPROVAL_CONTENT_FIELDS`（判斷「這是不是同一次重試」的欄位比對）原本包含 `approved_by`。
+    親自重現：模擬第二次 canonical 寫入（`proposals.jsonl` 的 resolve）崩潰，`decisions.jsonl`
+    已經成功寫入 revision 1（`approved_by=alice`），proposal 仍顯示 `pending`；用不同的 `--by bob`
+    重新執行 `approve()`，因為 `approved_by` 對不上（`alice` vs `bob`），冪等檢查判定「不是同一次
+    重試」，又附加了一筆內容相同的 revision 2（`approved_by=bob`）。修法：把 `approved_by` 從
+    `_APPROVAL_CONTENT_FIELDS` 移除——這個欄位記錄的是「這次呼叫是誰執行的」，不是「核准了什麼
+    內容」，崩潰復原的真實情境本來就可能是不同的人接手完成一個卡住的核准。修好後重試只會重用
+    already-written 的 revision 1（`approved_by` 仍是原本的 `alice`），`resolved_proposal.
+    resolved_by` 正確記成 `bob`（誰完成了這次收尾）。1 個 regression test 直接斷言重試後
+    revision 數量不變、原始 `approved_by` 不變、新的 `resolved_by` 正確。
+152. **（低，評估後判定不修，明確記錄為已知邊界）第 151 條修法讓一個既有的、更罕見的
+    false-positive 邊界稍微變寬**：兩個內容逐欄位相同、record_id 相同的**獨立**新 proposal
+    （例如同一個修法被複製貼上提案兩次），若兩者都被核准，第二次核准會被冪等檢查誤判成「這是第一次
+    的重試」，靜默重用第一筆 revision，而不是報錯或附加第二筆——proposal 狀態顯示 `approved`，但
+    `payload` 指向的是第一筆的 revision。這與程式碼註解原本宣稱的「這組比對基本上只有同一次重試才會
+    全欄位相同」不完全相符。移除 `approved_by` 後，兩個獨立核准即使由不同人執行也會撞上這個
+    false positive（先前至少同一個人才會撞上）。**評估後判定不修**：正確修法需要在
+    `MemoryRevision` 上追蹤「這個 revision 是被哪個 `proposal_id` 核准出來的」，是 schema 變更，
+    跟這輪「修一個 model_copy 驗證繞過的 bug」不對稱；且兩個 proposal 內容本來就逐欄位相同，
+    無論哪種行為 canonical 裡的最終內容都一樣，只是歸屬的 proposal 記錄不同，實務影響趨近於零。
+    已在 `_APPROVAL_CONTENT_FIELDS` 旁明確記錄這個 accepted false-positive，不是被忽略的 bug。
+153. **（低）CLI `note update` 無法用空清單取代 scopes/files/symbols/evidence**：`main.py` 用
+    `evidence or None` 決定要不要覆寫這幾個欄位——但 Typer 的 repeatable list option 預設值也是
+    `[]`，導致「使用者根本沒加這個旗標」跟「使用者想清空這個清單」在 CLI 端無法區分（兩者都收到
+    `[]`），而 core 層的 `note_update` 其實已經支援用空清單明確覆寫（`None` 才是「不動」）。跟每個
+    選項的 help 文字（"Replaces the full … list"）矛盾。修法：仿照既有的 `--clear-expires-at`，
+    新增 `--clear-evidence`/`--clear-scopes`/`--clear-files`/`--clear-symbols` 四個旗標，只有明確
+    傳入時才把對應欄位改成 `[]`，否則維持先前「沒傳這個旗標就不動」的行為不變。1 個 CLI regression
+    test 直接讀 `notes.jsonl` 斷言 `--clear-evidence` 後新 revision 的 `evidence` 確實是 `[]`。
+
+新增 10 個 regression test（`tests/integration/test_memory_notes.py` 3 個、
+`tests/integration/test_memory_proposals.py` 3 個、`tests/unit/test_materialize.py` 2 個、
+`tests/unit/test_cli.py` 2 個），每一條都先寫重現腳本、實際看到問題發生（包括手動竄改
+`memory.db` 成 0-byte、monkeypatch `append_jsonl` 模擬崩潰）才動手修。327 個 Python 測試全綠、
+`ruff check` 全綠。這輪沒有觸及 canonical schema、scope model、Decision/Constraint 語意、
+staleness 語意或 agent-injection 語意——全部是既有已定案行為（「validator 必須真的擋住不合法
+資料」「memory.db 永遠可以安全丟棄重建」「崩潰重試不該重複寫入」「CLI 選項要能做到 help 文字說的
+事」）的正確性修復，不是新設計決策，因此本輪未修改 ARCHITECTURE.md/DATA_MODEL.md。

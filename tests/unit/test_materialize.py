@@ -487,6 +487,54 @@ def test_rebuild_cache_self_heals_an_old_shape_memory_db(git_repo: Path) -> None
     assert row == (1, "old purpose")
 
 
+def test_rebuild_cache_self_heals_a_corrupt_memory_db(git_repo: Path) -> None:
+    """Relayed review, reproduced by hand: a 0-byte/truncated `memory.db`
+    (e.g. `echo "" > .rune/cache/memory.db`) fails even `connect()`'s own
+    `PRAGMA journal_mode` -- before `rebuild_cache` ever got a live
+    connection to hand to `_ensure_compatible_cache_schema`'s existing
+    old-shape self-heal. This crashed `rebuild_cache`/`rune update`/`rune
+    rebuild-cache` with a raw `sqlite3.DatabaseError: file is not a
+    database`. Fixed by catching that in `rebuild_cache` and discarding +
+    recreating the file, the same way an old-shape cache is already
+    discarded -- `memory.db` is always safe to regenerate from canonical.
+    """
+    layout = init_project(git_repo)
+    layout.memory_db.parent.mkdir(parents=True, exist_ok=True)
+    layout.memory_db.write_bytes(b"")
+
+    stats = rebuild_cache(layout, code_index=CodeIndexData())  # must not raise
+
+    assert stats["files"] == 0
+    conn = sqlite3.connect(str(layout.memory_db))
+    version = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+    ).fetchone()[0]
+    assert version is not None
+
+
+def test_read_current_code_index_survives_a_corrupt_memory_db(git_repo: Path) -> None:
+    """Companion to the self-heal test above: `read_current_code_index`
+    (used by `core.update`'s incremental diff *and* by `core.memory.
+    records.refresh_cache`, i.e. every propose/approve/note write) used
+    to raise the same raw `sqlite3.DatabaseError` reading a corrupt
+    `memory.db`, crashing every write command that indirectly calls it.
+    It now returns an empty `CodeIndexData`, same as the existing
+    "memory.db doesn't exist yet" case -- a corrupt cache has nothing
+    usable to reuse either way.
+    """
+    from rune.core.storage.sqlite.materialize import read_current_code_index
+
+    layout = init_project(git_repo)
+    layout.memory_db.parent.mkdir(parents=True, exist_ok=True)
+    layout.memory_db.write_bytes(b"")
+
+    result = read_current_code_index(layout)  # must not raise
+
+    assert result.files == []
+    assert result.symbols == []
+    assert result.edges == []
+
+
 def test_rebuild_cache_populates_fts5_indexes(git_repo: Path) -> None:
     """ARCHITECTURE.md §4.8/DATA_MODEL.md §5's fts_* tables were declared
     in schema.sql since Milestone 1 but nothing ever actually inserted

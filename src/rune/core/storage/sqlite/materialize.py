@@ -74,17 +74,29 @@ def _schema_sql_text() -> str:
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    # SQLite ignores declared foreign keys unless this is turned on per
-    # connection — without it, every `REFERENCES ... ON DELETE CASCADE` in
-    # schema.sql is decorative only. `scope_files.file`/`scope_symbols.
-    # symbol_id` deliberately do NOT declare a FK to files/symbols yet (see
-    # schema.sql comment): those tables stay empty until Milestone 2, while
-    # scopes.json can already carry file/symbol members in Milestone 1
-    # (e.g. via --force-preserved content), so enforcing that particular FK
-    # now would break legitimate M1 materialization.
-    conn.execute("PRAGMA foreign_keys=ON;")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        # SQLite ignores declared foreign keys unless this is turned on per
+        # connection — without it, every `REFERENCES ... ON DELETE CASCADE` in
+        # schema.sql is decorative only. `scope_files.file`/`scope_symbols.
+        # symbol_id` deliberately do NOT declare a FK to files/symbols yet (see
+        # schema.sql comment): those tables stay empty until Milestone 2, while
+        # scopes.json can already carry file/symbol members in Milestone 1
+        # (e.g. via --force-preserved content), so enforcing that particular FK
+        # now would break legitimate M1 materialization.
+        conn.execute("PRAGMA foreign_keys=ON;")
+    except BaseException:
+        # `sqlite3.connect()` succeeds even for a corrupt/0-byte file --
+        # it's the first PRAGMA that actually fails to open it as a
+        # database. Without closing here, the failed `Connection` still
+        # holds the file open; a caller that reacts to the error by
+        # trying to delete and recreate `db_path` (`rebuild_cache`'s
+        # corrupt-cache self-heal) would then hit a Windows
+        # `PermissionError` on the unlink, since Windows refuses to
+        # remove a file with an open handle (confirmed by hand).
+        conn.close()
+        raise
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -560,49 +572,73 @@ def read_current_code_index(layout: RuneLayout) -> CodeIndexData:
     memory.db. Used by `core.update` to know what was indexed last time
     (for change detection) and to reuse symbols/edges for files whose
     content hash hasn't changed, without re-parsing them. Returns an
-    empty CodeIndexData if memory.db doesn't exist yet (first run).
+    empty CodeIndexData if memory.db doesn't exist yet (first run), and
+    the same empty result if it exists but isn't a readable database at
+    all (0 bytes, truncated) -- confirmed by hand: a corrupt `memory.db`
+    made this raise a raw `sqlite3.OperationalError: no such table:
+    files`, which propagated out of every write command that calls this
+    indirectly via `core.memory.records.refresh_cache` (note add,
+    proposal approve, ...), with no clean-error contract at all, unlike
+    `rune search`/`check`'s `connect_for_read`. Deliberately narrower
+    than `connect_for_read`'s check, though: this only catches
+    `sqlite3.DatabaseError` (file genuinely won't open as a database),
+    NOT an old-shape-but-structurally-valid cache -- `core.update` relies
+    on being able to read an old-shape cache here *before*
+    `rebuild_cache`'s own `_ensure_compatible_cache_schema` self-heal
+    runs, so treating an old schema_version as unusable here would break
+    that self-healing path.
     """
     if not layout.memory_db.exists():
         return CodeIndexData()
-    conn = connect(layout.memory_db)
     try:
-        files = [
-            IndexedFile(
-                path=row["path"],
-                language=row["language"],
-                content_hash=row["content_hash"],
-                size=row["size"],
-                mtime=row["mtime"],
-                git_blob_hash=row["git_blob_hash"],
-                indexed_at=row["indexed_at"],
-                status=IndexedFileStatus(row["status"]),
-            )
-            for row in conn.execute("SELECT * FROM files")
-        ]
-        symbols = [
-            Symbol(
-                symbol_id=row["symbol_id"],
-                file=row["file"],
-                name=row["name"],
-                qualified_name=row["qualified_name"],
-                kind=SymbolKind(row["kind"]),
-                signature=row["signature"],
-                start_line=row["start_line"],
-                end_line=row["end_line"],
-            )
-            for row in conn.execute("SELECT * FROM symbols")
-        ]
-        edges = [
-            Edge(
-                source_symbol=row["source_symbol"],
-                source_file=row["source_file"],
-                target_symbol=row["target_symbol"],
-                target_file=row["target_file"],
-                edge_type=EdgeType(row["edge_type"]),
-                confidence=row["confidence"],
-            )
-            for row in conn.execute("SELECT * FROM edges")
-        ]
+        conn = connect(layout.memory_db)
+    except sqlite3.DatabaseError:
+        # A corrupt/0-byte file fails even the `PRAGMA journal_mode`
+        # `connect()` runs on every connection, before any table is ever
+        # queried -- confirmed by hand this is where the crash actually
+        # happened, not in the SELECT statements below.
+        return CodeIndexData()
+    try:
+        try:
+            files = [
+                IndexedFile(
+                    path=row["path"],
+                    language=row["language"],
+                    content_hash=row["content_hash"],
+                    size=row["size"],
+                    mtime=row["mtime"],
+                    git_blob_hash=row["git_blob_hash"],
+                    indexed_at=row["indexed_at"],
+                    status=IndexedFileStatus(row["status"]),
+                )
+                for row in conn.execute("SELECT * FROM files")
+            ]
+            symbols = [
+                Symbol(
+                    symbol_id=row["symbol_id"],
+                    file=row["file"],
+                    name=row["name"],
+                    qualified_name=row["qualified_name"],
+                    kind=SymbolKind(row["kind"]),
+                    signature=row["signature"],
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                )
+                for row in conn.execute("SELECT * FROM symbols")
+            ]
+            edges = [
+                Edge(
+                    source_symbol=row["source_symbol"],
+                    source_file=row["source_file"],
+                    target_symbol=row["target_symbol"],
+                    target_file=row["target_file"],
+                    edge_type=EdgeType(row["edge_type"]),
+                    confidence=row["confidence"],
+                )
+                for row in conn.execute("SELECT * FROM edges")
+            ]
+        except sqlite3.DatabaseError:
+            return CodeIndexData()
         return CodeIndexData(files=files, symbols=symbols, edges=edges)
     finally:
         conn.close()
@@ -741,7 +777,22 @@ def rebuild_cache(
     without the underlying file ever needing to be swapped out.
     """
     code_index = code_index if code_index is not None else CodeIndexData()
-    conn = connect(layout.memory_db)
+    try:
+        conn = connect(layout.memory_db)
+    except sqlite3.DatabaseError:
+        # A 0-byte/truncated/corrupt memory.db fails even the `PRAGMA
+        # journal_mode` `connect()` runs on every connection -- before
+        # `_ensure_compatible_cache_schema` below ever gets a `conn` to
+        # inspect. `rebuild_cache` is the one place in this codebase
+        # that's always allowed to discard memory.db (it's a from-
+        # scratch rebuild by definition), so this is the same self-heal
+        # `_ensure_compatible_cache_schema` already does for an
+        # old-shape cache, just triggered one failure mode earlier
+        # (confirmed by hand: without this, `rune update`/`rebuild-cache`
+        # against a corrupt memory.db raised a raw `sqlite3.DatabaseError:
+        # file is not a database` instead of self-healing).
+        _discard_cache_file(layout.memory_db)
+        conn = connect(layout.memory_db)
     conn = _ensure_compatible_cache_schema(layout, conn)
     try:
         create_schema(conn)

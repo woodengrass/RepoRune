@@ -1,11 +1,14 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成之後，再加一輪純設計文件修訂
-（部署模型、`protocol_version`、git worktree／多 agent 協作、scope reconciliation 治理——**不含
-任何程式碼變更**，見 IMPLEMENTATION_PLAN.md「Milestone 7 開工」第四輪修訂）。**尚未接過真實
-OpenCode host 驗收**，是目前唯一剩下的實作工作，細節見文末「立刻可以做的下一步」。以下段落按時間
-順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原「為什麼是這樣做」的完整脈絡；只要看結論，
-直接跳到「立刻可以做的下一步」即可。
+最後更新：2026-09-07，Milestone 7（OpenCode Adapter）全量開發完成、再經一輪純設計文件修訂之後，
+使用者又轉述一份涵蓋 Milestone 6/7 core 的 code review（6 條 finding，逐條重現後全部確認為真並
+修正，見 IMPLEMENTATION_PLAN.md 第 148-153 條）：`model_copy(update=...)` 繞過 Pydantic 驗證可
+毒化 canonical（高，`note_update`/`proposal edit`）、0-byte/損毀 `memory.db` 讓 `status`/
+`bootstrap`/所有寫入指令原始崩潰（中）、`approve()` 崩潰重試在 `--by` 不同時冪等失效並重複寫入
+（中）、CLI `note update` 無法用空清單清空 scopes/files/symbols/evidence（低）。327 個 Python
+測試全綠。**Milestone 7 尚未接過真實 OpenCode host 驗收**，是目前唯一剩下的實作工作，細節見文末
+「立刻可以做的下一步」。以下段落按時間順序記錄從 Milestone 4 到現在每一輪的決策與修正，供還原
+「為什麼是這樣做」的完整脈絡；只要看結論，直接跳到「立刻可以做的下一步」即可。
 
 之後兩輪自我複查／使用者轉述
 外部 finding 各修正若干問題：`rune scope suggest` 崩潰 bug（IMPLEMENTATION_PLAN.md 第 50 條）；接著
@@ -243,6 +246,36 @@ TypeScript 測試全綠、`tsc`/`ruff check` 全綠。**依然沒有連到真實
 指示不需要）——`tool.execute.before` 參數欄位名稱的猜測、`experimental.chat.system.transform` 的
 實際執行時機，都只驗證到型別檢查通過，還沒驗證到真實行為，這是 Milestone 7 交付前最後需要用真實
 host 驗收的部分。
+
+**（純設計文件修訂一輪後）使用者轉述涵蓋 Milestone 6/7 core 的 code review，6 條 finding 逐條重現
+後全部確認為真並修正**：見 IMPLEMENTATION_PLAN.md 第 148-153 條。
+- **（高）`model_copy(update=...)` 繞過 Pydantic 驗證，可毒化 canonical**：`note_update`／CLI 的
+  `proposal edit` 都用裸 `model_copy` 組新 revision，Pydantic 不會重新驗證——親自重現：
+  `note update --expires-at <naive timestamp>` 成功寫進 `notes.jsonl`，直到下次 `refresh_cache`
+  重讀才炸開，且炸開後 `note list`/`note add` 全部 raw `ValidationError`，只能手改 JSONL 才能救回
+  來。新增 `storage/canonical.py` 的 `validated_copy()`（`model_dump()` + `update` 再丟回
+  `model_validate()`，強制重新驗證），取代 `notes.py`/`approve()` 內的裸 `model_copy`；`approve()`
+  額外對 `edited_payload` 無條件重新驗證一次，保護的是這個唯一合法寫入路徑本身，不管呼叫者怎麼組出
+  `edited_payload`。
+- **（中）0-byte／損毀 `memory.db` 讓 `status`/`bootstrap --mode soft`/所有寫入指令原始崩潰**：
+  `rune search`/`check`/hard bootstrap 已有的「壞了就清楚報錯，指向 `rebuild-cache`」契約沒有涵蓋
+  `compute_status`、`read_current_code_index`（每次 propose/approve/note 寫入後的 `refresh_cache`
+  都會呼叫）、`rebuild_cache` 自己的 `connect()`。三層都補上處理；順手修掉一個
+  Windows-only 的連環 bug：`connect()` PRAGMA 失敗時沒關閉已建立的 connection，洩漏的檔案 handle
+  讓後續想刪除壞檔案的 `_discard_cache_file` 在 Windows 上收到 `PermissionError`。
+- **（中）`approve()` 崩潰後重試，`--by` 不同時冪等檢查失效、附加重複 revision**：崩潰復原的冪等比對
+  原本包含 `approved_by`（記錄的是「誰執行這次呼叫」，不是「核准了什麼內容」），移除後修正；順手在
+  程式碼裡明確記錄一個因此變寬、但評估後判定不修的低風險 false-positive（兩個內容逐欄位相同的獨立
+  proposal 若都被核准，第二個會被誤判成同一次重試）。
+- **（低）CLI `note update` 無法用空清單清空 scopes/files/symbols/evidence**：`evidence or None`
+  分不出「沒傳這個旗標」跟「想清空」，新增 `--clear-evidence`/`--clear-scopes`/`--clear-files`/
+  `--clear-symbols` 四個旗標，仿照既有的 `--clear-expires-at`。
+
+新增 10 個 regression test（`test_memory_notes.py`/`test_memory_proposals.py`/`test_materialize.py`/
+`test_cli.py`），每條都先寫重現腳本、實際看到問題發生（含手動竄改 `memory.db` 成 0-byte、
+monkeypatch 模擬崩潰）才動手修。327 個 Python 測試全綠、`ruff check` 全綠。這輪全部是既有已定案行為
+的正確性修復，沒有觸及 canonical schema/scope model/Decision-Constraint 語意/staleness 語意/
+agent-injection 語意，因此沒有修改 ARCHITECTURE.md/DATA_MODEL.md。
 
 ## 專案是什麼
 
@@ -506,6 +539,12 @@ git-init 過的小型測試用 repo）。
   large-churn 的具體數值都還沒做，是設計先於實作的狀態。
 - **`protocol_version` 尚未加進任何 `--json` 輸出**：ARCHITECTURE.md §6.2 已經定義好 adapter/core
   相容性契約的設計，但目前所有 `--json` 命令都還沒有這個欄位，是 Milestone 7 收尾前要補的 contract。
+- **`approve()` 的崩潰重試冪等檢查有一個評估後判定不修的 false-positive**（見
+  `proposals.py`：`_APPROVAL_CONTENT_FIELDS` 旁的註解、IMPLEMENTATION_PLAN.md 第 152 條）：兩個
+  內容逐欄位相同、record_id 相同的**獨立**新 proposal（例如同一個修法被複製貼上提案兩次）若都被
+  核准，第二次核准會被誤判成第一次的崩潰重試，靜默重用第一筆 revision 而非附加第二筆。正確修法需要
+  `MemoryRevision` 追蹤是哪個 `proposal_id` 核准出來的（schema 變更），跟兩個 proposal 內容本來就
+  相同、canonical 最終內容不受影響的近零實務影響不對稱，故不修。
 
 ## 立刻可以做的下一步
 

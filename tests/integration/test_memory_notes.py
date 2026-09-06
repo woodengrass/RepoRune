@@ -219,6 +219,58 @@ def test_note_update_can_change_importance_and_confidence(git_repo: Path) -> Non
     assert updated.confidence == 0.2
 
 
+def test_note_update_rejects_naive_expires_at_without_poisoning_canonical(git_repo: Path) -> None:
+    """Relayed review, reproduced by hand: `note_update` built the new
+    revision via `current.model_copy(update=updates)`, which Pydantic
+    does NOT re-validate -- a naive (non-UTC) `expires_at` was written
+    straight into `notes.jsonl` as-is, and every subsequent `note`
+    command then crashed reading it back (`read_jsonl` DOES validate).
+    Fixed via `validated_copy` (re-runs every field's validator before
+    the write); this now raises `NoteValidationError` immediately and
+    the canonical file is never touched.
+    """
+    layout = init_project(git_repo)
+    note = note_add(layout, category=NoteCategory.pitfall, content="c", why_persist="w")
+
+    with pytest.raises(NoteValidationError):
+        note_update(layout, note.id, expires_at="2026-09-07T12:00:00")  # naive, no tzinfo
+
+    notes = read_jsonl(layout.notes_jsonl, Note)
+    assert len(notes) == 1  # nothing appended
+    # canonical is still readable and the note is unaffected
+    still_current = get_current_note(layout, note.id)
+    assert still_current.revision == 1
+    assert still_current.expires_at is None
+
+
+def test_note_update_rejects_out_of_range_importance_and_confidence(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    note = note_add(layout, category=NoteCategory.pitfall, content="c", why_persist="w")
+
+    with pytest.raises(NoteValidationError):
+        note_update(layout, note.id, importance=9.9, confidence=-2.0)
+
+    notes = read_jsonl(layout.notes_jsonl, Note)
+    assert len(notes) == 1
+
+
+def test_note_add_rejects_naive_expires_at_with_a_clean_error(git_repo: Path) -> None:
+    """Same underlying validator, but on the `note_add` construction path
+    (a plain `Note(...)` call, not `model_copy`) -- this one already
+    failed before writing anything, but as a raw `pydantic.
+    ValidationError`, not the domain `NoteValidationError` every other
+    rejection here raises. Low-severity CLI polish, fixed alongside the
+    higher-severity `model_copy` bug since it's the same code path.
+    """
+    layout = init_project(git_repo)
+    with pytest.raises(NoteValidationError):
+        note_add(
+            layout, category=NoteCategory.pitfall, content="c", why_persist="w",
+            expires_at="2026-09-07T12:00:00",
+        )
+    assert read_jsonl(layout.notes_jsonl, Note) == []
+
+
 def test_note_add_before_any_rune_update_does_not_create_a_misleading_empty_cache(git_repo: Path) -> None:
     """A relayed review confirmed by hand: refresh_cache() used to call
     rebuild_cache() with an empty CodeIndexData whenever memory.db didn't

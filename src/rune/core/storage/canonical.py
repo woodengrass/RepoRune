@@ -52,6 +52,27 @@ def write_json_model(path: Path, model: BaseModel) -> None:
     atomic_write_text(path, content)
 
 
+def validated_copy[ModelT: BaseModel](model: ModelT, updates: dict) -> ModelT:
+    """`model.model_copy(update=updates)` writes `updates` straight into
+    `__dict__` and skips every validator -- Pydantic v2 documents this
+    explicitly. That's fine for updates a caller can't get wrong (e.g. a
+    system-computed `revision`/`status`/timestamp), but every canonical
+    "append a new revision" writer in this codebase that lets a *string*
+    from a CLI flag (`--expires-at`, `--importance`) flow into `updates`
+    was using plain `model_copy` regardless, which let a value that fails
+    the field's own validator (an `AfterValidator`, a `Field(ge=..., le=
+    ...)`) get written straight into a canonical JSONL line -- confirmed
+    by hand: `note update --expires-at` with a naive (non-UTC) timestamp
+    wrote the bad line successfully, and every subsequent `note`
+    command then crashed reading it back, since `read_jsonl` DOES
+    validate. Round-tripping the update through `model_dump()` +
+    `model_validate()` re-runs every validator before anything is ever
+    handed to `append_jsonl`, so a bad value fails loudly right here
+    instead of poisoning the canonical file.
+    """
+    return type(model).model_validate(model.model_dump() | updates)
+
+
 def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[ModelT]:
     """Reads every line of a canonical JSONL file. Missing file -> []."""
     if not path.exists():

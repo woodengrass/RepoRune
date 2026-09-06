@@ -19,6 +19,7 @@ from rune.core.storage.canonical import read_jsonl
 from rune.core.storage.models import (
     MemoryRevision,
     PersistenceMode,
+    Proposal,
     ProposalStatus,
     RecordStatus,
     RecordType,
@@ -475,6 +476,97 @@ def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(g
     decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
     assert len(decisions) == 1
     assert decisions[0].revision == 1
+
+
+def test_reapproving_after_a_crash_with_a_different_by_does_not_duplicate(git_repo: Path) -> None:
+    """Relayed review, reproduced by hand: the retry-after-crash
+    idempotency check (see the test above) compared `approved_by` as
+    part of "is this the same content already written" -- so a retry
+    completed by a *different* human than whoever hit the crash (a
+    realistic scenario: someone else notices the stuck pending proposal
+    and finishes it) failed the comparison and appended a second,
+    duplicate revision. Fixed by dropping `approved_by` from the
+    comparison (it records who ran the call, not what was approved).
+    """
+    import rune.core.memory.proposals as proposals_module
+
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="c")
+
+    real_append = proposals_module.append_jsonl
+    call_count = {"n": 0}
+
+    def flaky_append(path, model):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise OSError("simulated crash between the two canonical writes")
+        return real_append(path, model)
+
+    proposals_module.append_jsonl = flaky_append
+    try:
+        with pytest.raises(OSError):
+            approve(layout, proposal.proposal_id, resolved_by="alice")
+    finally:
+        proposals_module.append_jsonl = real_append
+
+    resolved, memory_rev = approve(layout, proposal.proposal_id, resolved_by="bob")
+    assert resolved.status is ProposalStatus.approved
+    assert resolved.resolved_by == "bob"
+    # the already-written revision's own attribution is untouched
+    assert memory_rev.approved_by == "alice"
+    assert memory_rev.revision == 1
+
+    decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
+    assert len(decisions) == 1
+
+
+def test_propose_rejects_invalid_expires_at_with_a_clean_error(git_repo: Path) -> None:
+    """`propose()` builds `MemoryRevision(...)` directly -- this already
+    failed before writing anything (nothing to poison here), but as a
+    raw `pydantic.ValidationError` rather than the domain
+    `ProposalValidationError` every other rejection in this module
+    raises. Fixed alongside the higher-severity `approve()`/`edited_
+    payload` bug below since it's the same class of gap.
+    """
+    layout = init_project(git_repo)
+    with pytest.raises(ProposalValidationError):
+        propose(
+            layout, type=RecordType.constraint, record_id="c1", content="c",
+            severity=Severity.should, persistence_mode=PersistenceMode.temporary,
+            expires_at="2026-09-07T12:00:00",  # naive, no tzinfo
+        )
+    assert read_jsonl(layout.proposals_jsonl, Proposal) == []
+
+
+def test_approve_rejects_edited_payload_with_naive_expires_at_without_poisoning_canonical(
+    git_repo: Path,
+) -> None:
+    """Relayed review, reproduced by hand: the CLI's `proposal edit`
+    builds `edited_payload` via `proposal.payload.model_copy(update=...)`
+    -- unvalidated, same class of bug as `note_update`'s. A naive
+    `--expires-at` used to be written straight into `constraints.jsonl`,
+    breaking every later `constraint`/`decision`/`search` command that
+    reads it back. Fixed with a defensive re-validation inside
+    `approve()` itself (not just at the CLI layer) so the write path is
+    protected regardless of how a caller constructed `edited_payload`.
+    """
+    layout = init_project(git_repo)
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="temp rule",
+        severity=Severity.should, persistence_mode=PersistenceMode.temporary,
+        expires_at="2026-12-01T00:00:00Z",
+    )
+    # mimics the CLI's own (unsafe) construction of `edited_payload`
+    edited = proposal.payload.model_copy(update={"expires_at": "2026-09-07T12:00:00"})
+
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice", edited_payload=edited)
+
+    assert read_jsonl(layout.constraints_jsonl, MemoryRevision) == []
+    still_pending = [
+        p for p in read_jsonl(layout.proposals_jsonl, Proposal) if p.proposal_id == proposal.proposal_id
+    ]
+    assert still_pending[-1].status is ProposalStatus.pending
 
 
 def test_edited_payload_critical_true_on_constraint_is_rejected(git_repo: Path) -> None:
