@@ -192,8 +192,16 @@ IMPLEMENTATION_PLAN.md 第 121-128 條，這輪沒有需要另外確認設計的
 `NotesConfig` TTL 沒有正值驗證、`proposal edit --critical` 用在 constraint 被靜默接受（
 `constraint_revisions` 表根本沒有這欄位）、CLI `note update` 沒暴露 core 新增的
 scopes/files/symbols/importance/confidence/expires_at 參數（以上四條皆低，都已修正）。新增 12
-個 regression test，每條都先寫重現腳本、實際看到問題發生才動手修。**295 個測試全綠，
-`ruff check` 全綠。**
+個 regression test，每條都先寫重現腳本、實際看到問題發生才動手修。295 個測試全綠，
+`ruff check` 全綠。
+
+**Milestone 7 開工（第一輪，spike）**：見 IMPLEMENTATION_PLAN.md「Milestone 7 開工」第
+129-131 條、ARCHITECTURE.md §6（第十三輪）。新增 `core.retrieval.scope_for` + `rune scope-for
+<path> --json`（先前規格只點名這個指令、沒定義確切格式，本輪補上，重用 Milestone 5/6 既有的
+current+visible 過濾規則，唯一新規則是 INFO severity 不主動注入）。新增最小 TypeScript adapter
+骨架 `adapters/opencode/`，對照一個手工建立的暫存 repo 實際跑過
+「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條路徑，含
+dedup 邏輯，確認可行——沒有連到真實 OpenCode host。303 個 Python 測試全綠。
 
 ## 專案是什麼
 
@@ -271,10 +279,11 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
-| 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
+| 7. OpenCode Adapter | 🚧 開工中（spike 完成） | `rune scope-for` + 最小 TS adapter 骨架已驗證可行；hard/soft bootstrap 注入、session hook、custom tool 尚未開始 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**295 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
+失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
@@ -300,9 +309,10 @@ src/rune/
 │  │  ├─ proposals.py         # propose/approve/reject/deactivate（Decision/Constraint）
 │  │  ├─ notes.py             # note_add/note_update（無需核准）
 │  │  └─ staleness.py         # 存在性檢查 + snapshot 比對，純結構/hash，不呼叫 LLM
-│  ├─ retrieval/               # Milestone 6，完成
+│  ├─ retrieval/               # Milestone 6 完成，Milestone 7 開工中
 │  │  ├─ search.py            # 八層排序 search，FTS5 查詢
-│  │  └─ check.py             # 變更檔案 -> 受影響 scope -> 相關 constraint
+│  │  ├─ check.py             # 變更檔案 -> 受影響 scope -> 相關 constraint
+│  │  └─ scope_for.py         # Milestone 7：path -> scope + summary + MUST/SHOULD + note
 │  ├─ semantic/
 │  │  ├─ provider.py         # ModelProvider protocol、OpenRouter/OpenAI/通用 httpx 實作
 │  │  ├─ redaction.py        # free-text 欄位 secret 遮蔽（結構化參照欄位不碰）
@@ -321,6 +331,11 @@ src/rune/
 │        ├─ schema.sql      # 完整 SQLite schema
 │        └─ materialize.py  # rebuild_cache()：整個系統唯一寫 SQLite 的地方
 ```
+
+**`adapters/opencode/`（Milestone 7，開工中）**——與 `src/rune/` 平行的頂層目錄，TypeScript，
+`package.json`/`tsconfig.json`（`strict: true`）、`src/rune-cli.ts`（唯一允許呼叫 `rune` CLI 的
+地方，`RUNE_CLI_PATH` 環境變數可覆寫供開發時指向 venv 的 `rune.exe`）、`src/spike.ts`（目前只有
+這一支手動跑過的 spike 腳本，`npm run spike -- <repo-dir> <file-path>`，還沒有自動化測試框架）。
 
 `tests/unit/`、`tests/integration/`（含 `fixtures/python-simple`、`fixtures/ts-simple` 兩個
 git-init 過的小型測試用 repo）。
@@ -433,15 +448,24 @@ staleness}`、`core.retrieval.{search,check}`、FTS5 索引、CLI 子命令
 （`decision`/`constraint`/`note`/`proposal`/`search`/`check`）全部到位，包括第十五輪決議的
 「`possibly_stale`/`stale` 摘要不顯示舊文字」也已落地到 `rune search`。261 個測試全綠。
 
-**Milestone 7（OpenCode Adapter）是下一步**：`adapters/opencode`（TypeScript）加上支援它的少量
-`rune.cli` 新增子命令（`--json` 輸出）。開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 7 整段與
-ARCHITECTURE.md §6-7。**先做規格明講的小 spike，不要一次全量開發**：只驗證
-「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條最關鍵路徑能跑
-通，確認 tool context 能正確取得 `directory`/`worktree` 定位到正確的 `.rune/`。之後才是完整交付項目：
+**Milestone 7（OpenCode Adapter）開工中，spike 已完成**（見 IMPLEMENTATION_PLAN.md「Milestone 7
+開工」第 129-131 條）：`core.retrieval.scope_for` + `rune scope-for <path> --json`（ARCHITECTURE
+§6 新增的確切 JSON 格式）已實作並測試（7 個 Python 整合測試）；`adapters/opencode/` 最小
+TypeScript 骨架（`package.json`/`tsconfig.json`/`src/rune-cli.ts`/`src/spike.ts`）已對照一個
+手工建立、有真實 scope/constraint/note 的暫存 repo 實際跑過
+「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條路徑，含
+`active_scope_ids` dedup（同一 scope 同一 session 只注入一次），確認可行。**沒有連到真實 OpenCode
+host**（沒有可用的 OpenCode 執行環境），只驗證機制本身，不是真的部署。
+
+**下一步是 Milestone 7 的完整交付項目**：
 `rune bootstrap --mode hard|soft --json`（`core.retrieval.context` 新增
 `build_hard_bootstrap_context()`/`build_soft_bootstrap_context()`，hard 輸出超出 budget 時
-`overflow=true`、絕不靜默丟棄 MUST 規則）、session-start/session-compaction hook、`tool.execute.
-before` 掛 constraint delivery（`bash` 指令的特殊處理：V1 不嘗試解析 shell 語意，改在
-`tool.execute.after` 用 git diff 事後偵測）、custom tool 註冊
+`overflow=true`、絕不靜默丟棄 MUST 規則，JSON 格式已在 ARCHITECTURE §7.6 定義好）、
+session-start/session-compaction hook（`hard_context_generation` 計數器要跟 `active_scope_ids`
+分開維護，不可共用同一個旗標）、`tool.execute.before` 掛 constraint delivery（`bash` 指令的特殊
+處理：V1 不嘗試解析 shell 語意，改在 `tool.execute.after` 用 git diff 事後偵測；`scope-for` 已經
+做好，這部分只需要接上 dedup 快取跟實際的 hook 註冊）、custom tool 註冊
 （`decision_propose`/`constraint_propose`/`note_add`，這些底層 core 函式 Milestone 6 已經做好，
-Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。
+Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。開工前重讀
+IMPLEMENTATION_PLAN.md 的 Milestone 7 整段（含驗收標準——規格明講是「V1 真正價值的驗證階段」，
+不可妥協）與 ARCHITECTURE.md §6-7。

@@ -231,3 +231,24 @@ def test_note_update_cli_exposes_scopes_files_symbols_and_expiry(git_repo: Path)
     )
     assert result.exit_code == 0, result.output
     assert "rev2" in result.output
+
+
+def test_scope_for_cli_json_round_trip(git_repo: Path) -> None:
+    """The spike ARCHITECTURE.md §6/IMPLEMENTATION_PLAN.md Milestone 7
+    calls for before full adapter development: `rune scope-for --path ...
+    --json` must be a working, scriptable round trip an adapter (or, here,
+    a plain subprocess call standing in for one) can drive."""
+    import json as json_module
+
+    (git_repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    runner.invoke(
+        app, ["scope", "create", "core", "--name", "Core", "--file", "a.py", "--path", str(git_repo)]
+    )
+    runner.invoke(app, ["update", "--path", str(git_repo)])
+
+    result = runner.invoke(app, ["scope-for", "a.py", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["path"] == "a.py"
+    assert [s["scope_id"] for s in payload["scopes"]] == ["core"]

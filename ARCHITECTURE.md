@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十二輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十三輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -41,7 +41,11 @@ status_code`/`is_rate_limited`、`mark_possibly_stale`、CLI 依健康狀態決�
 撤回這個簡化，恢復成第十輪原始措辭**——`model` 空字串跟 API key 缺一樣，只要 `semantic.enabled=
 true` 就是設定錯誤，不因為是預設值就特殊放行；受影響的既有測試（假設「什麼都不設也能正常跑
 update」的測試）改成明確加上 `semantic.enabled=false` 才算未使用 semantic 這個前提。細節見第 4.5
-節與文末「第十五輪修訂」「第十七輪修訂」。本文件與
+節與文末「第十五輪修訂」「第十七輪修訂」。**第十三輪是 Milestone 7 開工前的 spike，見第 6 節**：
+新增 `rune scope-for <path> --json`（第 6 節先前只點名這個指令、沒有定義確切 JSON 格式，本輪補上），
+用一個最小的 TypeScript adapter 骨架（`adapters/opencode/`）實際跑過
+「`tool.execute.before` → `rune scope-for` → 注入 context」這條路徑，包含同一 scope 第二次不重複
+注入的 dedup 邏輯，確認整條路徑可行才進入 Milestone 7 全量開發。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -615,6 +619,39 @@ SQLite、不呼叫 model provider、不含 staleness 邏輯，也不嘗試解析
 
 實作前建議先做一個很小的 spike：只驗證「`tool.execute.before` → `rune scope-for` → 注入 context」
 這條最關鍵的路徑能跑通，再進入 Milestone 7 全量開發。
+
+**`rune scope-for <path> --json` 的輸出格式（第十三輪 spike 確認，先前只點名這個指令、沒有定義確切
+JSON 格式）**：一個檔案可能屬於零、一或多個 scope（DATA_MODEL §4），所以回傳一個陣列，成員不存在
+任何 scope 是正常結果，不是錯誤。每個 scope 附上它的 semantic summary（Milestone 5，`possibly_stale`
+/`stale` 一樣不回傳舊摘要文字本身、改用指向 `source_files` 的提示，跟 `rune search` 完全同一套規則）、
+current+visible 的 MUST/SHOULD constraint（INFO severity 不主動注入，見 7.1：INFO 只能透過
+`rune search` 查到，不值得每次 scope activation 都佔用 context）、current+visible 的 note：
+
+```json
+{
+  "path": "app/services.py",
+  "scopes": [
+    {
+      "scope_id": "app",
+      "name": "App",
+      "description": "",
+      "summary": "Handles user account lookups.",
+      "summary_status": "fresh",
+      "constraints": [
+        {"record_id": "no-bare-except", "severity": "MUST", "content": "...", "status": "active", "warning": null}
+      ],
+      "notes": [
+        {"id": "...", "category": "pitfall", "content": "...", "status": "active", "warning": null}
+      ]
+    }
+  ]
+}
+```
+
+`adapters/opencode/`（TypeScript，本輪新增最小骨架）的 `src/rune-cli.ts` 是 adapter 唯一允許呼叫
+`rune` CLI 的地方，`src/spike.ts` 模擬 `tool.execute.before` 的注入邏輯（含 `active_scope_ids`
+dedup：同一 scope 同一 session 只注入一次），已對照一個手工建立、有真實 scope/constraint/note 的
+暫存 repo 實際跑過，確認整條路徑可行。
 
 ## 7. Global Code Standards / Hard-Soft Bootstrap（本輪新增，agent-injection semantics 的正式一部分）
 

@@ -7,3 +7,4 @@ __pycache__/
 build/
 dist/
 token.env
+node_modules/

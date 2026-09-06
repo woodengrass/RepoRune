@@ -1790,3 +1790,41 @@ snapshot（107）、Note TTL 死代碼（108）、`--history` 找不到舊 revis
 斷言強化）。每一條都先寫重現腳本、實際看到問題發生，才動手修——包括用 monkeypatch 模擬崩潰重現
 finding 124、手動竄改 `schema_meta`/`fts_decisions` 表形狀重現 finding 122。295 個測試全綠，
 `ruff check` 全綠。
+
+## Milestone 7 開工（spike）
+
+### 第一輪修訂（開工前 spike：`rune scope-for` + 最小 TypeScript adapter 骨架）
+
+129. **`core.retrieval.scope_for`（新模組）+ `rune scope-for <path> --json`**：這是本輪唯一需要
+    新設計的部分——ARCHITECTURE §6 先前只點名這個指令會被 `tool.execute.before` 呼叫，沒有定義
+    確切 JSON 格式。設計方式完全重用既有 building block，不是憑空發明：`semantic_objects`
+    （Milestone 5 的 summary，`possibly_stale`/`stale` 一樣改回傳指向 `source_files` 的提示，跟
+    `rune search` 同一套規則）、`constraint_scopes`/`note_scopes`（Milestone 6 的 current+visible
+    過濾規則）。**唯一的新規則**：只回傳 MUST/SHOULD constraint，INFO severity 不主動注入（
+    ARCHITECTURE §7.1：INFO 只值得被動查詢，不值得每次 scope activation 都佔用 context，這點
+    ARCHITECTURE §7 原本就隱含在三層規範分工表格裡，本輪只是第一次真正需要在程式碼裡落實這個
+    篩選）。一個檔案可能屬於零到多個 scope，回傳陣列，空陣列是正常結果不是錯誤。細節已寫進
+    ARCHITECTURE.md §6（第十三輪）。
+130. **`adapters/opencode/`（新增最小 TypeScript 骨架，不是完整 adapter）**：`package.json`/
+    `tsconfig.json`（`strict: true`）、`src/rune-cli.ts`（adapter 唯一允許呼叫 `rune` CLI 的
+    地方，`execFile` + JSON.parse，`RUNE_CLI_PATH` 環境變數可覆寫供開發/CI 環境指向 venv 裡的
+    `rune.exe`，不需要真的裝到全域 PATH——真正部署（Milestone 8 打包）預期 `rune` 就在 PATH 上）、
+    `src/spike.ts`（模擬 `tool.execute.before`：呼叫 `scope-for`、用 `active_scope_ids` Set 做
+    dedup、印出注入內容）。**沒有連到真實 OpenCode host**（沒有可用的 OpenCode 執行環境可以測），
+    spike 驗證的是「這個機制本身走得通」，不是「真的部署進 OpenCode」。
+131. **spike 對照一個手工建立、有真實資料的暫存 repo 實際跑過**：`rune init` → `rune scope create`
+    → `rune constraint propose`/`approve`（MUST，scoped）→ `rune note add`（scoped）→
+    `rune update`，然後跑 `npm run spike -- <repo-dir> app/services.py`，確認：
+    - TypeScript 端能透過純 CLI `--json` 呼叫拿到正確的 scope/constraint/note 資料（不是
+      import Python、不是碰 SQLite）
+    - 同一個 scope 第二次呼叫（模擬同一 session 內再次觸及同一 scope 的檔案）被 dedup 邏輯正確
+      跳過，只印一次「injecting context」
+
+新增 8 個 Python regression test（`tests/integration/test_retrieval_scope_for.py` 7 個、
+`tests/unit/test_cli.py` 1 個 CLI JSON round-trip）。TypeScript 端目前只有手動跑過的 spike
+腳本，還沒有自動化測試框架（Milestone 7 全量開發時再補，這輪的目標只是驗證路徑可行）。303 個
+Python 測試全綠，`ruff check` 全綠。
+
+**尚未開始**：`rune bootstrap --mode hard|soft --json`、`core.retrieval.context`、
+session-start/session-compaction hook、`tool.execute.before` 掛 constraint delivery（含
+`bash` 的事後偵測）、custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`）。

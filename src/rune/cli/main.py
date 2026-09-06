@@ -47,6 +47,7 @@ from rune.core.project import (
     init_project,
 )
 from rune.core.retrieval.check import check as core_check
+from rune.core.retrieval.scope_for import scope_for as core_scope_for
 from rune.core.retrieval.search import search as core_search
 from rune.core.scopes.clustering import suggest_from_graph
 from rune.core.scopes.heuristics import ScopeCandidate, suggest_from_paths
@@ -926,6 +927,64 @@ def check(
         return
     for c in result.constraints:
         typer.echo(f"[{c.severity}] {c.record_id} (scopes: {', '.join(c.scope_ids)}): {c.content}")
+
+
+@app.command(name="scope-for")
+def scope_for_cmd(
+    file_path: str = typer.Argument(..., help="File path relative to the repo root."),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Which scope(s) FILE_PATH belongs to, plus each scope's summary,
+    MUST/SHOULD constraints, and notes -- the context an adapter injects
+    the first time an agent touches a scope in a session
+    (ARCHITECTURE.md §6's `tool.execute.before` flow)."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+        results = core_scope_for(layout, file_path)
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                {
+                    "path": file_path,
+                    "scopes": [
+                        {
+                            "scope_id": s.scope_id, "name": s.name, "description": s.description,
+                            "summary": s.summary, "summary_status": s.summary_status,
+                            "constraints": [
+                                {"record_id": c.record_id, "severity": c.severity, "content": c.content,
+                                 "status": c.status, "warning": c.warning}
+                                for c in s.constraints
+                            ],
+                            "notes": [
+                                {"id": n.id, "category": n.category, "content": n.content,
+                                 "status": n.status, "warning": n.warning}
+                                for n in s.notes
+                            ],
+                        }
+                        for s in results
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    if not results:
+        typer.echo(f"{file_path} is not a member of any scope.")
+        return
+    for s in results:
+        typer.echo(f"{s.scope_id}: {s.name}")
+        if s.summary:
+            typer.echo(f"  summary [{s.summary_status}]: {s.summary}")
+        for c in s.constraints:
+            warn = f" ({c.warning})" if c.warning else ""
+            typer.echo(f"  [{c.severity}] {c.record_id}{warn}: {c.content}")
+        for n in s.notes:
+            warn = f" ({n.warning})" if n.warning else ""
+            typer.echo(f"  note [{n.category}]{warn}: {n.content}")
 
 
 def main() -> None:
