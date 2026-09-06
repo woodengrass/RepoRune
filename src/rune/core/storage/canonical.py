@@ -12,13 +12,10 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import TypeVar
 
 from pydantic import BaseModel
 
 from rune.core.storage.schema_versions import check_schema_version
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -40,7 +37,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def read_json_model(path: Path, model_cls: type[ModelT]) -> ModelT | None:
+def read_json_model[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> ModelT | None:
     """Returns None if the file doesn't exist (caller decides the default)."""
     if not path.exists():
         return None
@@ -55,7 +52,7 @@ def write_json_model(path: Path, model: BaseModel) -> None:
     _atomic_write_text(path, content)
 
 
-def read_jsonl(path: Path, model_cls: type[ModelT]) -> list[ModelT]:
+def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[ModelT]:
     """Reads every line of a canonical JSONL file. Missing file -> []."""
     if not path.exists():
         return []

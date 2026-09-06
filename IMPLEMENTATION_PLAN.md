@@ -22,13 +22,16 @@ OpenCode adapter 的 hard/soft 注入）、Milestone 8（`rune doctor` 的 MUST 
 **現在沒有任何未知項足以阻擋 Milestone 1–3 開工**——這三個 milestone 的範圍（core foundation、
 code index、references/graph）不依賴上述任何一個尚待驗證的假設。
 
-工具鏈假設（已依實際開發機環境調整）：**Python 3.11+**（開發機只有 3.11，無 3.12，`tomllib` 讀取自
-3.11 起已是標準庫，不影響任何已確認設計）、**pip + venv**（開發機無 `uv`；`pyproject.toml` 仍維持
-uv 相容，未來可無痛切換）、hatchling 為 build backend、Typer 做 CLI、Pydantic v2、標準庫 `sqlite3`
-（V1 不需要 server process，同步即可）、`tree-sitter` + 各語言獨立 grammar 套件
-（`tree-sitter-python`、`tree-sitter-javascript`、`tree-sitter-typescript`，本次確認採此路線而非
-`tree-sitter-languages` bundle）、`httpx` 呼叫 provider、`pytest` + `ruff`、git CLI 以 `subprocess`
-呼叫。
+工具鏈假設（本輪升級回原始假設）：**Python 3.12+**（開發機原本只有 3.11，已透過 `winget install
+Python.Python.3.12` 補裝 3.12.10 並重建 venv；考量此專案預期使用多年、未來還會有 V2/V3，3.11 的
+安全支援窗口到 2027 年底、3.12 到 2028 年底，現在（程式碼量還小）是切換成本最低的時間點，因此改回
+3.12+ 而非長期停留在 3.11。升級後 `ruff` 自動指出 `read_json_model`/`read_jsonl` 可改用 PEP 695
+的 `def f[T: BaseModel](...)` 泛型語法（3.12 起才有），已一併採用，取代原本的 `TypeVar`
+寫法）、**pip + venv**（開發機無 `uv`；`pyproject.toml` 仍維持 uv 相容，未來可無痛切換）、hatchling
+為 build backend、Typer 做 CLI、Pydantic v2、標準庫 `sqlite3`（V1 不需要 server process，同步即
+可）、`tree-sitter` + 各語言獨立 grammar 套件（`tree-sitter-python`、`tree-sitter-javascript`、
+`tree-sitter-typescript`，本次確認採此路線而非 `tree-sitter-languages` bundle）、`httpx` 呼叫
+provider、`pytest` + `ruff`、git CLI 以 `subprocess` 呼叫。
 
 **Milestone 1 目前狀態：已實作並通過測試**（`src/rune/`，32 個單元測試全綠，`ruff check` 全綠，含
 Global Code Standards 支援欄位）。

@@ -18,9 +18,6 @@ import sqlite3
 from collections import defaultdict
 from importlib import resources
 from pathlib import Path
-from typing import TypeVar
-
-from pydantic import BaseModel
 
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model, read_jsonl
@@ -32,8 +29,6 @@ from rune.core.storage.models import (
     ScopesFile,
     ScopeSummary,
 )
-
-ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class CanonicalConflictError(Exception):
