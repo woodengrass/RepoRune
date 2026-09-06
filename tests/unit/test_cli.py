@@ -279,3 +279,36 @@ def test_bootstrap_cli_hard_and_soft_json_round_trip(git_repo: Path) -> None:
 
     result = runner.invoke(app, ["bootstrap", "--mode", "bogus", "--path", str(git_repo)])
     assert result.exit_code == 1
+
+
+def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
+    """The OpenCode adapter's custom tools (decision_propose/
+    constraint_propose/note_add, ARCHITECTURE.md §6) need machine-readable
+    output from these CLI entry points to report back to the agent."""
+    import json as json_module
+
+    result = runner.invoke(app, ["init", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(app, [
+        "decision", "propose", "d1", "--content", "use postgres", "--json", "--path", str(git_repo),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload == {"proposal_id": payload["proposal_id"], "record_id": "d1", "status": "pending"}
+
+    result = runner.invoke(app, [
+        "constraint", "propose", "c1", "--content", "no bare except", "--severity", "MUST",
+        "--persistence-mode", "persistent", "--json", "--path", str(git_repo),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload == {"proposal_id": payload["proposal_id"], "record_id": "c1", "status": "pending"}
+
+    result = runner.invoke(app, [
+        "note", "add", "--category", "pitfall", "--content", "watch this", "--why-persist", "bit us once",
+        "--json", "--path", str(git_repo),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["category"] == "pitfall"

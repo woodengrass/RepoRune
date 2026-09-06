@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十四輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十六輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -54,8 +54,20 @@ compute_status()`，供 soft bootstrap 重用同一份計算而非另寫一份�
 發現第 6 節先前記錄的 hook 形狀與實際 API 不完全相符（沒有獨立的 `session.created`/
 `session.compacted`/`file.edited` hook key，而是單一 `event` hook 搭配 discriminated union；
 `tool.execute.before`/`tool.execute.after` 沒有帶 `directory`/`worktree`/`messageID`），且同一套件
-內存在第二套平行的「v2/effect」plugin API——這個落差尚未與使用者確認如何處理，第 6 節暫不更動，
-留待下一輪修訂。本文件與
+內存在第二套平行的「v2/effect」plugin API。**第十五輪跟使用者確認後修正第 6 節**：改用真實的
+`event` hook + discriminated union 描述 session 生命週期事件；`tool.execute.before`/`after` 缺少
+的 `directory`/`worktree` 改成在 `Plugin` 工廠函式的 `PluginInput` 只捕捉一次、透過閉包重用（CWD
+在單一 session 內不會變）；確認目標鎖定 classic `Hooks` interface，不投入時間探索 v2/effect API；
+custom tool 註冊的部分先前記錄本來就正確，不需修正。**第十六輪發現並解決第二層落差、完成 Milestone
+7 全量開發**：`tool.execute.before` 實際上完全無法注入文字（只能改自己的 tool 參數），型別定義裡
+唯一的 system-level 注入通道是 experimental 的 `experimental.chat.system.transform`；跟使用者確認
+後改用「每個 session 持續維護 hard bootstrap/active scopes/pending events 狀態、每次 LLM 呼叫前
+重新 render 整份 context、原地覆寫既有 system 字串而非新增陣列元素」的設計（細節見新第 6.1 節），
+`client.session.prompt({noReply:true})` 只留作未接入的降級 fallback。新增
+`adapters/opencode/src/{rune-context,plugin,tool-paths}.ts` 與對應的 `node:test` 測試（20 個全綠），
+`rune-cli.ts` 補上 `bootstrapHard`/`bootstrapSoft`/`decisionPropose`/`constraintPropose`/`noteAdd`/
+`changedFilesFromGitStatus`；CLI 端的 `decision propose`/`constraint propose`/`note add` 補上
+`--json` 輸出供 custom tool 使用（317 個 Python 測試全綠）。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -572,43 +584,67 @@ adapter 的查詢額外提供 `--json` 輸出（見第 6 節）。
 
 ## 6. OpenCode adapter 邊界（`adapters/opencode`）
 
-TypeScript，保持薄。**本輪已對照 OpenCode 官方 plugin 文件確認以下 hook 實際存在**：
-`session.created`/`session.updated`/`session.compacted`/`session.idle` 等 session event、
-`file.edited`/`file.watcher.updated`、`tool.execute.before`/`tool.execute.after`、custom tool
-註冊（context 帶 `sessionID`/`messageID`/`directory`/`worktree`）。Milestone 7 的核心假設成立，
-以下是根據這些真實 API 具體化的設計：
+TypeScript，保持薄。**第十四輪對照官方 `@opencode-ai/plugin` npm 套件（v1.18.29）的真實 TypeScript
+型別定義，修正先前幾輪憑官方文件描述、但實際跟型別不完全相符的部分**：早先版本以為
+`session.created`/`session.compacted`/`file.edited` 是各自獨立的 hook key，且 `tool.execute.before`
+的 input 帶 `directory`/`worktree`/`messageID`——兩者皆錯。真實 API 如下（`Hooks` interface，
+`index.d.ts`）：
 
-- **Session 開始**（`session.created`）：依序呼叫 `rune bootstrap --mode hard --json` 與
-  `rune bootstrap --mode soft --json`，分別注入 hard bootstrap（全域 MUST constraint + critical
-  global decision，見第 7 節）與 soft bootstrap（project overview、新鮮度判斷等）。不在此觸發昂貴的
-  `rune update`。
-- **Session compaction（`session.compacted`）視為「可能失憶事件」（本輪新增，見第 7 節）**：只重新呼叫
-  `rune bootstrap --mode hard --json` 並重新注入，**不**重新送出完整 soft bootstrap（避免浪費
-  token）。理由：不能假設 compaction 產生的摘要保留了所有 MUST constraint 的完整內容與權威性，
-  authoritative hard policy 永遠由 rune 重新送出，不依賴 agent 自己的 context compression 品質。
-- **Constraint delivery 的關鍵 hook 是 `tool.execute.before`，不是 `file.edited`**（本輪修正）：
-  agent 真正需要的是「碰某個檔案**之前**就看到 constraint」，`file.edited` 只在檔案已經被改完之後觸發，
-  時機太晚。流程：
+- **Session 生命週期事件走單一 `event` hook，不是分開的具名 hook**：`event?: (input: { event: Event
+  }) => Promise<void>`，`Event` 是 discriminated union（`@opencode-ai/sdk` 定義），本輪需要的三種：
+  `{type: "session.created", properties: {info: Session}}`（`Session.directory` 可用）、
+  `{type: "session.compacted", properties: {sessionID}}`（**沒有** `directory`）、
+  `{type: "session.idle", properties: {sessionID}}`（同樣沒有 `directory`）。Adapter 內用
+  `input.event.type` 做 switch 分派，不是註冊三個不同的 hook 函式。
+- **`tool.execute.before`/`tool.execute.after` 的 input 只有 `{tool, sessionID, callID}`
+  （`after` 多一個 `args`），沒有 `directory`/`worktree`/`messageID`**：這點先前記錄錯誤。**確認的
+  因應方式**：CWD 在單一 session 內不會變，所以 `directory`/`worktree` 改成在 `Plugin` 工廠函式收到
+  的 `PluginInput`（`(input, options) => Promise<Hooks>` 的 `input` 參數，型別裡本來就有
+  `directory`/`worktree`）**只在 plugin 載入時捕捉一次**，之後所有 hook（`event`/
+  `tool.execute.before`/`tool.execute.after`）透過閉包重用同一份，不需要每次 hook 呼叫都重新取得。
+- **Custom tool 註冊的部分先前記錄正確、本輪確認無需修正**：`tool()` 工廠回傳的 `ToolDefinition`
+  執行時拿到的 `ToolContext` 確實帶 `sessionID`/`messageID`/`agent`/`directory`/`worktree`，跟先前
+  ARCHITECTURE 記錄的一致。
+- **同一套件內還有第二套「v2/effect」plugin API**（`dist/v2/effect/plugin.d.ts`，建構在 `effect`
+  函式庫上），與這裡描述的「classic `Hooks` interface」並存。**本輪確認：目標鎖定 classic `Hooks`
+  interface**——它是先前 spike 已經驗證過的介面、看起來是文件化的穩定介面，v2/effect 目前未知是否
+  為穩定公開介面或仍在實驗階段，不投入時間先探索它。
+
+以下是根據上述真實 API 具體化的設計：
+
+- **Session 開始**（`event` hook 收到 `type: "session.created"`）：依序呼叫 `rune bootstrap --mode
+  hard --json` 與 `rune bootstrap --mode soft --json`，分別注入 hard bootstrap（全域 MUST
+  constraint + critical global decision，見第 7 節）與 soft bootstrap（project overview、新鮮度
+  判斷等）。不在此觸發昂貴的 `rune update`。
+- **Session compaction（`event` hook 收到 `type: "session.compacted"`）視為「可能失憶事件」（見第
+  7 節）**：只重新呼叫 `rune bootstrap --mode hard --json` 並重新注入，**不**重新送出完整 soft
+  bootstrap（避免浪費 token）。理由：不能假設 compaction 產生的摘要保留了所有 MUST constraint 的
+  完整內容與權威性，authoritative hard policy 永遠由 rune 重新送出，不依賴 agent 自己的 context
+  compression 品質。
+- **Constraint delivery 的關鍵 hook 是 `tool.execute.before`，不是 `file.edited`**：
+  agent 真正需要的是「碰某個檔案**之前**就看到 constraint」，`file.edited`（`event` hook 收到的另一
+  種 `type`）只在檔案已經被改完之後觸發，時機太晚。流程：
 
   ```text
   tool.execute.before
     → 依 input.tool 決定如何擷取受影響路徑：
-        read / edit / write → 直接從 tool 參數取得 path
-        apply_patch          → 解析 patchText 取得受影響路徑
+        read / edit / write → 直接從 output.args（tool 參數，pre-execution 可變）取得 path
+        apply_patch          → 解析 output.args 裡的 patchText 取得受影響路徑
         bash                  → V1 不嘗試精準解析 shell command（見下）
-    → 對每個路徑呼叫 `rune scope-for --path ... --json`（對應邏輯在 core，adapter 只呼叫）
+    → 對每個路徑呼叫 `rune scope-for --path ... --json`（對應邏輯在 core，adapter 只呼叫；`--path`
+      用 plugin 載入時捕捉的 `directory`，見上）
     → 若該 scope 在本 session 尚未注入過（`active_scope_ids` 快取，規格 §37）：
         注入 scope summary + MUST/SHOULD constraint + 相關 note
     → 放行 tool 執行（本 hook 不阻擋，只注入 context）
   ```
 
-  `bash` 的特殊處理（本輪新增）：**V1 不嘗試解析 shell command 語意**（可能間接修改任意數量的檔案，
-  精準解析的成本與可靠度都不划算）。改為在 `tool.execute.after` 用 `git diff`（或既有的
-  `file.watcher.updated` 事件）偵測 bash 執行後實際發生的檔案變動，事後才做 scope 對應與（若有新
+  `bash` 的特殊處理：**V1 不嘗試解析 shell command 語意**（可能間接修改任意數量的檔案，
+  精準解析的成本與可靠度都不划算）。改為在 `tool.execute.after` 用 `git diff`（`directory` 一樣沿用
+  plugin 載入時捕捉的值）偵測 bash 執行後實際發生的檔案變動，事後才做 scope 對應與（若有新
   scope 被觸及）注入——放棄「執行前精準攔截」，換取「執行後至少不漏掉變動」。
 - **Custom tool**：`decision_propose`／`constraint_propose`／`note_add` 註冊為 OpenCode custom
-  tool，直接呼叫 `rune decision-propose --json` 等 CLI 進入點，帶入 tool context 提供的
-  `sessionID`/`directory`/`worktree` 供 CLI 定位正確的 `.rune/`。
+  tool（`Hooks.tool` 欄位），直接呼叫 `rune decision-propose --json` 等 CLI 進入點，帶入
+  `ToolContext` 提供的 `sessionID`/`directory`/`worktree` 供 CLI 定位正確的 `.rune/`。
 
 **Hard bootstrap 的 dedup 機制不能沿用 `active_scope_ids`（本輪新增）**：同一 session 可能被 compact
 多次，每次 compaction 都必須重新注入 hard bootstrap（見第 7 節），但同一次 compaction 之後、下一次
@@ -658,10 +694,52 @@ current+visible 的 MUST/SHOULD constraint（INFO severity 不主動注入，見
 }
 ```
 
-`adapters/opencode/`（TypeScript，本輪新增最小骨架）的 `src/rune-cli.ts` 是 adapter 唯一允許呼叫
-`rune` CLI 的地方，`src/spike.ts` 模擬 `tool.execute.before` 的注入邏輯（含 `active_scope_ids`
-dedup：同一 scope 同一 session 只注入一次），已對照一個手工建立、有真實 scope/constraint/note 的
-暫存 repo 實際跑過，確認整條路徑可行。
+`adapters/opencode/` 的 `src/rune-cli.ts` 是 adapter 唯一允許呼叫 `rune` CLI 的地方（第十三輪 spike
+新增 `src/spike.ts` 模擬早期版本設計，已被下方第十六輪的真實 `src/plugin.ts` 取代）。
+
+### 6.1 注入機制（第十六輪，跟使用者確認後定案）——為什麼不是一次性訊息，而是持續重繪的 system block
+
+**`tool.execute.before` 本身無法注入任何文字**：對照真實型別定義（見上方第十五輪修正），這個 hook 的
+`output` 只有 `{args: any}`——可變的是「這個 tool 呼叫自己的參數」，不是任何形式的訊息或 context
+通道。這代表舊版設計（本輪之前）假設的「`tool.execute.before` 觸發時直接注入一則訊息」在真實 API
+下不成立。**型別定義裡唯一找得到的 system-level 注入通道是 `experimental.chat.system.transform`**
+（`(input: {sessionID?, model}, output: {system: string[]}) => Promise<void>`，每次呼叫 LLM 前都會
+執行一次）——標記 `experimental`，但目前是唯一選項。
+
+跟使用者確認後定案的機制，**不是單純的「一次性 queue，drain 後清空」，而是持續狀態＋每次重繪**：
+
+- **每個 session 維護一份持續狀態**（`RuneSessionContext`，`adapters/opencode/src/rune-context.ts`，
+  純邏輯、不依賴任何 OpenCode/CLI 型別，方便獨立單元測試）：
+  - `hard`：目前的 hard bootstrap（全域 MUST constraint + critical decision）——`session.created`
+    設定一次，**每次 `session.compacted` 整個替換**（不是疊加），確保 compaction 後永遠是最新一份。
+  - `activeScopes`：本 session 目前已觸及的 scope 集合，每個 scope 附完整 constraint/note——
+    `tool.execute.before`/`tool.execute.after`（bash 事後偵測）觸及新 scope 時加入，**不因
+    compaction 清空**（這點比舊版設計更安全：因為每次 LLM 呼叫都重繪整份 context，scope 的
+    constraint 不可能被 compaction 悄悄漏掉，不像舊版設計依賴「只注入一次」的訊息可能被 compaction
+    摘要掉）。
+  - `pendingEvents`：一次性佇列，目前只用來放 soft bootstrap（`session.created` 才 enqueue 一次，
+    compaction 不重新 enqueue，符合 §7.3「soft bootstrap 只在 session.created 注入一次」），render
+    後立刻清空，不重複出現。
+- **`experimental.chat.system.transform` 每次呼叫都重新 render 整份持續狀態**，用一組固定的
+  `<!-- rune-context:start/end -->` marker 包裹，`mergeRuneBlock()`
+  （同檔案）**原地覆寫**已存在的 marker 區塊，或附加到現有的最後一個 system 字串——**絕不對
+  `output.system` 陣列 push 新元素**（跟使用者確認：部分 OpenAI-compatible provider 會拒絕帶超過
+  一個 system-role 訊息的請求，見規格）。這保證：同一份 context 重繪 N 次，`system` 陣列長度不變、
+  不重複、也不會意外製造出第二個 system 角色訊息。
+- **`client.session.prompt({noReply: true})` 只保留為降級 fallback**（`adapters/opencode/src/
+  plugin.ts` 的 `injectViaPromptFallback`，型別已對照確認存在，**未對照真實 host 驗證過**，沒有
+  接入主要流程，只是留一個文件化但未啟用的備案）——如果未來發現 `experimental.chat.system.transform`
+  不可靠或被移除，才切換過去，V1 預設不用。
+
+`RuneSessionContext`／`mergeRuneBlock()` 是純邏輯，`adapters/opencode/src/rune-context.test.ts`
+用 Node 內建 `node:test` 涵蓋：全域 MUST 每次呼叫都在、scoped constraint 跨多次呼叫持續存在、
+`mergeRuneBlock` 不會重複累積、不會產生第二個 system 元素、pending event 只出現一次即清空、
+overflow 只加警告不丟規則。`adapters/opencode/src/plugin.test.ts` 用一個可替換的 `RuneClient`
+介面（不打真實 `rune` CLI）覆蓋同一組行為，外加 compaction 後 hard bootstrap 確實換新、以及不同
+session 之間狀態互不外洩。`extractPathsFromToolArgs()`（`tool-paths.ts`）從 `tool.execute.before`
+的 `output.args` 猜測 `filePath`/`path`/`file_path` 欄位名稱、`apply_patch` 解析
+`*** Add/Update/Delete File:` 標記——**這組欄位名稱未對照真實 host 驗證過**，猜錯的後果是「這次
+tool 呼叫沒有觸發任何 context 注入」（fail open，不是注入到錯的路徑）。
 
 ## 7. Global Code Standards / Hard-Soft Bootstrap（本輪新增，agent-injection semantics 的正式一部分）
 

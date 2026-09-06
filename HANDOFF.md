@@ -217,6 +217,26 @@ dedup 邏輯，確認可行——沒有連到真實 OpenCode host。303 個 Pyth
 給使用者、取得如何處理的決定**——這正是本專案「agent-injection semantics 變更需要先過 governance
 doc 確認」慣例本該攔住的情況。
 
+**Milestone 7（第三輪）：跟使用者確認兩層 API 落差後，全量開發完成**：見
+IMPLEMENTATION_PLAN.md「Milestone 7 開工」第 134-140 條、ARCHITECTURE.md §6.1（第十六輪）。使用者
+先確認了 hook 形狀落差的因應方式（改用真實 `event` hook、目標鎖定 classic `Hooks` interface）；
+開發過程中發現第二層更深的落差——`tool.execute.before` 其實完全沒有任何文字注入通道（只能改
+tool 自己的參數），型別定義裡唯一的 system-level 通道是 experimental 的
+`experimental.chat.system.transform`。使用者給了具體設計指示：**不是一次性 queue-drain**，改成
+每個 session 持續維護 hard bootstrap／active scopes／pending events 三桶狀態，每次 LLM 呼叫前
+重新 render 整份 context，**絕不對 `output.system` push 新元素**（部分 OpenAI-compatible provider
+拒絕多個 system-role 訊息）、原地覆寫既有 marker 區塊。新增 `adapters/opencode/src/
+{rune-context,plugin,tool-paths}.ts`（`rune-context.ts`/`tool-paths.ts` 是零 OpenCode/CLI 依賴的
+純邏輯，方便不 mock 整個 Hooks 介面就能測）與 `rune-cli.ts` 的六個新 wrapper；Python CLI
+`decision propose`/`constraint propose`/`note add` 補上 `--json` 供 custom tool 使用。**新增 20 個
+TypeScript regression test**（Node 內建 `node:test`，涵蓋使用者要求的六個場景：全域 MUST 每次呼叫
+都在、scoped constraint 跨呼叫持續存在、不重複累積、compaction 後確實換新、不產生第二個 system
+訊息、session 之間不互相洩漏）與 4 個 Python regression test。317 個 Python 測試全綠、20 個
+TypeScript 測試全綠、`tsc`/`ruff check` 全綠。**依然沒有連到真實 OpenCode host**（使用者本輪明確
+指示不需要）——`tool.execute.before` 參數欄位名稱的猜測、`experimental.chat.system.transform` 的
+實際執行時機，都只驗證到型別檢查通過，還沒驗證到真實行為，這是 Milestone 7 交付前最後需要用真實
+host 驗收的部分。
+
 ## 專案是什麼
 
 RepoRune（CLI/套件名：`rune`）= *Repository Understanding & Navigation Engine*。
@@ -293,7 +313,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
-| 7. OpenCode Adapter | 🚧 開工中（`rune bootstrap` 完成） | `rune scope-for`/`rune bootstrap --mode hard\|soft` 皆已完成並測試；session hook/`tool.execute.before`/custom tool 卡在真實 OpenCode plugin API 落差待使用者確認 |
+| 7. OpenCode Adapter | 🚧 全量開發完成，待真實 host 驗收 | `rune scope-for`/`rune bootstrap`/session hook/`tool.execute.before`/custom tool 皆已實作並有 20 個 TS + 4 個 Python 測試；未連過真實 OpenCode host（使用者指示本階段不需要） |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
@@ -348,10 +368,22 @@ src/rune/
 │        └─ materialize.py  # rebuild_cache()：整個系統唯一寫 SQLite 的地方
 ```
 
-**`adapters/opencode/`（Milestone 7，開工中）**——與 `src/rune/` 平行的頂層目錄，TypeScript，
-`package.json`/`tsconfig.json`（`strict: true`）、`src/rune-cli.ts`（唯一允許呼叫 `rune` CLI 的
-地方，`RUNE_CLI_PATH` 環境變數可覆寫供開發時指向 venv 的 `rune.exe`）、`src/spike.ts`（目前只有
-這一支手動跑過的 spike 腳本，`npm run spike -- <repo-dir> <file-path>`，還沒有自動化測試框架）。
+**`adapters/opencode/`（Milestone 7，全量開發完成，待真實 host 驗收）**——與 `src/rune/` 平行的
+頂層目錄，TypeScript，`package.json`/`tsconfig.json`（`strict: true`）：
+- `src/rune-cli.ts`——唯一允許呼叫 `rune` CLI 的地方（`RUNE_CLI_PATH` 環境變數可覆寫供開發時指向
+  venv 的 `rune.exe`）：`scopeFor`/`bootstrapHard`/`bootstrapSoft`/`decisionPropose`/
+  `constraintPropose`/`noteAdd`/`changedFilesFromGitStatus`。
+- `src/rune-context.ts`——零 OpenCode/CLI 依賴的純邏輯：`RuneSessionContext`（每個 session 持續
+  維護 hard bootstrap／active scopes／pending events 三桶狀態並 render 成文字）、
+  `mergeRuneBlock()`（原地覆寫 `<!-- rune-context:start/end -->` marker 區塊，絕不對
+  `output.system` push 新元素）。
+- `src/tool-paths.ts`——`extractPathsFromToolArgs()`：從 `tool.execute.before` 的 `output.args`
+  猜測受影響檔案路徑（未對照真實 host 驗證，fail open）。
+- `src/plugin.ts`——真正的 `Plugin`/`Hooks` 匯出：`event`（session.created/compacted）、
+  `tool.execute.before`/`.after`（scope activation + bash 事後偵測）、
+  `experimental.chat.system.transform`（注入機制本體）、`tool`（三個 custom tool）。
+- `src/spike.ts`——第十三輪 spike 遺留的手動腳本，已被 `plugin.ts` 取代，保留供對照。
+- `npm test`（`tsc` + Node 內建 `node:test`，20 個測試全綠）、`npm run build`。
 
 `tests/unit/`、`tests/integration/`（含 `fixtures/python-simple`、`fixtures/ts-simple` 兩個
 git-init 過的小型測試用 repo）。
@@ -478,17 +510,20 @@ IMPLEMENTATION_PLAN.md 第 132-133 條）：`core.retrieval.context` 的 `build_
 `build_soft_bootstrap`，hard 輸出超出 budget 時 `overflow=true`、絕不靜默丟棄 MUST 規則（有
 regression test 直接斷言），JSON 格式逐字對照 ARCHITECTURE §7.6。316 個測試全綠。
 
-**下一步卡在一個必須先跟使用者確認的落差，不能直接動手寫 TypeScript hook 程式碼**：裝了官方
-`@opencode-ai/plugin` npm 套件後，其真實型別定義顯示 ARCHITECTURE.md §6 記錄的 hook 形狀（獨立的
-`session.created`/`session.compacted`/`file.edited` hook key；`tool.execute.before` 帶
-`directory`/`worktree`）跟實際 API 不符（真實 API 是單一 `event` hook + discriminated union，
-`tool.execute.before` 只有 `{tool, sessionID, callID}` + 可變的 `args`），且同一套件內還有第二套
-平行的「v2/effect」plugin API，兩者該用哪一套尚未決定。**先把這個落差攤開給使用者，取得決定後
-再更新 ARCHITECTURE §6、才能繼續做** session-start/session-compaction hook（`hard_context_
-generation` 計數器要跟 `active_scope_ids` 分開維護，不可共用同一個旗標）、`tool.execute.before`
-掛 constraint delivery（`bash` 指令的特殊處理：V1 不嘗試解析 shell 語意，改在 `tool.execute.after`
-用 git diff 事後偵測；`scope-for` 已經做好，這部分只需要接上 dedup 快取跟實際的 hook 註冊）、
-custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`，這些底層 core 函式
-Milestone 6 已經做好，Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。開工前
-重讀 IMPLEMENTATION_PLAN.md 的 Milestone 7 整段（含驗收標準——規格明講是「V1 真正價值的驗證階段」，
-不可妥協）與 ARCHITECTURE.md §6-7。
+**Milestone 7 全量開發已完成**（見上方「Milestone 7（第三輪）」、IMPLEMENTATION_PLAN.md 第
+134-140 條、ARCHITECTURE.md §6.1）：兩層 API 落差都已跟使用者確認並落實——hook 形狀改用真實
+`event` hook、鎖定 classic `Hooks` interface；注入機制改用 `experimental.chat.system.transform` +
+每個 session 持續維護的三桶狀態（hard bootstrap／active scopes／pending events），絕不對
+`output.system` push 新元素。`session.created`/`session.compacted`/`tool.execute.before`/
+`tool.execute.after`（bash 事後偵測）/三個 custom tool（`decision_propose`/`constraint_propose`/
+`note_add`）全部實作完成，20 個 TypeScript 測試 + 4 個 Python 測試全綠。
+
+**下一步是用真實 OpenCode host 驗收**（`adapters/opencode/` 目前只驗證到「型別檢查通過、單元測試
+綠」，從未連過真實 host）：需要確認 (1) `extractPathsFromToolArgs()` 猜測的 `filePath`/`path`/
+`file_path` 參數欄位名稱是否命中真實內建 tool 的實際參數形狀（猜錯會 fail open，完全不注入，而不是
+注入到錯的路徑，但仍需要修正）；(2) `experimental.chat.system.transform` 是否真的在每次 LLM
+呼叫前執行、`output.system` 的實際生效方式是否符合預期（這是 experimental API，行為沒有型別定義
+之外的保證）；(3) `client.session.prompt({noReply:true})` fallback（`plugin.ts` 的
+`injectViaPromptFallback`，目前完全未接入）是否真的需要，或 `system.transform` 已經夠可靠。找到
+可用的 OpenCode 執行環境後，重讀 ARCHITECTURE.md §6/§6.1 與 IMPLEMENTATION_PLAN.md 第 134-140
+條，照著上面三點逐一驗證、修正落差、更新對應章節。

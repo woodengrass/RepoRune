@@ -89,3 +89,190 @@ export interface ScopeForResult {
 export async function scopeFor(directory: string, filePath: string): Promise<ScopeForResult> {
   return callRuneJson<ScopeForResult>(directory, ["scope-for", filePath]);
 }
+
+export interface HardBootstrapConstraint {
+  record_id: string;
+  severity: string;
+  content: string;
+  source_document: string | null;
+  source_section: string | null;
+}
+
+export interface HardBootstrapDecision {
+  record_id: string;
+  content: string;
+}
+
+export interface HardBootstrapResult {
+  mode: "hard";
+  constraints: HardBootstrapConstraint[];
+  decisions: HardBootstrapDecision[];
+  estimated_tokens: number;
+  budget_tokens: number;
+  overflow: boolean;
+}
+
+/** `rune bootstrap --mode hard --json --path <directory>` (ARCHITECTURE.md
+ * §7.3/§7.6). Called on session.created and every session.compacted. */
+export async function bootstrapHard(directory: string): Promise<HardBootstrapResult> {
+  return callRuneJson<HardBootstrapResult>(directory, ["bootstrap", "--mode", "hard"]);
+}
+
+export interface SoftBootstrapScope {
+  scope_id: string;
+  name: string;
+  description: string;
+  summary: string | null;
+}
+
+export interface SoftBootstrapDecision {
+  record_id: string;
+  content: string;
+}
+
+export interface SoftBootstrapResult {
+  mode: "soft";
+  project_name: string | null;
+  working_tree_fresh: boolean | null;
+  files_indexed: number;
+  symbols_indexed: number;
+  scopes: SoftBootstrapScope[];
+  decisions: SoftBootstrapDecision[];
+  estimated_tokens: number;
+  budget_tokens: number;
+  overflow: boolean;
+}
+
+/** `rune bootstrap --mode soft --json --path <directory>` -- called once,
+ * on session.created only (ARCHITECTURE.md §7.3: not resent on compaction). */
+export async function bootstrapSoft(directory: string): Promise<SoftBootstrapResult> {
+  return callRuneJson<SoftBootstrapResult>(directory, ["bootstrap", "--mode", "soft"]);
+}
+
+export interface ProposeResult {
+  proposal_id: string;
+  record_id: string;
+  status: string;
+}
+
+export interface DecisionProposeArgs {
+  record_id: string;
+  content: string;
+  rationale?: string;
+  scopes?: string[];
+  files?: string[];
+  symbols?: string[];
+  critical?: boolean;
+  source_document?: string;
+  source_section?: string;
+}
+
+/** `rune decision propose <record_id> --content ... --json --path <directory>`
+ * -- the `decision_propose` custom tool's only job is to shell out to this. */
+export async function decisionPropose(directory: string, args: DecisionProposeArgs): Promise<ProposeResult> {
+  const cliArgs = ["decision", "propose", args.record_id, "--content", args.content];
+  if (args.rationale) cliArgs.push("--rationale", args.rationale);
+  for (const s of args.scopes ?? []) cliArgs.push("--scope", s);
+  for (const f of args.files ?? []) cliArgs.push("--file", f);
+  for (const sym of args.symbols ?? []) cliArgs.push("--symbol", sym);
+  if (args.critical) cliArgs.push("--critical");
+  if (args.source_document) cliArgs.push("--source-document", args.source_document);
+  if (args.source_section) cliArgs.push("--source-section", args.source_section);
+  return callRuneJson<ProposeResult>(directory, cliArgs);
+}
+
+export interface ConstraintProposeArgs {
+  record_id: string;
+  content: string;
+  severity: "MUST" | "SHOULD" | "INFO";
+  persistence_mode: "persistent" | "scope_bound" | "source_bound" | "temporary";
+  rationale?: string;
+  scopes?: string[];
+  files?: string[];
+  symbols?: string[];
+  expires_at?: string;
+  source_document?: string;
+  source_section?: string;
+  machine_check_hint?: string;
+}
+
+/** `rune constraint propose <record_id> --content ... --severity ... --json
+ * --path <directory>` -- the `constraint_propose` custom tool's only job is
+ * to shell out to this. */
+export async function constraintPropose(directory: string, args: ConstraintProposeArgs): Promise<ProposeResult> {
+  const cliArgs = [
+    "constraint", "propose", args.record_id, "--content", args.content,
+    "--severity", args.severity, "--persistence-mode", args.persistence_mode,
+  ];
+  if (args.rationale) cliArgs.push("--rationale", args.rationale);
+  for (const s of args.scopes ?? []) cliArgs.push("--scope", s);
+  for (const f of args.files ?? []) cliArgs.push("--file", f);
+  for (const sym of args.symbols ?? []) cliArgs.push("--symbol", sym);
+  if (args.expires_at) cliArgs.push("--expires-at", args.expires_at);
+  if (args.source_document) cliArgs.push("--source-document", args.source_document);
+  if (args.source_section) cliArgs.push("--source-section", args.source_section);
+  if (args.machine_check_hint) cliArgs.push("--machine-check-hint", args.machine_check_hint);
+  return callRuneJson<ProposeResult>(directory, cliArgs);
+}
+
+export interface NoteAddArgs {
+  category: string;
+  content: string;
+  why_persist: string;
+  scopes?: string[];
+  files?: string[];
+  symbols?: string[];
+  importance?: number;
+  confidence?: number;
+  evidence?: string[];
+  expires_at?: string;
+}
+
+export interface NoteAddResult {
+  id: string;
+  category: string;
+}
+
+/** `rune note add --category ... --content ... --why-persist ... --json
+ * --path <directory>` -- the `note_add` custom tool's only job is to shell
+ * out to this. No approval gate on the rune side, so this writes immediately. */
+export async function noteAdd(directory: string, args: NoteAddArgs): Promise<NoteAddResult> {
+  const cliArgs = [
+    "note", "add", "--category", args.category, "--content", args.content,
+    "--why-persist", args.why_persist,
+  ];
+  for (const s of args.scopes ?? []) cliArgs.push("--scope", s);
+  for (const f of args.files ?? []) cliArgs.push("--file", f);
+  for (const sym of args.symbols ?? []) cliArgs.push("--symbol", sym);
+  if (args.importance !== undefined) cliArgs.push("--importance", String(args.importance));
+  if (args.confidence !== undefined) cliArgs.push("--confidence", String(args.confidence));
+  for (const e of args.evidence ?? []) cliArgs.push("--evidence", e);
+  if (args.expires_at) cliArgs.push("--expires-at", args.expires_at);
+  return callRuneJson<NoteAddResult>(directory, cliArgs);
+}
+
+/** Every file `git status --porcelain` reports as changed (modified,
+ * added, deleted, renamed, or untracked) relative to the working tree --
+ * used post-hoc after a `bash` tool call, since V1 deliberately never
+ * tries to parse shell command semantics to predict what a `bash` call
+ * will touch (ARCHITECTURE.md §6). Not `rune check`'s own diff (that
+ * compares against the last `rune update`, not "what did this one bash
+ * call just change") -- this needs "what changed very recently", which is
+ * exactly what `git status` reports regardless of whether `rune update`
+ * has run since.
+ */
+export async function changedFilesFromGitStatus(directory: string): Promise<string[]> {
+  const { stdout } = await execFileAsync(
+    "git", ["-C", directory, "status", "--porcelain=v1", "--untracked-files=all"],
+    { encoding: "utf-8" },
+  );
+  const paths: string[] = [];
+  for (const line of stdout.split("\n")) {
+    if (line.length < 4) continue;
+    // porcelain v1: "XY path" or "XY orig -> path" for renames.
+    const rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    paths.push(arrow === -1 ? rest.trim() : rest.slice(arrow + 4).trim());
+  }
+  return paths;
+}

@@ -6,13 +6,16 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "spike": "tsc -p tsconfig.json && node dist/spike.js"
+    "spike": "tsc -p tsconfig.json && node dist/spike.js",
+    "test": "tsc -p tsconfig.json && node --test dist/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.29"
+    "@opencode-ai/plugin": "^1.18.29",
+    "@opencode-ai/sdk": "1.18.29",
+    "zod": "4.1.8"
   }
 }

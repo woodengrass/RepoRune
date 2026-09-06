@@ -487,6 +487,7 @@ def decision_propose(
     source_document: str | None = typer.Option(None, "--source-document"),
     source_section: str | None = typer.Option(None, "--source-section"),
     created_by: str = typer.Option("agent", "--created-by", help="'agent' or 'human'."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output (e.g. for an adapter custom tool)."),
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Propose a new Decision. Sits pending until `rune proposal approve`."""
@@ -502,6 +503,11 @@ def decision_propose(
     except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
+    if json_output:
+        typer.echo(json_module.dumps(
+            {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
+        ))
+        return
     typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
 
 
@@ -557,6 +563,7 @@ def constraint_propose(
     source_section: str | None = typer.Option(None, "--source-section"),
     machine_check_hint: str | None = typer.Option(None, "--machine-check-hint"),
     created_by: str = typer.Option("agent", "--created-by", help="'agent' or 'human'."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output (e.g. for an adapter custom tool)."),
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Propose a new Constraint. Sits pending until `rune proposal approve` --
@@ -575,6 +582,11 @@ def constraint_propose(
     except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
+    if json_output:
+        typer.echo(json_module.dumps(
+            {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
+        ))
+        return
     typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
 
 
@@ -627,6 +639,7 @@ def note_add_cmd(
     evidence: list[str] = typer.Option([], "--evidence"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
     source: str = typer.Option("agent", "--source", help="'agent' or 'human'."),
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable output (e.g. for an adapter custom tool)."),
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Add a new Note. No approval gate -- writes immediately."""
@@ -645,6 +658,9 @@ def note_add_cmd(
     except (NotAGitRepoError, _MissingLayoutError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
+    if json_output:
+        typer.echo(json_module.dumps({"id": note.id, "category": note.category.value}))
+        return
     typer.echo(f"Added note {note.id} ({note.category.value})")
 
 

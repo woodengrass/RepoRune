@@ -1863,7 +1863,63 @@ session-start/session-compaction hook、`tool.execute.before` 掛 constraint del
 新增 13 個測試（`tests/integration/test_retrieval_context.py` 12 個、`tests/unit/test_cli.py` 1 個
 CLI JSON round-trip，涵蓋 hard/soft 兩種 mode）。316 個 Python 測試全綠，`ruff check` 全綠。
 
-**尚未開始**：session-start/session-compaction hook（呼叫這裡新增的 `rune bootstrap`）、
-`tool.execute.before` 掛 constraint delivery（含 `bash` 的事後偵測）、custom tool 註冊
-（`decision_propose`/`constraint_propose`/`note_add`）——這幾項全部卡在 OpenCode 真實 plugin API
-與 ARCHITECTURE.md §6 既有設計之間發現的落差，見下一輪修訂前必須先跟使用者確認的問題。
+**尚未開始（此輪結束時）**：session-start/session-compaction hook（呼叫這裡新增的
+`rune bootstrap`）、`tool.execute.before` 掛 constraint delivery（含 `bash` 的事後偵測）、
+custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`）——這幾項全部卡在 OpenCode
+真實 plugin API 與 ARCHITECTURE.md §6 既有設計之間發現的落差，見下一輪修訂前必須先跟使用者確認的
+問題。
+
+### 第三輪修訂（跟使用者確認兩層 API 落差後，完成 Milestone 7 全量開發）
+
+134. **確認 hook 形狀落差的因應方式與目標 API 介面**：使用者選擇「改用真實的 `event` hook +
+    discriminated union」與「目標鎖定 classic `Hooks` interface（不投入時間探索 v2/effect API）」。
+    細節見 ARCHITECTURE.md §6 第十五輪修訂。
+135. **開發過程中發現第二層更深的落差、進一步跟使用者確認**：`tool.execute.before` 真實型別的
+    `output` 只有 `{args: any}`——完全沒有任何形式的文字/訊息注入通道，只能修改「這次 tool 呼叫
+    自己的參數」。型別定義裡唯一的 system-level 注入通道是標記為 experimental 的
+    `experimental.chat.system.transform`（`output: {system: string[]}`，每次 LLM 呼叫前執行）。
+    使用者給出具體設計指示：**不要做成一次性 queue-drain**，改成每個 session 持續維護狀態（hard
+    bootstrap／active scopes／pending events 三個桶），`system.transform` 每次都重新 render 整份
+    狀態；**絕不對 `output.system` push 新元素**（部分 OpenAI-compatible provider 拒絕多個
+    system-role 訊息），改成原地覆寫既有 marker 區塊或附加到最後一個既有字串；
+    `client.session.prompt({noReply:true})` 只留作未接入的降級 fallback，不是 V1 主要機制。細節
+    與完整設計理由見 ARCHITECTURE.md §6.1（第十六輪）。
+136. **`adapters/opencode/src/rune-context.ts`（新模組，純邏輯、零 OpenCode/CLI 依賴）**：
+    `RuneSessionContext` 類別（`setHardBootstrap`/`addActiveScope`/`enqueuePendingEvent`/`render`）
+    + `mergeRuneBlock()`（`<!-- rune-context:start/end -->` marker 原地覆寫邏輯）+
+    `renderSoftBootstrap()`。刻意設計成不依賴任何 OpenCode 型別或 `rune` CLI，純粹是「拿到 rune
+    回傳的結構化資料 -> 渲染成文字」，方便獨立單元測試而不需要 mock 整個 Hooks/PluginInput 介面。
+137. **`adapters/opencode/src/plugin.ts`（新模組，真正的 `Plugin` 匯出）**：`createRuneHooks()`
+    接受一個可替換的 `RuneClient` 介面（`scopeFor`/`bootstrapHard`/`bootstrapSoft`/
+    `changedFilesFromGitStatus`），生產環境用真的 CLI-backed 實作，測試用假的——這個介面切分純粹
+    是為了讓 `plugin.test.ts` 不用打真實 `rune` CLI 就能測 hook 邏輯。實作 `event`（session.created
+    seed hard+soft bootstrap，session.compacted 只重新 seed hard bootstrap）、`tool.execute.before`
+    （非 bash：從 `extractPathsFromToolArgs` 取路徑，呼叫 `scope-for` 累加進 active scopes）、
+    `tool.execute.after`（bash：`git status --porcelain` 事後偵測變動檔案，同樣累加進 active
+    scopes）、`experimental.chat.system.transform`（render 目前狀態、`mergeRuneBlock` 寫入）、
+    `tool`（`decision_propose`/`constraint_propose`/`note_add` 三個 custom tool，直接呼叫對應
+    CLI）。`injectViaPromptFallback()` 文件化但未接入主流程。
+138. **`adapters/opencode/src/tool-paths.ts`（新模組，純邏輯）**：`extractPathsFromToolArgs()`
+    從 `tool.execute.before` 的 `output.args` 猜測 `filePath`/`path`/`file_path` 欄位名、
+    `apply_patch` 解析 `*** Add/Update/Delete File:` 標記。**這組欄位名稱沒有真實 OpenCode host
+    可以驗證**（使用者本輪明確指示不需要驗證），刻意 fail open：猜錯欄位名的後果是「這次 tool 呼叫
+    沒有觸發任何 context 注入」，不是注入到錯的路徑——比默默用錯路徑安全。
+139. **`rune-cli.ts` 補齊 `bootstrapHard`/`bootstrapSoft`/`decisionPropose`/`constraintPropose`/
+    `noteAdd`/`changedFilesFromGitStatus` 六個新的 CLI wrapper**，對照 Python CLI 的實際旗標
+    （`rune bootstrap --mode hard|soft`、`rune decision propose ... --json`、`rune constraint
+    propose ... --json`、`rune note add ... --json`）。
+140. **Python CLI 端補上三個 `--json` 旗標**：`decision propose`/`constraint propose`/`note add`
+    先前只有人類可讀輸出，custom tool 需要拿到 `proposal_id`/`record_id`/`status`（或
+    note 的 `id`/`category`）才能回報給 agent，本輪各自加一個 `--json`，輸出格式跟其餘 CLI 命令的
+    `--json` 慣例一致。
+
+新增 20 個 TypeScript 測試（`rune-context.test.ts` 11 個、`plugin.test.ts` 6 個、
+`tool-paths.test.ts` 5 個，Node 內建 `node:test`，`adapters/opencode` 下 `npm test`
+執行）涵蓋使用者明確要求的六個場景：全域 MUST 每次 LLM 呼叫都在、scoped constraint 跨呼叫持續存在、
+不重複累積 Rune block、compaction 後 hard bootstrap 確實換新、不產生第二個 system 訊息、不同
+session 狀態互不外洩。新增 4 個 Python regression test（三個 `--json` 旗標的 CLI round-trip）。
+317 個 Python 測試全綠、`ruff check` 全綠；20 個 TypeScript 測試全綠、`tsc` 編譯無錯誤。**依然沒有
+連到真實 OpenCode host**（使用者本輪明確指示不需要）——`extractPathsFromToolArgs` 的參數欄位名稱、
+`experimental.chat.system.transform` 的實際行為（是否真的每次呼叫前執行、`output.system` 的實際
+用法）都只驗證到「型別檢查通過」，沒有驗證到「真的在 OpenCode 裡跑起來符合預期」，這是 Milestone 7
+交付前最後需要用真實 host 驗收的部分。
