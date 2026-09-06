@@ -13,6 +13,7 @@ from rune.core.memory.revisions import current_revision
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_jsonl
 from rune.core.storage.models import MemoryRevision, Note, RecordType
+from rune.core.storage.sqlite.materialize import read_current_code_index, rebuild_cache
 
 
 def _group_by_id[T](records: list[T], id_field: str) -> dict[str, list[T]]:
@@ -57,3 +58,28 @@ def load_current_constraints(layout: RuneLayout) -> dict[str, MemoryRevision]:
 
 def load_current_notes(layout: RuneLayout) -> dict[str, Note]:
     return current_by_note_id(read_jsonl(layout.notes_jsonl, Note))
+
+
+def refresh_cache(layout: RuneLayout) -> None:
+    """Re-materializes `memory.db` from the current canonical files right
+    after a single decision/constraint/note write, so `rune search`/
+    `rune check` see it without waiting for the next `rune update`
+    (confirmed with the user: SQLite being a derived cache that only
+    refreshes on `rune update` meant a just-approved Decision/Constraint
+    or a just-added Note was invisible to search for the rest of the
+    session, since the Milestone 7 OpenCode adapter deliberately never
+    auto-triggers a full `rune update` on every tool call).
+
+    Deliberately NOT the same cost as `rune update`: this reuses
+    `read_current_code_index` (the already-materialized files/symbols/
+    edges) instead of re-scanning and re-parsing the source tree, so it's
+    a plain "re-read every canonical file, re-run the existing single
+    SQLite transaction" pass -- the same work `rune rebuild-cache` does,
+    minus the scan. Safe to call after every propose/approve/note write;
+    if it fails (e.g. a canonical conflict), the canonical write that
+    already happened stands and the cache simply stays behind until the
+    next successful `rune update`/`rebuild-cache` -- consistent with
+    every other place in this project where the derived cache is allowed
+    to lag behind canonical without corrupting anything.
+    """
+    rebuild_cache(layout, code_index=read_current_code_index(layout))

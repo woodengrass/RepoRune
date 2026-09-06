@@ -231,8 +231,12 @@ CREATE TABLE IF NOT EXISTS semantic_run_metrics (
 );
 
 -- FTS5 (rebuilt in full on every materialize pass)
+-- fts_decisions/fts_constraints/fts_notes index EVERY revision, not just
+-- current (the `revision` column lets a query tell which one a hit is --
+-- `rune search --history` needs to find a superseded revision's own text,
+-- which the current revision's row would never contain).
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_semantic USING fts5(scope_id UNINDEXED, text);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_decisions USING fts5(record_id UNINDEXED, text);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_constraints USING fts5(record_id UNINDEXED, text);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(note_id UNINDEXED, text);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_decisions USING fts5(record_id UNINDEXED, revision UNINDEXED, text);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_constraints USING fts5(record_id UNINDEXED, revision UNINDEXED, text);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(note_id UNINDEXED, revision UNINDEXED, text);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_symbols USING fts5(symbol_id UNINDEXED, text);

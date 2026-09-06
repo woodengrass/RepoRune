@@ -14,12 +14,12 @@ of freshness instead of introducing a second, subtly different one.
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass, field
 
 from rune.core.config import load_config
 from rune.core.index.scanner import diff_against_previous, scan_files
 from rune.core.project import RuneLayout
+from rune.core.storage.sqlite.materialize import connect_for_read
 
 _VISIBLE_CONSTRAINT_STATUSES = {"active", "review_required", "stale"}
 
@@ -31,6 +31,8 @@ class RelevantConstraint:
     severity: str
     status: str
     scope_ids: list[str]
+    # [] for a global constraint (DATA_MODEL.md §3: scopes==[] is exactly
+    # what "global" means -- there's no scope to list).
 
 
 @dataclass(frozen=True)
@@ -47,8 +49,7 @@ def check(layout: RuneLayout) -> CheckResult:
     config = load_config(layout.config_path)
     scanned = scan_files(layout.repo_root, config.index)
 
-    conn = sqlite3.connect(str(layout.memory_db))
-    conn.row_factory = sqlite3.Row
+    conn = connect_for_read(layout)
     try:
         previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
         changeset = diff_against_previous(scanned, previous_hashes)
@@ -98,7 +99,36 @@ def check(layout: RuneLayout) -> CheckResult:
                     status=row["status"], scope_ids=sorted(scope_ids),
                 )
             )
-        constraints.sort(key=lambda c: (c.severity != "MUST", c.record_id))
+
+        # Global MUST constraints (scopes == []) are relevant to any
+        # change, not just ones touching a specific scope -- confirmed
+        # with the user: `rune check` should include the *current*
+        # global MUST rules rather than leaving them only discoverable
+        # via `rune search`/hard bootstrap, since "any change" is exactly
+        # the condition a global MUST rule is scoped to apply to.
+        global_rows = conn.execute(
+            "SELECT r.record_id, v.status, v.content, v.severity "
+            "FROM constraint_records r "
+            "JOIN constraint_revisions v "
+            "  ON v.record_id = r.record_id AND v.revision = r.current_revision "
+            "WHERE v.severity = 'MUST' "
+            "  AND v.status IN ('active', 'review_required', 'stale') "
+            "  AND NOT EXISTS ("
+            "    SELECT 1 FROM constraint_scopes cs "
+            "    WHERE cs.record_id = r.record_id AND cs.revision = r.current_revision"
+            "  )"
+        ).fetchall()
+        for row in global_rows:
+            if row["record_id"] in seen:
+                continue  # already listed as scoped (shouldn't happen for a truly global one, but avoid dupes)
+            constraints.append(
+                RelevantConstraint(
+                    record_id=row["record_id"], content=row["content"], severity=row["severity"],
+                    status=row["status"], scope_ids=[],
+                )
+            )
+
+        constraints.sort(key=lambda c: (c.severity != "MUST", not c.scope_ids, c.record_id))
 
         return CheckResult(
             changed_files=changed_files,

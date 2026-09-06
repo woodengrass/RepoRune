@@ -50,6 +50,19 @@ class CanonicalConflictError(Exception):
     """
 
 
+class CacheUnusableError(Exception):
+    """Raised by `connect_for_read` when `memory.db` exists but isn't a
+    usable rune cache -- 0 bytes, truncated, or otherwise not opening as
+    the expected schema (`sqlite3.DatabaseError`, which `OperationalError`
+    is a subclass of, covers "file is not a database" and "no such
+    table" alike). Confirmed by hand: `rune search`/`rune check` against a
+    0-byte `memory.db` previously surfaced a raw `sqlite3.OperationalError`
+    traceback instead of a message telling the user what to do. The fix
+    is `rune rebuild-cache` -- memory.db is always safe to discard and
+    regenerate from canonical + a fresh scan.
+    """
+
+
 def _schema_sql_text() -> str:
     return (
         resources.files("rune.core.storage.sqlite")
@@ -76,6 +89,29 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_for_read(layout: RuneLayout) -> sqlite3.Connection:
+    """Read-only-in-spirit connection for `rune search`/`rune check`
+    (readers never write to `memory.db`): opens the file and confirms
+    it's actually a usable rune cache before handing it back, rather than
+    letting a 0-byte or truncated file surface a raw `sqlite3.
+    OperationalError` traceback the first time a query touches a missing
+    table. Raises `CacheUnusableError` (not the underlying sqlite3
+    exception) so callers can give the user an actionable message instead
+    of a stack trace.
+    """
+    conn = sqlite3.connect(str(layout.memory_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise CacheUnusableError(
+            f"{layout.memory_db} exists but isn't a usable cache ({exc}). "
+            "Run `rune rebuild-cache` to regenerate it."
+        ) from exc
+    return conn
+
+
 def create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_schema_sql_text())
 
@@ -99,7 +135,13 @@ def create_schema(conn: sqlite3.Connection) -> None:
 # a version mismatch is handled the exact same safe way `rune
 # rebuild-cache` already promises — discard and rebuild fresh — just
 # triggered without the user needing to know to do it themselves.
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
+# Bumped for Milestone 6's review round: fts_decisions/fts_constraints/
+# fts_notes gained a `revision` column (index every revision, not just
+# current) so `rune search --history` can actually find a superseded
+# revision's own text -- an old-shape memory.db without that column would
+# make `_materialize_fts`'s INSERT fail with `OperationalError: table
+# fts_decisions has 2 columns but 3 values were supplied`.
 
 
 def _discard_cache_file(db_path: Path) -> None:
@@ -334,11 +376,18 @@ def _materialize_fts(
     they are NOT covered by `_clear_all_content`'s cascading deletes --
     they must be cleared and repopulated here explicitly, same "full
     rebuild every time" contract as everything else in this function.
-    Only *current* revisions are indexed (regardless of status/
-    visibility): `core.retrieval.search` filters visibility at query
-    time, not at index time, so a search covers everything current, and
-    a non-visible hit (e.g. `orphaned`) simply gets ranked/labeled
-    accordingly rather than being invisible to FTS entirely.
+
+    `fts_decisions`/`fts_constraints`/`fts_notes` index **every**
+    revision, not just current, each row carrying its own `revision`
+    number: DATA_MODEL.md §3 promises "history 模式可看到全部 revision",
+    which needs a superseded revision's own text to be findable at all --
+    indexing only the current revision (as this used to do) meant
+    `rune search --history` could never find a Decision that read
+    "use redis" in revision 1 before being replaced by "use postgres" in
+    revision 2, because "redis" was never in the FTS index to begin with.
+    `core.retrieval.search` decides current-vs-historical (and thus
+    visibility/rank) per hit by comparing the row's `revision` against
+    the record's `current_revision`, not at index time.
     """
     conn.execute("DELETE FROM fts_decisions;")
     conn.execute("DELETE FROM fts_constraints;")
@@ -347,23 +396,23 @@ def _materialize_fts(
     conn.execute("DELETE FROM fts_symbols;")
 
     for record_id, revs in _group_current_by_id(decisions, "record_id", "decisions.jsonl").items():
-        current = revs[-1]
-        conn.execute(
-            "INSERT INTO fts_decisions (record_id, text) VALUES (?, ?)",
-            (record_id, f"{current.content}\n{current.rationale}"),
-        )
+        for rev in revs:
+            conn.execute(
+                "INSERT INTO fts_decisions (record_id, revision, text) VALUES (?, ?, ?)",
+                (record_id, rev.revision, f"{rev.content}\n{rev.rationale}"),
+            )
     for record_id, revs in _group_current_by_id(constraints, "record_id", "constraints.jsonl").items():
-        current = revs[-1]
-        conn.execute(
-            "INSERT INTO fts_constraints (record_id, text) VALUES (?, ?)",
-            (record_id, f"{current.content}\n{current.rationale}"),
-        )
+        for rev in revs:
+            conn.execute(
+                "INSERT INTO fts_constraints (record_id, revision, text) VALUES (?, ?, ?)",
+                (record_id, rev.revision, f"{rev.content}\n{rev.rationale}"),
+            )
     for note_id, revs in _group_current_by_id(notes, "id", "notes.jsonl").items():
-        current = revs[-1]
-        conn.execute(
-            "INSERT INTO fts_notes (note_id, text) VALUES (?, ?)",
-            (note_id, f"{current.content}\n{current.why_persist}"),
-        )
+        for rev in revs:
+            conn.execute(
+                "INSERT INTO fts_notes (note_id, revision, text) VALUES (?, ?, ?)",
+                (note_id, rev.revision, f"{rev.content}\n{rev.why_persist}"),
+            )
     for scope_id, summary in current_scope_summaries(semantic).items():
         conn.execute(
             "INSERT INTO fts_semantic (scope_id, text) VALUES (?, ?)", (scope_id, summary.purpose)

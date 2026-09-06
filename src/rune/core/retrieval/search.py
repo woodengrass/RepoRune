@@ -24,6 +24,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from rune.core.project import RuneLayout
+from rune.core.storage.sqlite.materialize import CacheUnusableError, connect_for_read
 
 RANK_GLOBAL_MUST = 1
 RANK_SCOPED_MUST = 2
@@ -47,6 +48,12 @@ class SearchResult:
     text: str
     status: str
     warning: str | None = None
+    revision: int = 0
+    # The revision this hit came from; 0 for semantic (not revision-
+    # addressed the same way). A `warning="superseded"` result's
+    # `revision` is NOT the record's current revision -- see
+    # `_search_decisions` for why that distinction matters for
+    # `--history`.
 
 
 def _fts_phrase(query: str) -> str:
@@ -60,25 +67,28 @@ def _fts_phrase(query: str) -> str:
     return '"' + query.replace('"', '""') + '"'
 
 
-def _connect(layout: RuneLayout) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(layout.memory_db))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def search(layout: RuneLayout, query: str, *, history: bool = False, limit: int = 50) -> list[SearchResult]:
     """Runs `query` against every FTS5 index and returns matches sorted by
     rank (ascending -- rank 1 first), then by id for a stable order within
-    a rank. `history=True` additionally includes non-visible current
-    revisions (`inactive`/`orphaned` Decisions/Constraints,
-    `expired`/`orphaned`/`archived` Notes) at `RANK_HISTORICAL`, still
-    only the current revision of each record -- this is not a full
-    audit/every-revision dump, just "show me things a default search
-    hides".
+    a rank.
+
+    `history=True` additionally includes:
+    - non-visible *current* revisions (`inactive`/`orphaned` Decisions/
+      Constraints, `expired`/`orphaned`/`archived` Notes), and
+    - a **superseded** revision whose own text matches but whose record's
+      current revision doesn't (DATA_MODEL.md §3: "history 模式可看到全部
+      revision" -- e.g. a Decision that said "use redis" in revision 1,
+      replaced by "use postgres" in revision 2, must still be findable by
+      searching "redis" in history mode, even though "redis" appears
+      nowhere in the current revision's text).
+
+    Raises `CacheUnusableError` if `memory.db` exists but isn't openable
+    as a real cache (0 bytes, truncated); returns `[]` if it doesn't
+    exist at all (nothing has been indexed yet, not an error).
     """
     if not layout.memory_db.exists():
         return []
-    conn = _connect(layout)
+    conn = connect_for_read(layout)
     try:
         phrase = _fts_phrase(query)
         results: list[SearchResult] = []
@@ -94,24 +104,32 @@ def search(layout: RuneLayout, query: str, *, history: bool = False, limit: int 
 
 def _search_decisions(conn: sqlite3.Connection, phrase: str, history: bool) -> list[SearchResult]:
     rows = conn.execute(
-        "SELECT r.record_id, v.status, v.content "
+        "SELECT f.record_id AS record_id, f.revision AS hit_revision, "
+        "       r.current_revision AS current_revision, v.status AS status, v.content AS content "
         "FROM fts_decisions f "
         "JOIN decision_records r ON r.record_id = f.record_id "
-        "JOIN decision_revisions v ON v.record_id = r.record_id AND v.revision = r.current_revision "
+        "JOIN decision_revisions v ON v.record_id = f.record_id AND v.revision = f.revision "
         "WHERE fts_decisions MATCH ?",
         (phrase,),
     ).fetchall()
     out: list[SearchResult] = []
     for row in rows:
-        visible = row["status"] in _DECISION_VISIBLE
-        if not visible and not history:
-            continue
-        warning = "review_required" if row["status"] == "review_required" else None
-        rank = RANK_ACTIVE_DECISION if visible else RANK_HISTORICAL
+        is_current = row["hit_revision"] == row["current_revision"]
+        if is_current:
+            visible = row["status"] in _DECISION_VISIBLE
+            if not visible and not history:
+                continue
+            warning = "review_required" if row["status"] == "review_required" else None
+            rank = RANK_ACTIVE_DECISION if visible else RANK_HISTORICAL
+        else:
+            if not history:
+                continue
+            warning = "superseded"
+            rank = RANK_HISTORICAL
         out.append(
             SearchResult(
                 kind="decision", rank=rank, id=row["record_id"], text=row["content"],
-                status=row["status"], warning=warning,
+                status=row["status"], warning=warning, revision=row["hit_revision"],
             )
         )
     return out
@@ -119,31 +137,40 @@ def _search_decisions(conn: sqlite3.Connection, phrase: str, history: bool) -> l
 
 def _search_constraints(conn: sqlite3.Connection, phrase: str, history: bool) -> list[SearchResult]:
     rows = conn.execute(
-        "SELECT r.record_id, v.status, v.content, v.severity, "
-        "  EXISTS(SELECT 1 FROM constraint_scopes cs WHERE cs.record_id = r.record_id "
-        "         AND cs.revision = r.current_revision) AS is_scoped "
+        "SELECT f.record_id AS record_id, f.revision AS hit_revision, "
+        "       r.current_revision AS current_revision, v.status AS status, v.content AS content, "
+        "       v.severity AS severity, "
+        "       EXISTS(SELECT 1 FROM constraint_scopes cs WHERE cs.record_id = f.record_id "
+        "              AND cs.revision = f.revision) AS is_scoped "
         "FROM fts_constraints f "
         "JOIN constraint_records r ON r.record_id = f.record_id "
-        "JOIN constraint_revisions v ON v.record_id = r.record_id AND v.revision = r.current_revision "
+        "JOIN constraint_revisions v ON v.record_id = f.record_id AND v.revision = f.revision "
         "WHERE fts_constraints MATCH ?",
         (phrase,),
     ).fetchall()
     out: list[SearchResult] = []
     for row in rows:
-        visible = row["status"] in _CONSTRAINT_VISIBLE
-        if not visible and not history:
-            continue
-        warning = row["status"] if row["status"] in ("review_required", "stale") else None
-        if not visible:
-            rank = RANK_HISTORICAL
-        elif row["severity"] == "MUST":
-            rank = RANK_GLOBAL_MUST if not row["is_scoped"] else RANK_SCOPED_MUST
+        is_current = row["hit_revision"] == row["current_revision"]
+        if is_current:
+            visible = row["status"] in _CONSTRAINT_VISIBLE
+            if not visible and not history:
+                continue
+            warning = row["status"] if row["status"] in ("review_required", "stale") else None
+            if not visible:
+                rank = RANK_HISTORICAL
+            elif row["severity"] == "MUST":
+                rank = RANK_GLOBAL_MUST if not row["is_scoped"] else RANK_SCOPED_MUST
+            else:
+                rank = RANK_SHOULD_CONSTRAINT
         else:
-            rank = RANK_SHOULD_CONSTRAINT
+            if not history:
+                continue
+            warning = "superseded"
+            rank = RANK_HISTORICAL
         out.append(
             SearchResult(
                 kind="constraint", rank=rank, id=row["record_id"], text=row["content"],
-                status=row["status"], warning=warning,
+                status=row["status"], warning=warning, revision=row["hit_revision"],
             )
         )
     return out
@@ -195,28 +222,40 @@ def _search_semantic(conn: sqlite3.Connection, phrase: str) -> list[SearchResult
 
 def _search_notes(conn: sqlite3.Connection, phrase: str, history: bool) -> list[SearchResult]:
     rows = conn.execute(
-        "SELECT r.id, v.status, v.content FROM fts_notes f "
+        "SELECT f.note_id AS note_id, f.revision AS hit_revision, "
+        "       r.current_revision AS current_revision, v.status AS status, v.content AS content "
+        "FROM fts_notes f "
         "JOIN note_records r ON r.id = f.note_id "
-        "JOIN note_revisions v ON v.id = r.id AND v.revision = r.current_revision "
+        "JOIN note_revisions v ON v.id = f.note_id AND v.revision = f.revision "
         "WHERE fts_notes MATCH ?",
         (phrase,),
     ).fetchall()
     out: list[SearchResult] = []
     for row in rows:
-        visible = row["status"] in _NOTE_VISIBLE
-        if not visible and not history:
-            continue
-        warning = "[STALE]" if row["status"] == "stale" else None
-        if not visible:
-            rank = RANK_HISTORICAL
-        elif row["status"] == "stale":
-            rank = RANK_STALE_NOTE
+        is_current = row["hit_revision"] == row["current_revision"]
+        if is_current:
+            visible = row["status"] in _NOTE_VISIBLE
+            if not visible and not history:
+                continue
+            warning = "[STALE]" if row["status"] == "stale" else None
+            if not visible:
+                rank = RANK_HISTORICAL
+            elif row["status"] == "stale":
+                rank = RANK_STALE_NOTE
+            else:
+                rank = RANK_FRESH_NOTE
         else:
-            rank = RANK_FRESH_NOTE
+            if not history:
+                continue
+            warning = "superseded"
+            rank = RANK_HISTORICAL
         out.append(
             SearchResult(
-                kind="note", rank=rank, id=row["id"], text=row["content"],
-                status=row["status"], warning=warning,
+                kind="note", rank=rank, id=row["note_id"], text=row["content"],
+                status=row["status"], warning=warning, revision=row["hit_revision"],
             )
         )
     return out
+
+
+__all__ = ["CacheUnusableError", "SearchResult", "possibly_stale_pointer", "search"]

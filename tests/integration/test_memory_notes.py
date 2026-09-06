@@ -80,3 +80,69 @@ def test_note_update_nonexistent_id_raises(git_repo: Path) -> None:
     layout = init_project(git_repo)
     with pytest.raises(NoteNotFoundError):
         note_update(layout, "nope", content="x")
+
+
+def test_note_add_temporary_context_gets_default_ttl_from_config(git_repo: Path) -> None:
+    """IMPLEMENTATION_PLAN.md's Milestone 6 deliverable ("依 category 有
+    TTL"): a temporary_context Note written without an explicit
+    --expires-at must still get one, from `config.notes.
+    temporary_context_ttl_days` -- confirmed by hand this was previously
+    dead code (NotesConfig's TTL fields existed but nothing read them),
+    so this note would otherwise never expire.
+    """
+    from datetime import UTC, datetime
+
+    layout = init_project(git_repo)
+    note = note_add(
+        layout, category=NoteCategory.temporary_context, content="c", why_persist="w",
+    )
+    assert note.expires_at is not None
+    expiry = datetime.fromisoformat(note.expires_at)
+    days_out = (expiry - datetime.now(UTC)).days
+    assert 6 <= days_out <= 7  # default is 7 days
+
+
+def test_note_add_investigation_result_gets_default_ttl_from_config(git_repo: Path) -> None:
+    from datetime import UTC, datetime
+
+    layout = init_project(git_repo)
+    note = note_add(
+        layout, category=NoteCategory.investigation_result, content="c", why_persist="w",
+    )
+    assert note.expires_at is not None
+    expiry = datetime.fromisoformat(note.expires_at)
+    days_out = (expiry - datetime.now(UTC)).days
+    assert 29 <= days_out <= 30  # default is 30 days
+
+
+def test_note_add_explicit_expires_at_overrides_ttl_default(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    note = note_add(
+        layout, category=NoteCategory.temporary_context, content="c", why_persist="w",
+        expires_at="2099-01-01T00:00:00Z",
+    )
+    assert note.expires_at == "2099-01-01T00:00:00Z"
+
+
+def test_note_add_non_ttl_category_has_no_default_expiry(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    note = note_add(layout, category=NoteCategory.pitfall, content="c", why_persist="w")
+    assert note.expires_at is None
+
+
+def test_note_update_does_not_overwrite_created_at(git_repo: Path) -> None:
+    """DATA_MODEL.md §2.6 lists only status/source/last_verified_at as the
+    fields a revision transition changes -- created_at is the note's
+    original creation time and must survive across every subsequent
+    revision, not get reset to "now" on every update.
+    """
+    layout = init_project(git_repo)
+    note = note_add(layout, category=NoteCategory.pitfall, content="c", why_persist="w")
+    original_created_at = note.created_at
+
+    import time
+    time.sleep(1.1)  # ensure utc_now_iso() (second precision) actually differs
+
+    updated = note_update(layout, note.id, content="revised")
+    assert updated.created_at == original_created_at
+    assert updated.last_verified_at != original_created_at

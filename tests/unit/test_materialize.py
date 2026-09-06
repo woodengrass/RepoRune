@@ -491,8 +491,11 @@ def test_rebuild_cache_populates_fts5_indexes(git_repo: Path) -> None:
     """ARCHITECTURE.md §4.8/DATA_MODEL.md §5's fts_* tables were declared
     in schema.sql since Milestone 1 but nothing ever actually inserted
     into them (grep confirmed zero writers before this fix) -- `rune
-    search` would have queried permanently-empty FTS tables. Only current
-    revisions are indexed; a non-current revision must not appear.
+    search` would have queried permanently-empty FTS tables. Every
+    revision is indexed (not just current -- see the `revision`-aware
+    regression test below), tagged with its own `revision` number so
+    `core.retrieval.search` can tell current from superseded at query
+    time.
     """
     layout = init_project(git_repo)
     append_jsonl(
@@ -531,14 +534,19 @@ def test_rebuild_cache_populates_fts5_indexes(git_repo: Path) -> None:
         "SELECT note_id FROM fts_notes WHERE fts_notes MATCH 'retry'"
     ).fetchone() == ("n1",)
 
-    # a second revision replacing rev1's content must not leave the old
-    # text still findable via FTS -- only the current revision is indexed
+    # a second revision must show up as its OWN indexed row (revision=2),
+    # alongside rev1's -- both are kept so a history-mode search can find
+    # either one's text, not just whichever is current
     append_jsonl(
         layout.decisions_jsonl,
         _decision("d1", 2, RecordStatus.inactive),
     )
     rebuild_cache(layout, code_index=CodeIndexData())
     conn = sqlite3.connect(str(layout.memory_db))
-    assert conn.execute(
-        "SELECT COUNT(*) FROM fts_decisions WHERE record_id = 'd1'"
-    ).fetchone() == (1,)  # exactly one row (the current one), not two
+    revisions_indexed = {
+        row[0]
+        for row in conn.execute(
+            "SELECT revision FROM fts_decisions WHERE record_id = 'd1'"
+        )
+    }
+    assert revisions_indexed == {1, 2}

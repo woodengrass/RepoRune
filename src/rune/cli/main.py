@@ -71,7 +71,10 @@ from rune.core.storage.models import (
     ScopeSource,
     Severity,
 )
-from rune.core.storage.sqlite.materialize import CanonicalConflictError
+from rune.core.storage.sqlite.materialize import (
+    CacheUnusableError,
+    CanonicalConflictError,
+)
 from rune.core.update import run_update
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -758,6 +761,12 @@ def proposal_edit(
     severity: Severity | None = typer.Option(None, "--severity"),
     persistence_mode: PersistenceMode | None = typer.Option(None, "--persistence-mode"),
     expires_at: str | None = typer.Option(None, "--expires-at"),
+    critical: bool | None = typer.Option(
+        None, "--critical/--not-critical", help="Decision-only: eligible for hard bootstrap."
+    ),
+    source_document: str | None = typer.Option(None, "--source-document"),
+    source_section: str | None = typer.Option(None, "--source-section"),
+    machine_check_hint: str | None = typer.Option(None, "--machine-check-hint"),
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Edit a pending proposal's content, then approve the edited version
@@ -783,6 +792,14 @@ def proposal_edit(
             updates["persistence_mode"] = persistence_mode
         if expires_at is not None:
             updates["expires_at"] = expires_at
+        if critical is not None:
+            updates["critical"] = critical
+        if source_document is not None:
+            updates["source_document"] = source_document
+        if source_section is not None:
+            updates["source_section"] = source_section
+        if machine_check_hint is not None:
+            updates["machine_check_hint"] = machine_check_hint
         edited_payload = proposal.payload.model_copy(update=updates)
         _, memory_rev = core_approve(
             layout, proposal_id, resolved_by=by, edited_payload=edited_payload
@@ -810,10 +827,10 @@ def search(
     Notes (ARCHITECTURE.md §4.8's eight-layer priority order)."""
     try:
         layout = _require_layout(path or Path.cwd())
-    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        results = core_search(layout, query, history=history, limit=limit)
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
-    results = core_search(layout, query, history=history, limit=limit)
     if json_output:
         typer.echo(
             json_module.dumps(
@@ -842,10 +859,10 @@ def check(
     """Working-tree changes -> affected scopes -> relevant Constraints. No model calls."""
     try:
         layout = _require_layout(path or Path.cwd())
-    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        result = core_check(layout)
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
-    result = core_check(layout)
     if json_output:
         typer.echo(
             json_module.dumps(

@@ -303,6 +303,21 @@ def test_note_orphan_takes_priority_over_everything_else() -> None:
     assert result[0].status is NoteStatus.orphaned
 
 
+def test_note_system_transition_does_not_overwrite_created_at() -> None:
+    """DATA_MODEL.md §2.6 lists only status/source/last_verified_at as the
+    fields a system-triggered Note revision changes -- created_at (the
+    note's original creation time) must survive, not get reset to "now"
+    on every automatic transition (orphan/expiry/staleness alike).
+    """
+    note = _note(scopes=["gone"])
+    result = detect_note_transitions(
+        {"n1": note}, known_scope_ids=set(), file_hashes={}, symbol_owning_file={}, now=_NOW
+    )
+    assert len(result) == 1
+    assert result[0].created_at == note.created_at
+    assert result[0].last_verified_at == _NOW
+
+
 def test_note_ttl_expiry_is_expired() -> None:
     note = _note(expires_at="2026-01-01T00:00:00Z")
     result = detect_note_transitions(

@@ -154,6 +154,18 @@ retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、改指向 `source_
 CRUD、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令，六項交付項目
 一項不缺。261 個測試全綠，`ruff check` 全綠。細節見 IMPLEMENTATION_PLAN.md 第 95-106 條。
 
+**第二十二輪修訂：使用者轉述外部針對 Milestone 6 的 code review，9 條 finding 全部先重現再修**
+（見 IMPLEMENTATION_PLAN.md 第 107-115 條）。7 條是違反已確認設計/文件的真 bug（`source_bound`
+核准接受不完整 snapshot、Note TTL 是死代碼、`--history` 找不到被取代的舊 revision 內容——這個
+修法動到 SQLite schema，`CACHE_SCHEMA_VERSION` 從 2 bump 到 3、系統 note revision 誤覆寫
+`created_at`、CLI `proposal edit` 缺欄位選項、`search`/`check` 對損毀 `memory.db` 沒有防護、
+`approve()` 兩段寫入非原子有靜默遺失風險）；2 條是設計取捨問題，先問過使用者才動手：**核准/新增
+的 memory 在下一次 `rune update` 前搜不到**（改成 `approve`/`note_add`/`note_update`/
+`deactivate` 都自動觸發一次輕量 materialize，重用已索引的 code index、不重新掃描原始碼）、
+**`rune check` 原本不含 global constraint**（改成也包含現行 global MUST 規則，SHOULD/INFO 維持
+scoped-only）。新增 22 個 regression test，每條都先寫重現腳本確認問題真的存在才動手修。**275 個
+測試全綠，`ruff check` 全綠。**
+
 ## 專案是什麼
 
 RepoRune（CLI/套件名：`rune`）= *Repository Understanding & Navigation Engine*。
@@ -233,7 +245,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**261 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**275 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

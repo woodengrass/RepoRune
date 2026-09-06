@@ -163,6 +163,44 @@ def test_approve_source_bound_constraint_with_no_indexed_files_is_rejected(
         approve(layout, proposal.proposal_id, resolved_by="alice")
 
 
+def test_approve_source_bound_constraint_with_one_missing_file_is_rejected(
+    python_simple_repo: Path,
+) -> None:
+    """DATA_MODEL.md §2.5: the source_hashes key set must equal `files ∪
+    owning_file(s)` exactly -- "at least one resolves" is not enough.
+    Confirmed by hand this used to approve successfully with only the
+    resolving file recorded, silently dropping the missing one from what
+    the constraint actually tracks.
+    """
+    layout = _init_with_index(python_simple_repo)
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="c",
+        severity=Severity.must, persistence_mode=PersistenceMode.source_bound,
+        files=["app/services.py", "GONE.py"],
+    )
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice")
+
+    # confirm it really was rejected, not partially approved
+    from rune.core.storage.canonical import read_jsonl
+    from rune.core.storage.models import MemoryRevision
+
+    assert read_jsonl(layout.constraints_jsonl, MemoryRevision) == []
+
+
+def test_approve_source_bound_constraint_with_unresolved_symbol_is_rejected(
+    python_simple_repo: Path,
+) -> None:
+    layout = _init_with_index(python_simple_repo)
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="c",
+        severity=Severity.must, persistence_mode=PersistenceMode.source_bound,
+        symbols=["does-not-exist::symbol"],
+    )
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice")
+
+
 def test_approve_scope_bound_constraint_computes_scope_hashes(python_simple_repo: Path) -> None:
     layout = _init_with_index(python_simple_repo)
     from rune.core.storage.canonical import write_json_model
@@ -240,3 +278,46 @@ def test_materialize_reflects_current_revision_after_deactivate(git_repo: Path) 
         "WHERE r.record_id = 'd1'"
     ).fetchone()
     assert row == (2, "inactive")
+
+
+def test_approve_writes_memory_revision_before_resolving_proposal(git_repo: Path, monkeypatch) -> None:
+    """A relayed review flagged approve()'s two canonical writes as
+    non-atomic (proposals.jsonl and decisions.jsonl/constraints.jsonl are
+    separate files, so a crash between them is possible). Simulates that
+    crash by making the *second* write (the proposal's own resolution)
+    fail, and confirms the failure mode is the intentionally-safer one:
+    the actual Decision content is already durably written, and the
+    proposal is left recoverably `pending` (still visible, not silently
+    claiming to be resolved) rather than the content being lost.
+    """
+    import rune.core.memory.proposals as proposals_module
+    from rune.core.storage.canonical import read_jsonl
+    from rune.core.storage.models import MemoryRevision, Proposal
+
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="use postgres")
+
+    real_append_jsonl = proposals_module.append_jsonl
+    call_count = {"n": 0}
+
+    def flaky_append_jsonl(path, model):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # the proposals.jsonl resolution write
+            raise OSError("simulated crash between the two canonical writes")
+        return real_append_jsonl(path, model)
+
+    monkeypatch.setattr(proposals_module, "append_jsonl", flaky_append_jsonl)
+
+    with pytest.raises(OSError):
+        approve(layout, proposal.proposal_id, resolved_by="alice")
+
+    # The Decision content survived -- not lost.
+    decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
+    assert len(decisions) == 1
+    assert decisions[0].content == "use postgres"
+
+    # The proposal is still (accurately) pending, not silently
+    # claiming to be resolved while its content never landed anywhere.
+    proposals = read_jsonl(layout.proposals_jsonl, Proposal)
+    assert len(proposals) == 1
+    assert proposals[0].status is ProposalStatus.pending

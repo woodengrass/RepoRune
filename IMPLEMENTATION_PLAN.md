@@ -1587,3 +1587,73 @@ IMPLEMENTATION_PLAN 第 410 行起、DATA_MODEL.md §2.5/§2.5a/§2.6/§6、ARCH
 新增 3 個 regression test（idempotency）。261 個測試全綠，`ruff check` 全綠。**Milestone 6
 （Policies & Memory）的六項交付項目至此全部完成**：current/visible 分離、proposal 流程、Note
 CRUD、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`，以及對應的 CLI 子命令。
+
+### 第二十二輪修訂（使用者轉述外部針對 Milestone 6 的 code review，9 條 finding，逐條重現後全部確認為真並修正）
+
+九條全部先重現才動手，兩條標記「設計確認」的先問過使用者才動手，其餘七條是直接違反已確認設計/文件
+的真 bug，不需要重新討論設計本身。
+
+107. **中·`source_bound` 核准接受部分 snapshot**：`approve()` 先前只檢查算出來的 `source_hashes`
+    是否為空，沒檢查是否**完整**——`files=["a.py", "GONE.py"]` 這種情況下 `GONE.py` 解析不到就悄悄
+    被丟掉，只記錄 `a.py` 的 hash，核准照樣成功。實測重現：確實如此。違反 DATA_MODEL §2.5「key
+    集合必須等於 `files ∪ owning_file(s)`，缺一即拒絕核准」。修法：核准前額外檢查
+    `missing_files`/`unresolved_symbols`，只要有一個沒解析到就整個拒絕，不再只看「結果是否為空」。
+108. **中·Note TTL 是死代碼**：`NotesConfig.temporary_context_ttl_days`/
+    `investigation_result_ttl_days` 從 Milestone 1 就存在，但 grep 全專案零呼叫點——`note_add`
+    只有呼叫者手動傳 `expires_at` 才會有值，`temporary_context`/`investigation_result` 類別的 Note
+    預設永不過期，違反 M6 交付項「依 category 有 TTL」。修法：`note_add` 在 `expires_at` 未指定時，
+    對這兩個類別自動從 `config.notes` 算出預設到期時間；顯式傳入的 `expires_at` 仍優先。
+109. **中·`--history` 永遠看不到被取代的舊 revision 內容**：FTS5 只索引 current revision、查詢也只
+    join `current_revision`——實測重現：`d1` rev1=「use redis」被 rev2=「use postgres」取代後，
+    `search('redis', history=True)` 回傳空陣列，因為「redis」這個字根本從未進過 FTS 索引。違反
+    M6 驗收「history flag 才顯示兩筆」與 DATA_MODEL §3「history 模式可看到全部 revision」。修法
+    是結構性的：`fts_decisions`/`fts_constraints`/`fts_notes` 新增 `revision` 欄位並索引**每一筆**
+    revision（不只 current），`CACHE_SCHEMA_VERSION` 隨之從 2 bump 到 3（既有機制自動觸發丟棄重建，
+    不需要使用者手動介入）；`core.retrieval.search` 的查詢改成先比對 FTS 命中的
+    `revision` 是否等於該筆記錄的 `current_revision`，是則走現有的 current/visible 判斷邏輯，不是
+    則只在 `history=True` 時納入、標記 `warning="superseded"`、排在 `RANK_HISTORICAL`。
+110. **低·系統 note revision 覆寫 `created_at`**：`staleness.py` 的 `_note_system_revision` 與
+    `notes.py` 的 `note_update` 都把 `created_at` 設成 `now`，但 DATA_MODEL §2.6 對 Note 的系統
+    轉換只列了「`status`、`source`、`last_verified_at`」三個會變動的欄位——`created_at`（原始建立
+    時間）應該原封不動跨 revision 保留，現行實作會讓這個資訊在 current 投影中遺失。修法：兩處都
+    移除 `created_at` 的覆寫。
+111. **低·CLI `proposal edit` 缺第五輪新增的欄位選項**：`core.memory.proposals` 已經支援
+    `critical`/`source_document`/`source_section`/`machine_check_hint`，但 CLI 的 `[E]dit` 流程
+    沒有暴露對應選項，人類想在編輯時調整這些欄位做不到。已補上
+    `--critical/--not-critical`、`--source-document`、`--source-section`、`--machine-check-hint`。
+112. **低·`rune search`/`rune check` 對損毀 `memory.db` 無防護**：實測用一個 0-byte 檔案模擬損毀
+    的 `memory.db`，兩者都直接拋出未經處理的 `sqlite3.OperationalError` traceback，使用者看不出
+    該怎麼修。新增 `materialize.connect_for_read()`：連線後先確認 `schema_meta` 表可讀，讀不到就
+    包裝成 `CacheUnusableError`（訊息直接告訴使用者跑 `rune rebuild-cache`），`search`/`check` 改用
+    這個函式，CLI 層也接住這個例外印出乾淨訊息而非 traceback。
+113. **低·`approve()` 是兩次獨立、非原子的 canonical 寫入**：先寫 `proposals.jsonl` 再寫
+    `decisions.jsonl`/`constraints.jsonl`，中間若崩潰會留下「proposal 顯示已核准，但實際內容從未
+    寫入任何地方」的靜默遺失狀態，且 `pending` 清單也不會再顯示它、沒有恢復路徑。修法：對調寫入
+    順序，先寫決定性內容（`decisions.jsonl`/`constraints.jsonl`），再寫 proposal 自己的
+    resolution——同樣沒有做到真正的原子性，但把失敗模式從「靜默遺失」改成「可偵測、可恢復」（崩潰後
+    內容已經在，proposal 只是還顯示 `pending`，重新核准前人類/後續流程至少看得到異常）。用
+    monkeypatch 模擬「第二次寫入失敗」重現過修法前的靜默遺失問題，也確認新順序下失敗會被正確偵測。
+
+**兩條標記「設計確認」的項目，先問過使用者才動手：**
+
+114. **核准/新增的 memory 在下一次 `rune update` 前對 `rune search` 不可見**：SQLite 是 derived
+    cache，這點跟 scope/semantic 完全一致，但 Milestone 7 的 OpenCode adapter 刻意不自動觸發
+    `rune update`（避免每次 tool call 都扒一次昂貴的 update），意味著整個 session 期間剛核准的規則
+    都搜尋不到。**使用者選擇：讓 `approve()`/`note_add()`/`note_update()`/`deactivate()` 自動觸發
+    一次輕量 materialize**——新增 `core.memory.records.refresh_cache()`，重用已索引的
+    `read_current_code_index()`（不重新掃描/解析原始碼）搭配 `rebuild_cache()`，比完整
+    `rune update` 便宜很多，只是把目前 canonical 狀態重新投影進 SQLite。每個會寫 decisions/
+    constraints/notes 的動作都接上這個呼叫。
+115. **`rune check` 只回傳 scoped constraint，完全不含 global constraint**：先前是我自己照字面
+    解讀 IMPLEMENTATION_PLAN 做的範圍限定。**使用者選擇：改成也包含現行 current+visible 的 global
+    MUST constraint**——只要有任何變更檔案，就無條件把目前的 global MUST 規則一起列出（不需要跟
+    changed files 有任何 scope 關聯），因為全域 MUST 規則本來就對任何變更都相關。SHOULD/INFO
+    severity 的 global constraint 不在此列，維持原本的 scoped-only 邏輯，只有 MUST 破例。
+
+新增 22 個 regression test（`test_memory_proposals.py` +5、`test_memory_notes.py` +5、
+`test_memory_staleness.py` +2、`test_retrieval_search.py` +3（含 3 個既有測試因為索引全部
+revision 而改寫斷言，屬於預期行為變更，非迴歸）、`test_retrieval_check.py` +3、
+`test_materialize.py` 既有 FTS5 測試改寫斷言）。每一條 finding 都先寫重現腳本確認問題真的存在，
+再動手修；「approve 兩段寫入非原子」用 monkeypatch 模擬崩潰、「history 找不到舊內容」用真實
+propose/approve 流程重現、「0-byte memory.db」用手工寫入空檔案重現。275 個測試全綠，`ruff check`
+全綠。

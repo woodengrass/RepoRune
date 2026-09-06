@@ -193,12 +193,15 @@ def detect_constraint_transitions(
 def _note_system_revision(
     current: Note, new_status: NoteStatus, now: str, author: RevisionAuthor, extra: dict | None = None
 ) -> Note:
+    # `created_at` is deliberately left untouched -- DATA_MODEL.md §2.6
+    # lists only status/source/last_verified_at as the fields a system
+    # transition changes; created_at is the note's original creation
+    # time and must survive across every subsequent revision.
     updates = {
         "revision": current.revision + 1,
         "status": new_status,
         "source": author,
         "last_verified_at": now,
-        "created_at": now,
     }
     if extra:
         updates.update(extra)

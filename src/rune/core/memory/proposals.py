@@ -15,6 +15,7 @@ from typing import Literal
 
 from rune.core.memory.hashes import compute_scope_membership_hash, compute_source_hashes
 from rune.core.memory.records import current_by, current_by_record_id
+from rune.core.memory.records import refresh_cache as _refresh_cache
 from rune.core.project import RuneLayout, utc_now_iso
 from rune.core.scopes.model import load_scopes
 from rune.core.storage.canonical import append_jsonl, read_jsonl
@@ -207,17 +208,34 @@ def approve(
 
     if payload.type is RecordType.constraint:
         if payload.persistence_mode is PersistenceMode.source_bound:
+            if not payload.files and not payload.symbols:
+                raise ProposalValidationError(
+                    "persistence_mode=source_bound requires at least one file or symbol"
+                )
             code_index = read_current_code_index(layout)
             file_hashes = {f.path: f.content_hash for f in code_index.files}
             symbol_owning_file = {s.symbol_id: s.file for s in code_index.symbols}
+            # DATA_MODEL.md §2.5: the snapshot's key set must equal
+            # `files ∪ owning_file(s) for s in symbols` exactly -- a
+            # missing file or an unresolved symbol means the resulting
+            # source_hashes couldn't cover every reference, silently
+            # binding to a partial subset rather than everything the
+            # human actually approved. Reject outright rather than
+            # accepting whatever subset happened to resolve (confirmed by
+            # hand: files=["a.py", "GONE.py"] used to approve successfully
+            # with only "a.py" recorded, silently dropping "GONE.py" from
+            # what the constraint actually tracks).
+            missing_files = [f for f in payload.files if f not in file_hashes]
+            unresolved_symbols = [s for s in payload.symbols if s not in symbol_owning_file]
+            if missing_files or unresolved_symbols:
+                raise ProposalValidationError(
+                    "persistence_mode=source_bound requires every file/symbol to resolve to a "
+                    f"currently-indexed file -- unresolved files={missing_files}, "
+                    f"symbols={unresolved_symbols}"
+                )
             source_hashes = compute_source_hashes(
                 payload.files, payload.symbols, file_hashes, symbol_owning_file
             )
-            if not source_hashes:
-                raise ProposalValidationError(
-                    "persistence_mode=source_bound requires at least one file or symbol "
-                    "that resolves to a currently-indexed file"
-                )
         elif payload.persistence_mode is PersistenceMode.scope_bound:
             if not payload.scopes:
                 raise ProposalValidationError("persistence_mode=scope_bound requires at least one scope")
@@ -258,11 +276,25 @@ def approve(
             "resolved_by": resolved_by,
         }
     )
-    append_jsonl(layout.proposals_jsonl, resolved_proposal)
+    # Write the authoritative content first, the proposal's resolution
+    # second. These are two separate canonical files -- each individual
+    # append is atomic (canonical.append_jsonl's temp-file+rename), but
+    # nothing makes the *pair* atomic, so a crash between them is
+    # possible. This order picks the less-bad failure mode: if the
+    # process dies after this line but before the next, decisions.jsonl/
+    # constraints.jsonl already has the real content and the proposal
+    # merely still shows `pending` -- visible and recoverable (re-running
+    # `rune proposal approve` finds it still pending; a human notices the
+    # stuck proposal). The reverse order risks the opposite: a proposal
+    # that says `approved` while the content it supposedly approved was
+    # never actually written anywhere -- a silent loss that looks
+    # resolved and gives no signal anything is wrong.
     target_path = (
         layout.decisions_jsonl if payload.type is RecordType.decision else layout.constraints_jsonl
     )
     append_jsonl(target_path, new_memory_revision)
+    append_jsonl(layout.proposals_jsonl, resolved_proposal)
+    _refresh_cache(layout)
     return resolved_proposal, new_memory_revision
 
 
@@ -299,6 +331,7 @@ def deactivate(
         }
     )
     append_jsonl(path, updated)
+    _refresh_cache(layout)
     return updated
 
 
