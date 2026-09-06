@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第九輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -29,7 +29,12 @@ fallback model 產生內容被誤標為 primary、provider request 缺少 struct
 review，5 條 finding 全部確認為真並修正**：SQLite cache 沒有 schema migration（舊版 memory.db
 會讓 materialize 持續 crash）、scope 刪除後重建同名 scope 永遠卡在 orphaned、`rune update` 的 CLI
 說明文字仍宣稱 zero LLM calls、`needs_refresh` 的 docstring 用詞不精確、`compute_source_files`
-的邊界案例澄清（不改變行為，只精確化文件措辭），細節見第 4.5 節與文末「第十四輪修訂」。本文件與
+的邊界案例澄清（不改變行為，只精確化文件措辭），細節見第 4.5 節與文末「第十四輪修訂」。**第十輪
+確認了先前記錄但延後的 `possibly_stale` 觸發邏輯與 provider 健康檢查設計**（尚未實作，是下一個
+session 的第一個任務）：`possibly_stale` 只在「曾經有內容、hash 對不上、這次沒 provider」時觸發，
+`possibly_stale`/`stale` 在 retrieval 端絕不直接回傳舊摘要文字、只能指向真實原始碼；provider 健康
+檢查改成三層（設定錯誤直接攔下要求修正、rate limit 提示使用者、其他錯誤 retry 一次後大聲失敗但不
+擋決定性索引），細節見第 4.5 節。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -341,11 +346,55 @@ Semantic staleness 判斷完全基於 **member 檔案的 content hash**（見 DA
    `rebuild_cache` 「清空重建」影響（只在真的嘗試過 refresh 時 append 一行），但會隨 `memory.db`
    整個被刪除重建而消失（接受，因為沒有 canonical 背書可以重建它）。
 
-**另一項複查中確認但刻意不在本輪修的問題**：provider 不可用（沒有 API key／`semantic.enabled=false`／
-預算用完）時，一個已經變 stale 的 scope 目前完全跳過，不會有任何狀態轉換——`possibly_stale` 這個
-enum 值從 Milestone 5 一開始就沒有任何觸發邏輯。使用者要求先記錄這個缺口、留到後續討論怎麼設計
-（例如「無 provider 時要不要附加一筆不需要呼叫 LLM 的 possibly_stale revision」），不要自己選一個
-方案動手。
+**`possibly_stale` 觸發邏輯與 provider 健康檢查（本輪確認設計，尚未實作，是下一個 session 的第一個
+任務）**：先前發現 provider 不可用（沒有 API key／`semantic.enabled=false`／預算用完）時，一個已經
+變 stale 的 scope 完全跳過、不會有任何狀態轉換，`possibly_stale` 這個 enum 值從 Milestone 5 一開始
+就沒有任何觸發邏輯。討論後確認以下設計：
+
+1. **`possibly_stale` 只在「曾經有過內容、現在 hash 對不上、但這次沒有 provider 可用」時觸發**：
+   附加新 revision，內容複製舊的（比照既有的「系統自動附加 revision 必須是完整 snapshot」規則），
+   只改 `status=possibly_stale` 與 `source_hash`/`source_files`（更新為目前的）。**「從沒成功過
+   （`unavailable`／`current=None`）+ 這次也沒 provider」不需要額外處理**——`needs_refresh` 對
+   `current is None` 或 `status=unavailable` 本來就無條件回傳 `True`，等哪次真的有 provider 可用
+   時自然會被抓到需要生成，不必為了「這次仍然沒有內容」這件事另外留一筆什麼都沒變的空白 revision。
+2. **`possibly_stale`／`stale` 在 retrieval 端絕不能把舊內容當作可信內容直接提供**：跟 Note 的
+   `[STALE]`（顯示舊內容 + 警告標記）刻意不同——semantic summary 是 LLM 生成的長篇散文式描述，不是
+   人工/agent 寫的簡短事實記錄，一段「看起來權威、但其實跟不上程式碼」的摘要比起完全沒有摘要更危險
+   （agent 可能照單全收，不會像看到「沒有資料」時那樣主動去讀原始碼確認）。因此 canonical
+   （`semantic.jsonl`）仍然保留舊內容（稽核用途，且若程式碼被還原成跟舊版一致，不需要重新呼叫 LLM
+   就能讓舊內容重新有效），但 Milestone 6 的 retrieval 對 `possibly_stale`/`stale` 的 scope
+   **不得回傳舊摘要文字本身**，而是要回傳「這個 scope 的摘要已過期，請直接讀取以下檔案確認目前
+   實際內容：`source_files` 清單」這種明確指向真實原始碼、而非舊摘要文字的提示。這個決定現在先
+   記錄下來，等 Milestone 6 做 retrieval 時直接照這個做，不需要重新討論。
+3. **Provider 健康檢查改成三層，每次 `rune update` 開頭跑一次（不是每個 scope 各自跑），區分「設定
+   錯誤」與「執行期問題」**：先前 `_build_semantic_providers` 把「使用者刻意關閉」「忘記設定」
+   「打錯字」「暫時性網路問題」全部用同一套「靜默回傳 None」邏輯處理，導致一個打錯字的 model 名稱
+   或忘記 export 的 API key 會讓 semantic 永遠悄悄不執行、完全沒有任何提示，直到使用者自己發現。
+   新設計（**尚未實作**）：
+   ```text
+   config.semantic.enabled != true
+     → 維持現狀：使用者刻意關閉，靜默跳過，不是錯誤
+   config.semantic.enabled == true：
+     Step 1（純靜態檢查，不呼叫網路）：
+       model 是空字串，或對應 provider 的 API key 環境變數沒設
+         → 這是設定錯誤，不是暫時性問題：印出明確訊息告訴使用者缺什麼、
+           怎麼補（例如「semantic.model 未設定」或「OPENROUTER_API_KEY
+           未設定」），這次 semantic 整段跳過，但決定性程式碼索引照常完成
+     Step 2（僅 Step 1 通過才做，一次輕量連線測試呼叫）：
+       回應是 rate limit（HTTP 429）
+         → 提示使用者（預期內、非使用者的錯），這次跳過 semantic
+           （避免後面每個 scope 都再撞一次同樣的 429，浪費呼叫）
+       回應是其他失敗原因
+         → retry 一次；仍失敗 → 這次跳過 semantic，但大聲失敗
+           （明確錯誤訊息，代表真的有問題：key 錯誤、model 名稱
+           provider 端不認得等），決定性索引照常完成
+       成功
+         → 照現有方式跑每個 scope 的刷新（各自既有的 fallback ladder 不變）
+   ```
+   實作上需要 `provider.py` 補上能分辨「是不是 429」的機制（目前 `ProviderError` 只是一句字串，
+   沒有結構化資訊可以判斷是哪種失敗），以及在 `update.py`/`worker.py` 新增這個一次性的 precheck
+   步驟（跟 semantic refresh 本身一樣，只在 `not full` 時跑）。CLI 需要能把這些訊息實際印給使用者
+   看（不能只塞進回傳的 stats dict，使用者當下就要看得到）。
 
 **第二輪品質複查（外部 review 轉述，本輪新增）修正的 5 個問題**：
 

@@ -1292,3 +1292,61 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
 
 新增 2 個回歸測試（第 77、78 條），皆用 `git stash` 驗證過修法前確實會失敗；其餘 3 條純屬文件精確化，
 不涉及行為變更。175 個測試全綠，`ruff check` 全綠。
+
+### 第十五輪修訂（確認 `possibly_stale` 觸發邏輯與 provider 健康檢查設計，尚未實作）
+
+第 70 條記錄的「provider 不可用時 possibly_stale 沒有觸發邏輯」這個缺口，本輪跟使用者討論後定案
+設計，**但故意不在本輪動手實作**——使用者要求先把決議完整寫進文件，下一個 session 開工前先讀這段，
+再開始寫程式碼。這是本輪唯一的內容，沒有程式碼變更。
+
+82. **`possibly_stale` 只在「曾經有內容、hash 對不上、這次沒 provider」時觸發，不需要另外處理
+    「從沒成功過」的情況**：附加新 revision，複製前一筆 current revision 的完整內容，只改動
+    `status=possibly_stale`、`source_hash`/`source_files`（更新為目前的）、`generated_at`——跟
+    既有的「系統自動附加 revision 必須是完整 snapshot」規則一致。**`current=None` 或
+    `status=unavailable` 的 scope 不需要為此額外附加任何 revision**：`needs_refresh` 對這兩種情況
+    本來就無條件回傳 `True`，等有 provider 可用時自然會被重新嘗試生成，不必為了「這次仍然沒有內容」
+    這件事另外留一筆什麼都沒變的空白 revision——這比原本考慮過的方案（連「從沒成功過」也要留痕跡）
+    更簡單，也是使用者主動指出、確認採用的簡化。記錄於 DATA_MODEL.md §2.4 的失敗時 revision 語意
+    表新增一列。
+83. **`possibly_stale`／`stale` 的 semantic summary 在 retrieval 端絕不能把舊內容當作可信內容直接
+    提供**：跟 Note 的 `[STALE]`（顯示舊內容 + 警告標記）刻意不同——理由是 semantic summary 是 LLM
+    生成的長篇散文式描述，不是人工/agent 寫的簡短事實記錄，一段「看起來權威、但其實跟不上程式碼」的
+    摘要比完全沒有摘要更危險（agent 可能照單全收、不會像看到「沒有資料」時那樣主動去讀原始碼確認，
+    等同於增加 hallucination 風險）。因此 canonical（`semantic.jsonl`）仍然保留舊內容（稽核用途，
+    且若程式碼被還原成跟舊版一致，不需要重新呼叫 LLM 就能讓舊內容重新有效），但 Milestone 6 的
+    retrieval 對 `possibly_stale`/`stale` 的 scope **不得回傳舊摘要文字本身**，而是要回傳「這個
+    scope 的摘要已過期，請直接讀取以下檔案確認目前實際內容：`source_files` 清單」這種明確指向真實
+    原始碼、而非舊摘要文字的提示。現在先記錄下來，等 Milestone 6 做 retrieval 時直接照這個做，不
+    需要重新討論這個決定本身（但 retrieval 的具體實作細節屆時仍可能需要進一步設計）。
+84. **Provider 健康檢查從「靜默吞掉一切」改成三層，區分設定錯誤與執行期問題（尚未實作）**：先前
+    `_build_semantic_providers` 把「使用者刻意關閉」「忘記設定」「打錯字」「暫時性網路問題」全部
+    用同一套「靜默回傳 None」邏輯處理，導致一個打錯字的 model 名稱或忘記 export 的 API key 會讓
+    semantic 永遠悄悄不執行、完全沒有任何提示，直到使用者自己發現——使用者認為這種基礎設定錯誤
+    應該在一開始就報錯，避免問題不斷擴大（每次 `rune update` 都悄悄不做事，卻沒人知道為什麼）。
+    確認設計為每次 `rune update` 開頭跑一次（不是每個 scope 各自跑）的三層檢查：
+    ```text
+    config.semantic.enabled != true
+      → 維持現狀：使用者刻意關閉，靜默跳過，不是錯誤
+    config.semantic.enabled == true：
+      Step 1（純靜態檢查，不呼叫網路）：
+        model 是空字串，或對應 provider 的 API key 環境變數沒設
+          → 設定錯誤，不是暫時性問題：印出明確訊息告訴使用者缺什麼、怎麼補，
+            這次 semantic 整段跳過，但決定性程式碼索引照常完成
+      Step 2（僅 Step 1 通過才做，一次輕量連線測試呼叫）：
+        回應是 rate limit（HTTP 429）
+          → 提示使用者（預期內、非使用者的錯），這次跳過 semantic
+            （避免後面每個 scope 都再撞一次同樣的 429，浪費呼叫）
+        回應是其他失敗原因
+          → retry 一次；仍失敗 → 這次跳過 semantic，但大聲失敗（明確錯誤訊息，
+            代表真的有問題：key 錯誤、model 名稱 provider 端不認得等），
+            決定性索引照常完成
+        成功
+          → 照現有方式跑每個 scope 的刷新（各自既有的 fallback ladder 不變）
+    ```
+    實作上需要 `provider.py` 補上能分辨「是不是 429」的機制（目前 `ProviderError` 只是一句字串，
+    沒有結構化資訊可以判斷是哪種失敗，需要新增例如區分 status_code 或子類別的方式）；`update.py`/
+    `worker.py` 新增這個一次性的 precheck 步驟，跟 semantic refresh 本身一樣只在 `not full` 時跑；
+    CLI 需要能把這些訊息實際印給使用者看（不能只塞進回傳的 stats dict 裡，使用者當下就要看得到，
+    不是要去翻資料才知道）。**這是下一個 session 開工的第一個任務**。
+
+本輪沒有程式碼變更，175 個測試維持全綠，`ruff check` 全綠。

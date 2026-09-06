@@ -83,7 +83,36 @@ DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但
 
 175 個測試全綠，`ruff check` 全綠。
 
-**Milestone 6（Policies & Memory）是下一步。**
+**第十五輪修訂（確認設計、尚未實作）**：針對第 70 條記錄的「provider 不可用時 possibly_stale
+沒有觸發邏輯」缺口，跟使用者討論後定案三項設計，但**刻意不在本輪動手**——使用者要求先把決議完整寫
+進文件，下一個 session 開工前先讀，再開始寫程式碼。細節見 IMPLEMENTATION_PLAN.md 第 82-84 條、
+ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4：
+
+1. **`possibly_stale` 只在「曾有內容、hash 對不上、這次沒 provider」時觸發**：附加新 revision，
+   複製前一筆 current revision 內容，只改 `status=possibly_stale`／`source_hash`／
+   `source_files`／`generated_at`。**「從沒成功過」的 scope 不需要額外處理**——`needs_refresh`
+   對 `current=None`／`unavailable` 本來就無條件回傳 `True`，不必為此多留一筆空白 revision（使用
+   者主動指出這點可以簡化，不需要比照第一點一樣特別處理）。
+2. **`possibly_stale`／`stale` 在 retrieval 端絕不能把舊摘要文字當作可信內容提供**：跟 Note 的
+   `[STALE]`（顯示舊內容 + 警告）刻意不同——LLM 生成的長篇散文比人工寫的短筆記有更高的
+   hallucination 風險，「看起來權威但過期」的摘要比完全沒有更危險。canonical 仍保留舊內容（稽核、
+   以及程式碼還原成舊版時可不必重新呼叫 LLM），但 Milestone 6 的 retrieval 對這兩種 status 必須
+   回傳「摘要已過期，請直接讀取 `source_files` 確認」之類的提示，不能回傳舊摘要本身。
+3. **Provider 健康檢查從靜默吞掉一切改成三層，每次 `rune update` 開頭跑一次**（而非每個 scope
+   各自跑）：
+   - `semantic.enabled != true` → 維持現狀，靜默跳過。
+   - `enabled == true` 時，Step 1（純靜態，不連網）：model 是空字串，或對應 provider 的 API key
+     環境變數沒設 → **設定錯誤**，印出明確訊息告訴使用者缺什麼、怎麼補，這次 semantic 整段跳過，
+     決定性索引照常完成。
+   - Step 2（僅 Step 1 通過才做，一次輕量連線測試）：HTTP 429 → 提示使用者（預期內、非使用者的
+     錯），跳過 semantic；其他失敗 → retry 一次，仍失敗則跳過 semantic 但**大聲失敗**（明確錯誤
+     訊息），決定性索引照常完成；成功 → 照現有方式跑每個 scope 的刷新。
+   - 需要 `provider.py` 補上分辨「是不是 429」的結構化機制（目前 `ProviderError` 只是字串）、
+     `update.py`/`worker.py` 新增這個一次性 precheck、CLI 要能把訊息實際印出來（不能只塞進 stats
+     dict）。**這是下一個 session 開工的第一個任務。**
+
+**Milestone 6（Policies & Memory）是再下一步**（等三層 provider 健康檢查與 possibly_stale
+觸發邏輯做完之後）。
 
 ## 專案是什麼
 
@@ -99,10 +128,10 @@ commit，全部已 push，沒有未提交的變更）。
 
 ## 必看的三份設計文件（優先順序：先讀這三份，再看程式碼）
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第六輪
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第十輪
   修訂**。
 - [`DATA_MODEL.md`](DATA_MODEL.md) — 所有 canonical Pydantic model、SQLite schema、revision
-  lifecycle 規則。目前**第五輪修訂**（第五輪指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
+  lifecycle 規則。目前**第九輪修訂**（這個輪數指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
   IMPLEMENTATION_PLAN 的輪數不是同一套計數，不要混淆——三份文件各自獨立記錄自己的修訂輪次）。
 - [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — 8 個 Milestone 的交付項目、驗收標準、
   **文末的「設計決策記錄」按輪次列出每一次修正**，這是最重要的部分：每個 milestone 完成後都有
@@ -306,10 +335,26 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-**Milestone 6（Policies & Memory）**：`rune.core.memory.{decisions,constraints,notes,staleness}`。
-開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 6 整段（含驗收標準）與 DATA_MODEL.md §1、§3、§6——
-「current 與 visible 分離」是這個 milestone 最容易重犯的錯誤點，文件裡已經明講必須有專門測試鎖死
-`rev1=active, rev2=inactive` 這個 case。Note 的 revision 化現在有 Milestone 5 的 `ScopeSummary`
-revision 實作可以參考同一套模式。Proposal 流程（`decision_propose`/`constraint_propose`）也是這個
-milestone 的範圍，記得核准 constraint 時要依 `persistence_mode` 自動算好
-`source_hashes`/`scope_hashes`/`expires_at` snapshot，不是人類手動填。
+**第一優先：實作第十五輪確認的三層 provider 健康檢查 + `possibly_stale` 觸發邏輯**（設計已定案，
+尚未動手，見上方「第十五輪修訂」段落與 IMPLEMENTATION_PLAN.md 第 82-84 條、ARCHITECTURE.md §4.5、
+DATA_MODEL.md §2.4）。開工前重讀這三處，順序建議：
+1. `provider.py` 先補結構化的錯誤區分（至少要能分辨「HTTP 429」跟「其他失敗」，目前 `ProviderError`
+   只是一句字串），這是後面兩步的地基。
+2. `update.py`/`worker.py` 新增一次性 precheck（config 靜態檢查 → 輕量連線測試），只在
+   `semantic.enabled == true` 且 `not full` 時跑；三種結果（設定錯誤／429／其他失敗重試後仍失敗／
+   成功）分別對應文件裡寫的訊息與後續行為。
+3. CLI（`cli/main.py`）要把 precheck 的訊息實際印給使用者看，不能只塞進 stats dict。
+4. `possibly_stale` 觸發邏輯接在 precheck 判定「這次沒有可用 provider」之後：對曾經成功過的
+   scope 附加一筆複製舊內容、只改 status/hash/timestamp 的新 revision；從沒成功過的 scope 不必
+   特別處理。
+5. retrieval 端的「不顯示舊摘要、改指向 source_files」規則屬於 Milestone 6 範圍，這次先不用做，
+   但寫 possibly_stale 邏輯時要留意欄位（`source_files`）確實有更新，供 Milestone 6 直接使用。
+
+**再來才是 Milestone 6（Policies & Memory）**：`rune.core.memory.{decisions,constraints,notes,
+staleness}`。開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 6 整段（含驗收標準）與 DATA_MODEL.md
+§1、§3、§6——「current 與 visible 分離」是這個 milestone 最容易重犯的錯誤點，文件裡已經明講必須有
+專門測試鎖死 `rev1=active, rev2=inactive` 這個 case。Note 的 revision 化現在有 Milestone 5 的
+`ScopeSummary` revision 實作可以參考同一套模式，retrieval 對 `possibly_stale`/`stale` 摘要的
+「不顯示舊內容、改指向 source_files」規則也要在這個 milestone 落地。Proposal 流程
+（`decision_propose`/`constraint_propose`）也是這個 milestone 的範圍，記得核准 constraint 時要依
+`persistence_mode` 自動算好 `source_hashes`/`scope_hashes`/`expires_at` snapshot，不是人類手動填。
