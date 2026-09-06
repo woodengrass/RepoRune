@@ -639,6 +639,21 @@ def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
     assert stats["files_reused"] == 3
 
 
+def _ok_health():
+    """`_build_semantic_providers` now returns a 3-tuple: (primary,
+    fallback, SemanticHealthCheck) -- see ARCHITECTURE.md §4.5's
+    three-tier provider health check. Every test in this file that
+    monkeypatches `_build_semantic_providers` with a fake provider is
+    exercising the "provider available and healthy" path, so the check
+    result is always `ok` here; the health-check machinery itself
+    (config-error/rate-limit/probe-failure detection) is covered directly
+    by tests in tests/unit/test_semantic.py against `check_semantic_health`.
+    """
+    from rune.core.semantic.provider import SemanticHealthCheck, SemanticHealthStatus
+
+    return SemanticHealthCheck(status=SemanticHealthStatus.ok)
+
+
 class _FakeSemanticProvider:
     """Implements the ModelProvider protocol used by core.semantic without
     touching the network -- injected by monkeypatching
@@ -694,7 +709,7 @@ def test_semantic_refresh_end_to_end_appends_new_revision(
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("summarizes app services")])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
 
     stats = run_update(layout, full=False)
@@ -741,7 +756,7 @@ def test_semantic_refresh_regenerates_after_member_file_content_changes(
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("v1 purpose")])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
     run_update(layout, full=False)
     first = read_jsonl(layout.semantic_jsonl, ScopeSummary)
@@ -754,7 +769,7 @@ def test_semantic_refresh_regenerates_after_member_file_content_changes(
     )
     provider2 = _FakeSemanticProvider("fake-model", [_good_semantic_json("v2 purpose")])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider2, None)
+        update_module, "_build_semantic_providers", lambda config: (provider2, None, _ok_health())
     )
     stats = run_update(layout, full=False)
 
@@ -802,7 +817,7 @@ def test_semantic_refresh_failure_does_not_leave_partial_canonical_state(
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
 
     def failing_rebuild_cache(*args, **kwargs):
@@ -851,7 +866,7 @@ def test_semantic_refresh_failure_writes_sanitized_error_to_canonical_and_full_d
         "fake-model", [ProviderError(detailed_error), ProviderError(detailed_error)]
     )
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
 
     run_update(layout, full=False)
@@ -896,7 +911,7 @@ def test_rebuild_cache_never_calls_the_semantic_provider(
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
 
     stats = run_update(layout, full=True)
@@ -938,7 +953,7 @@ def test_deleted_scope_orphans_its_semantic_summary_instead_of_crashing(
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("original purpose")])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
     run_update(layout, full=False)
 
@@ -996,7 +1011,7 @@ def test_multiple_semantic_revisions_append_atomically_in_one_run(
         "fake-model", [_good_semantic_json("purpose a"), _good_semantic_json("purpose b")]
     )
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
 
     def failing_append_jsonl_many(path, models):
@@ -1043,7 +1058,7 @@ def test_semantic_run_metrics_persist_across_runs(python_simple_repo: Path, monk
     )
     provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
     monkeypatch.setattr(
-        update_module, "_build_semantic_providers", lambda config: (provider, None)
+        update_module, "_build_semantic_providers", lambda config: (provider, None, _ok_health())
     )
     run_update(layout, full=False)
 

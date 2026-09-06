@@ -15,11 +15,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from enum import Enum
 from typing import Protocol
 
 import httpx
 
-from rune.core.storage.models import ReasoningConfig
+from rune.core.storage.models import ReasoningConfig, SemanticConfig
 
 
 class ProviderError(Exception):
@@ -27,7 +28,23 @@ class ProviderError(Exception):
     response, or a response shape `worker.py` can't even parse a completion
     out of. Never raised for a response that parsed fine but failed schema/
     reference validation — that distinction belongs to validation.py.
+
+    `status_code` is the HTTP status when one was actually received (None
+    for a transport-level failure that never got a response at all — a
+    timeout or connection error). This is the structured detail the
+    three-tier provider health check (ARCHITECTURE.md §4.5) needs to tell
+    "the provider is rate-limiting us" (429 — expected, not the user's
+    fault) apart from every other failure (bad key, bad model name,
+    genuine outage — all of which should fail loudly instead).
     """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+    @property
+    def is_rate_limited(self) -> bool:
+        return self.status_code == 429
 
 
 @dataclass(frozen=True)
@@ -109,7 +126,7 @@ class OpenAICompatibleProvider:
             raise ProviderError(f"request failed: {exc}") from exc
 
         if resp.status_code != 200:
-            raise ProviderError(f"HTTP {resp.status_code}: {resp.text[:500]}")
+            raise ProviderError(f"HTTP {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code)
 
         try:
             data = resp.json()
@@ -138,6 +155,34 @@ class OpenAICompatibleProvider:
             output_tokens=int(usage.get("completion_tokens", 0)),
             cost=usage.get("cost"),
         )
+
+    def probe(self) -> None:
+        """One minimal request used by the startup health check
+        (ARCHITECTURE.md §4.5, Step 2) to confirm the API key and model
+        name actually work before committing to a full per-scope refresh
+        pass. Raises `ProviderError` exactly like `complete` — callers
+        inspect `status_code`/`is_rate_limited` to decide how to react.
+        Doesn't reuse `complete`: this only needs to know "did a 200 come
+        back", not parse a completion out of the response, and `reasoning`
+        is forced off regardless of config — the goal is reachability and
+        auth, not exercising the reasoning path, and a reasoning-capable
+        model could otherwise burn this tiny max_tokens budget entirely on
+        thinking and return empty content, which would look like a probe
+        failure that isn't actually one.
+        """
+        headers = {"Authorization": f"Bearer {self._api_key}", **self._extra_headers}
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1,
+            "reasoning": {"enabled": False},
+        }
+        try:
+            resp = self._client.post("/chat/completions", json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"request failed: {exc}") from exc
+        if resp.status_code != 200:
+            raise ProviderError(f"HTTP {resp.status_code}: {resp.text[:500]}", status_code=resp.status_code)
 
 
 class OpenRouterProvider(OpenAICompatibleProvider):
@@ -222,3 +267,112 @@ def build_provider(
     if provider_name == "openrouter":
         return OpenRouterProvider(api_key=api_key, model=model, reasoning=reasoning_dict)
     return OpenAIProvider(api_key=api_key, model=model, reasoning=reasoning_dict)
+
+
+class SemanticHealthStatus(str, Enum):
+    """Outcome of the three-tier provider health check (ARCHITECTURE.md
+    §4.5) run once per `rune update`, before any per-scope refresh.
+    """
+
+    ok = "ok"
+    # config.semantic.enabled is false, or it's true but semantic.model is
+    # still the untouched empty-string default (what every fresh `rune
+    # init` produces). Neither is an error -- the first is the user
+    # deliberately opting out, the second is simply "haven't configured
+    # semantic yet" -- so callers must stay silent about both.
+    disabled = "disabled"
+    # Step 1 (static, no network): empty model, unknown provider, or the
+    # provider's API key env var isn't set. A basic setup mistake the
+    # user needs to go fix, not a transient condition -- callers should
+    # report this loudly rather than let it fail silently update after
+    # update.
+    config_error = "config_error"
+    # Step 2 probe hit HTTP 429. Expected and not the user's fault --
+    # callers should just let the user know, not treat it as broken.
+    rate_limited = "rate_limited"
+    # Step 2 probe failed for any other reason, even after one retry.
+    # Something is actually wrong (bad key rejected by the provider, a
+    # model name the provider doesn't recognize, a real outage) --
+    # callers should report this loudly.
+    probe_failed = "probe_failed"
+
+
+@dataclass(frozen=True)
+class SemanticHealthCheck:
+    status: SemanticHealthStatus
+    message: str | None = None
+
+
+def check_semantic_health(config: SemanticConfig) -> tuple[SemanticHealthCheck, ModelProvider | None, ModelProvider | None]:
+    """Runs the three-tier check and, only on success, returns the
+    (primary, fallback) providers to actually use this run -- avoids
+    building/probing the primary provider twice. Never raises: every
+    failure mode is reported through the returned `SemanticHealthCheck`
+    instead, because a semantic-provider problem must never abort the
+    deterministic code index (ARCHITECTURE.md §4.9's failure-isolation
+    principle applies here too).
+    """
+    if not config.enabled:
+        return SemanticHealthCheck(status=SemanticHealthStatus.disabled), None, None
+    if not config.model:
+        # `enabled=True` with an empty `model` is what every fresh `rune
+        # init` produces (SemanticConfig's own defaults) -- it means
+        # "haven't configured semantic yet", not "someone broke an
+        # existing configuration". Treated identically to `disabled`
+        # (silent, no message) rather than `config_error`, so a project
+        # that has simply never touched semantic settings doesn't fail
+        # loudly on every single `rune update`. `config_error` is reserved
+        # for a configuration that was actually attempted and got
+        # something wrong -- a non-empty model with a missing API key, or
+        # an unrecognized provider name, both handled below.
+        return SemanticHealthCheck(status=SemanticHealthStatus.disabled), None, None
+
+    try:
+        primary = build_provider(
+            provider_name=config.provider, model=config.model, reasoning=config.reasoning
+        )
+    except ProviderError as exc:
+        return (
+            SemanticHealthCheck(status=SemanticHealthStatus.config_error, message=str(exc)),
+            None,
+            None,
+        )
+
+    fallback: ModelProvider | None = None
+    if config.fallback_model:
+        try:
+            fallback = build_provider(
+                provider_name=config.provider, model=config.fallback_model, reasoning=config.reasoning
+            )
+        except ProviderError:
+            # The fallback model is optional -- a bad fallback config must
+            # not block the primary from running, same as the pre-existing
+            # (pre-health-check) behavior.
+            fallback = None
+
+    # Step 2: one lightweight connection probe against the primary model,
+    # with one retry for anything that isn't a rate limit.
+    last_error: ProviderError | None = None
+    for _ in range(2):
+        try:
+            primary.probe()
+            return SemanticHealthCheck(status=SemanticHealthStatus.ok), primary, fallback
+        except ProviderError as exc:
+            if exc.is_rate_limited:
+                return (
+                    SemanticHealthCheck(
+                        status=SemanticHealthStatus.rate_limited,
+                        message=f"provider rate-limited the startup check: {exc}",
+                    ),
+                    None,
+                    None,
+                )
+            last_error = exc
+    return (
+        SemanticHealthCheck(
+            status=SemanticHealthStatus.probe_failed,
+            message=f"provider startup check failed after one retry: {last_error}",
+        ),
+        None,
+        None,
+    )

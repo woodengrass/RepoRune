@@ -6,10 +6,13 @@ from pathlib import Path
 import httpx
 import pytest
 
+from rune.core.hashing import working_tree_fingerprint
 from rune.core.semantic.provider import (
     OpenAICompatibleProvider,
     ProviderError,
     ProviderResponse,
+    SemanticHealthStatus,
+    check_semantic_health,
     reasoning_payload,
 )
 from rune.core.semantic.redaction import redact_raw_scope_summary, redact_text
@@ -17,6 +20,7 @@ from rune.core.semantic.validation import validate_and_build_scope_summary
 from rune.core.semantic.worker import (
     aggregate_metrics,
     compute_source_files,
+    mark_possibly_stale,
     needs_refresh,
     refresh_scope_summary,
     run_semantic_refresh,
@@ -185,6 +189,176 @@ def test_provider_requests_json_object_response_format() -> None:
     )
     provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
     assert captured["body"]["response_format"] == {"type": "json_object"}
+
+
+def test_probe_succeeds_on_200() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["reasoning"] == {"enabled": False}  # probe forces reasoning off
+        assert body["max_tokens"] == 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": None}}]})
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=_client(handler)
+    )
+    provider.probe()  # must not raise -- probe doesn't parse content at all
+
+
+def test_probe_raises_with_status_code_on_429() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="rate limited")
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=_client(handler)
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        provider.probe()
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.is_rate_limited
+
+
+def test_probe_raises_without_status_code_on_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=_client(handler)
+    )
+    with pytest.raises(ProviderError) as exc_info:
+        provider.probe()
+    assert exc_info.value.status_code is None
+    assert not exc_info.value.is_rate_limited
+
+
+def test_provider_error_non_429_status_is_not_rate_limited() -> None:
+    assert not ProviderError("HTTP 500: boom", status_code=500).is_rate_limited
+
+
+# --------------------------------------------------------------------------
+# check_semantic_health -- ARCHITECTURE.md §4.5's three-tier provider
+# health check (round 15, IMPLEMENTATION_PLAN.md items 82-84)
+# --------------------------------------------------------------------------
+
+
+def test_health_check_disabled_when_semantic_enabled_is_false() -> None:
+    from rune.core.storage.models import SemanticConfig
+
+    health, primary, fallback = check_semantic_health(SemanticConfig(enabled=False, model="m"))
+    assert health.status is SemanticHealthStatus.disabled
+    assert health.message is None
+    assert primary is None
+    assert fallback is None
+
+
+def test_health_check_disabled_when_model_is_the_untouched_default(monkeypatch) -> None:
+    """`enabled=True` with an empty `model` is exactly what every fresh
+    `rune init` produces -- must be treated as "nothing configured yet",
+    not a loud config error, or every unconfigured project would fail
+    loudly on its very first `rune update`.
+    """
+    from rune.core.storage.models import SemanticConfig
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "irrelevant")
+    health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model=""))
+    assert health.status is SemanticHealthStatus.disabled
+    assert primary is None
+
+
+def test_health_check_config_error_when_api_key_env_var_missing(monkeypatch) -> None:
+    from rune.core.storage.models import SemanticConfig
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model="a-real-model"))
+    assert health.status is SemanticHealthStatus.config_error
+    assert "OPENROUTER_API_KEY" in health.message
+    assert primary is None
+
+
+def test_health_check_config_error_on_unknown_provider(monkeypatch) -> None:
+    from rune.core.storage.models import SemanticConfig
+
+    health, primary, _fallback = check_semantic_health(
+        SemanticConfig(enabled=True, provider="not-a-real-provider", model="m")
+    )
+    assert health.status is SemanticHealthStatus.config_error
+    assert primary is None
+
+
+def test_health_check_rate_limited_on_429_probe(monkeypatch) -> None:
+    from rune.core.storage.models import SemanticConfig
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+
+    def fake_build_provider(*, provider_name, model, reasoning=None):
+        class _RateLimited:
+            model = "m"
+
+            def probe(self):
+                raise ProviderError("HTTP 429: slow down", status_code=429)
+
+        return _RateLimited()
+
+    import rune.core.semantic.provider as provider_module
+
+    monkeypatch.setattr(provider_module, "build_provider", fake_build_provider)
+    health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model="m"))
+    assert health.status is SemanticHealthStatus.rate_limited
+    assert primary is None
+
+
+def test_health_check_probe_failed_retries_once_then_gives_up(monkeypatch) -> None:
+    """Non-rate-limit probe failures get exactly one retry -- confirmed by
+    counting probe() calls -- before the health check gives up and reports
+    `probe_failed`.
+    """
+    from rune.core.storage.models import SemanticConfig
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    call_count = {"n": 0}
+
+    def fake_build_provider(*, provider_name, model, reasoning=None):
+        class _AlwaysBroken:
+            model = "m"
+
+            def probe(self):
+                call_count["n"] += 1
+                raise ProviderError("HTTP 500: broken")
+
+        return _AlwaysBroken()
+
+    import rune.core.semantic.provider as provider_module
+
+    monkeypatch.setattr(provider_module, "build_provider", fake_build_provider)
+    health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model="m"))
+    assert health.status is SemanticHealthStatus.probe_failed
+    assert primary is None
+    assert call_count["n"] == 2  # one attempt + one retry, not unbounded
+
+
+def test_health_check_ok_when_probe_succeeds(monkeypatch) -> None:
+    from rune.core.storage.models import SemanticConfig
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+
+    def fake_build_provider(*, provider_name, model, reasoning=None):
+        class _Healthy:
+            def __init__(self, model):
+                self.model = model
+
+            def probe(self):
+                return None
+
+        return _Healthy(model)
+
+    import rune.core.semantic.provider as provider_module
+
+    monkeypatch.setattr(provider_module, "build_provider", fake_build_provider)
+    health, primary, fallback = check_semantic_health(
+        SemanticConfig(enabled=True, model="m", fallback_model="fb")
+    )
+    assert health.status is SemanticHealthStatus.ok
+    assert primary is not None and primary.model == "m"
+    assert fallback is not None and fallback.model == "fb"
 
 
 def test_reasoning_payload_none_when_config_is_default() -> None:
@@ -389,6 +563,99 @@ def test_needs_refresh_true_when_hash_differs() -> None:
         model="m", source_hash="sha256:old", status=SemanticStatus.fresh,
     )
     assert needs_refresh(current, "sha256:new") is True
+
+
+def _scope_with_files(scope_id: str, files: list[str]) -> Scope:
+    return Scope(
+        id=scope_id, name=scope_id, locked=False, source=ScopeSource.human,
+        members=ScopeMembers(files=files),
+    )
+
+
+def test_mark_possibly_stale_skips_scope_that_never_succeeded() -> None:
+    """DATA_MODEL.md §2.4's round-15 decision: a scope with no current
+    summary at all, or one that's still `unavailable`, needs no extra
+    revision here -- `needs_refresh` already returns True unconditionally
+    for both, so it's picked up the moment a provider is available again.
+    """
+    scope = _scope_with_files("app", ["app/a.py"])
+    unavailable = ScopeSummary(
+        scope_id="app", revision=1, purpose="", generated_at="2026-01-01T00:00:00Z",
+        model="m", source_hash="sha256:old", status=SemanticStatus.unavailable,
+    )
+    result = mark_possibly_stale(
+        [scope], {"app": unavailable}, {"app/a.py": "sha256:new"}, [], "2026-01-02T00:00:00Z"
+    )
+    assert result == []
+
+    result_no_current = mark_possibly_stale(
+        [scope], {}, {"app/a.py": "sha256:new"}, [], "2026-01-02T00:00:00Z"
+    )
+    assert result_no_current == []
+
+
+def test_mark_possibly_stale_skips_scope_whose_hash_is_unchanged() -> None:
+    scope = _scope_with_files("app", ["app/a.py"])
+    fresh = ScopeSummary(
+        scope_id="app", revision=1, purpose="p", generated_at="2026-01-01T00:00:00Z",
+        model="m", source_hash=working_tree_fingerprint({"app/a.py": "sha256:same"}),
+        source_files={"app/a.py": "sha256:same"}, status=SemanticStatus.fresh,
+    )
+    result = mark_possibly_stale(
+        [scope], {"app": fresh}, {"app/a.py": "sha256:same"}, [], "2026-01-02T00:00:00Z"
+    )
+    assert result == []
+
+
+def test_mark_possibly_stale_appends_revision_copying_old_content_forward() -> None:
+    """The core round-15 behavior: member files changed, no provider is
+    usable this run, but the scope has real prior content -- copy it
+    forward into a new revision, only touching status/hash/timestamp, so
+    a consumer sees "this is possibly outdated" instead of a silently
+    wrong `fresh`.
+    """
+    scope = _scope_with_files("app", ["app/a.py"])
+    old_hash = working_tree_fingerprint({"app/a.py": "sha256:old"})
+    current = ScopeSummary(
+        scope_id="app", revision=3, purpose="does the app thing",
+        responsibilities=["handles requests"], generated_at="2026-01-01T00:00:00Z",
+        model="m", source_hash=old_hash, source_files={"app/a.py": "sha256:old"},
+        status=SemanticStatus.fresh,
+    )
+    result = mark_possibly_stale(
+        [scope], {"app": current}, {"app/a.py": "sha256:new"}, [], "2026-01-02T00:00:00Z"
+    )
+    assert len(result) == 1
+    updated = result[0]
+    assert updated.revision == 4
+    assert updated.status is SemanticStatus.possibly_stale
+    assert updated.generated_at == "2026-01-02T00:00:00Z"
+    assert updated.source_files == {"app/a.py": "sha256:new"}
+    assert updated.source_hash == working_tree_fingerprint({"app/a.py": "sha256:new"})
+    # Content is copied forward unchanged -- this is a status/hash/
+    # timestamp-only revision, never a fabricated re-summary.
+    assert updated.purpose == "does the app thing"
+    assert updated.responsibilities == ["handles requests"]
+
+
+def test_mark_possibly_stale_fires_again_on_a_second_hash_change() -> None:
+    """A scope already `possibly_stale` whose source changes yet again
+    while still no provider is available gets another revision reflecting
+    the latest files -- same hash-driven trigger as any other
+    system-appended revision, no special-casing for "already stale".
+    """
+    scope = _scope_with_files("app", ["app/a.py"])
+    current = ScopeSummary(
+        scope_id="app", revision=4, purpose="p", generated_at="2026-01-02T00:00:00Z",
+        model="m", source_hash=working_tree_fingerprint({"app/a.py": "sha256:mid"}),
+        source_files={"app/a.py": "sha256:mid"}, status=SemanticStatus.possibly_stale,
+    )
+    result = mark_possibly_stale(
+        [scope], {"app": current}, {"app/a.py": "sha256:newer"}, [], "2026-01-03T00:00:00Z"
+    )
+    assert len(result) == 1
+    assert result[0].revision == 5
+    assert result[0].source_files == {"app/a.py": "sha256:newer"}
 
 
 def test_aggregate_metrics_returns_zeros_for_empty_input() -> None:

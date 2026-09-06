@@ -60,6 +60,90 @@ def test_update_then_status_reports_fresh_again(git_repo: Path) -> None:
     assert payload["files_modified"] == 0
 
 
+def test_update_fails_loudly_on_semantic_config_error(git_repo: Path, monkeypatch) -> None:
+    """ARCHITECTURE.md §4.5's three-tier provider health check, round 15:
+    a model that was actually configured (not the untouched empty-string
+    default) with no matching API key env var is a real setup mistake --
+    `rune update` must still complete the deterministic index (printed in
+    the "Updated: ..." line) but report semantic's config error loudly and
+    exit non-zero, not bury it as just another stat.
+    """
+    (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    (git_repo / ".rune" / "config.toml").write_text(
+        '[semantic]\nmodel = "some/model"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    (git_repo / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["update", "--path", str(git_repo)])
+    assert result.exit_code == 1
+    assert "Updated:" in result.output  # the deterministic index still ran and was reported
+    assert "semantic" in result.output
+    assert "OPENROUTER_API_KEY" in result.output
+
+
+def test_update_marks_possibly_stale_when_no_provider_and_hash_changes(git_repo: Path, monkeypatch) -> None:
+    """End-to-end for the round-15 possibly_stale trigger: a scope with a
+    real prior summary whose member file content changes, on a run where
+    semantic can't reach any provider (a config error here), must not
+    keep reporting the old `fresh` status against content that no longer
+    matches it.
+    """
+    import sqlite3
+
+    from rune.core.hashing import content_hash
+    from rune.core.storage.canonical import append_jsonl_many, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+        SemanticStatus,
+    )
+
+    (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    layout = RuneLayout(git_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["a.py"])),
+        ]),
+    )
+    old_hash = content_hash((git_repo / "a.py").read_bytes())
+    append_jsonl_many(
+        layout.semantic_jsonl,
+        [
+            ScopeSummary(
+                scope_id="app", revision=1, purpose="does foo things",
+                generated_at="2026-01-01T00:00:00Z", model="m",
+                source_hash=old_hash, source_files={"a.py": old_hash},
+                status=SemanticStatus.fresh,
+            )
+        ],
+    )
+    result = runner.invoke(app, ["rebuild-cache", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+
+    (git_repo / ".rune" / "config.toml").write_text(
+        '[semantic]\nmodel = "some/model"\n', encoding="utf-8"
+    )
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    (git_repo / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["update", "--path", str(git_repo)])
+    assert result.exit_code == 1  # semantic config error, but the index still ran
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    row = conn.execute(
+        "SELECT current_revision, status FROM semantic_objects WHERE scope_id = 'app'"
+    ).fetchone()
+    assert row == (2, "possibly_stale")
+
+
 def test_scope_suggest_rejection_has_no_canonical_side_effect(git_repo: Path) -> None:
     (git_repo / "app").mkdir()
     (git_repo / "app" / "a.py").write_text("x = 1\n", encoding="utf-8")

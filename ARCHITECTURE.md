@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十一輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -30,11 +30,15 @@ review，5 條 finding 全部確認為真並修正**：SQLite cache 沒有 schem
 會讓 materialize 持續 crash）、scope 刪除後重建同名 scope 永遠卡在 orphaned、`rune update` 的 CLI
 說明文字仍宣稱 zero LLM calls、`needs_refresh` 的 docstring 用詞不精確、`compute_source_files`
 的邊界案例澄清（不改變行為，只精確化文件措辭），細節見第 4.5 節與文末「第十四輪修訂」。**第十輪
-確認了先前記錄但延後的 `possibly_stale` 觸發邏輯與 provider 健康檢查設計**（尚未實作，是下一個
-session 的第一個任務）：`possibly_stale` 只在「曾經有內容、hash 對不上、這次沒 provider」時觸發，
-`possibly_stale`/`stale` 在 retrieval 端絕不直接回傳舊摘要文字、只能指向真實原始碼；provider 健康
-檢查改成三層（設定錯誤直接攔下要求修正、rate limit 提示使用者、其他錯誤 retry 一次後大聲失敗但不
-擋決定性索引），細節見第 4.5 節。本文件與
+確認了先前記錄但延後的 `possibly_stale` 觸發邏輯與 provider 健康檢查設計**：`possibly_stale` 只在
+「曾經有內容、hash 對不上、這次沒 provider」時觸發，`possibly_stale`/`stale` 在 retrieval 端絕不
+直接回傳舊摘要文字、只能指向真實原始碼；provider 健康檢查改成三層（設定錯誤直接攔下要求修正、
+rate limit 提示使用者、其他錯誤 retry 一次後大聲失敗但不擋決定性索引）。**第十一輪完成第十輪確認
+設計的實作**：`check_semantic_health`（三層健康檢查）、`ModelProvider.probe()`、`ProviderError.
+status_code`/`is_rate_limited`、`mark_possibly_stale`、CLI 依健康狀態決定 exit code，並在實作中
+發現並修正一處對第十輪原始措辭的必要澄清——「`enabled=True` 但 `model` 為空字串」（每個全新專案
+的預設狀態）改歸類為靜默跳過而非設定錯誤，避免所有未設定過 semantic 的專案每次 `rune update` 都
+無謂地大聲失敗，細節見第 4.5 節與文末「第十五輪修訂」。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。
@@ -346,10 +350,10 @@ Semantic staleness 判斷完全基於 **member 檔案的 content hash**（見 DA
    `rebuild_cache` 「清空重建」影響（只在真的嘗試過 refresh 時 append 一行），但會隨 `memory.db`
    整個被刪除重建而消失（接受，因為沒有 canonical 背書可以重建它）。
 
-**`possibly_stale` 觸發邏輯與 provider 健康檢查（本輪確認設計，尚未實作，是下一個 session 的第一個
-任務）**：先前發現 provider 不可用（沒有 API key／`semantic.enabled=false`／預算用完）時，一個已經
-變 stale 的 scope 完全跳過、不會有任何狀態轉換，`possibly_stale` 這個 enum 值從 Milestone 5 一開始
-就沒有任何觸發邏輯。討論後確認以下設計：
+**`possibly_stale` 觸發邏輯與 provider 健康檢查（第十一輪已實作）**：先前發現 provider 不可用（沒有
+API key／`semantic.enabled=false`／預算用完）時，一個已經變 stale 的 scope 完全跳過、不會有任何狀態
+轉換，`possibly_stale` 這個 enum 值從 Milestone 5 一開始就沒有任何觸發邏輯。第十輪討論確認以下設計，
+第十一輪實作完成：
 
 1. **`possibly_stale` 只在「曾經有過內容、現在 hash 對不上、但這次沒有 provider 可用」時觸發**：
    附加新 revision，內容複製舊的（比照既有的「系統自動附加 revision 必須是完整 snapshot」規則），
@@ -370,31 +374,50 @@ Semantic staleness 判斷完全基於 **member 檔案的 content hash**（見 DA
    錯誤」與「執行期問題」**：先前 `_build_semantic_providers` 把「使用者刻意關閉」「忘記設定」
    「打錯字」「暫時性網路問題」全部用同一套「靜默回傳 None」邏輯處理，導致一個打錯字的 model 名稱
    或忘記 export 的 API key 會讓 semantic 永遠悄悄不執行、完全沒有任何提示，直到使用者自己發現。
-   新設計（**尚未實作**）：
+   實際設計（`rune.core.semantic.provider.check_semantic_health`）：
    ```text
    config.semantic.enabled != true
      → 維持現狀：使用者刻意關閉，靜默跳過，不是錯誤
-   config.semantic.enabled == true：
+   config.semantic.enabled == true 但 model 是空字串
+     → 視同 disabled，靜默跳過，不印任何訊息（見下方「實作時發現並修正」）
+   config.semantic.enabled == true 且 model 非空：
      Step 1（純靜態檢查，不呼叫網路）：
-       model 是空字串，或對應 provider 的 API key 環境變數沒設
+       對應 provider 的 API key 環境變數沒設，或 provider 名稱不是已知的
+       openrouter/openai
          → 這是設定錯誤，不是暫時性問題：印出明確訊息告訴使用者缺什麼、
-           怎麼補（例如「semantic.model 未設定」或「OPENROUTER_API_KEY
-           未設定」），這次 semantic 整段跳過，但決定性程式碼索引照常完成
-     Step 2（僅 Step 1 通過才做，一次輕量連線測試呼叫）：
-       回應是 rate limit（HTTP 429）
-         → 提示使用者（預期內、非使用者的錯），這次跳過 semantic
+           怎麼補（例如「OPENROUTER_API_KEY is not set」），這次 semantic
+           整段跳過，但決定性程式碼索引照常完成，CLI 對這個狀態回傳
+           exit code 1（「在初始啟動的時候就報錯」，不能讓錯誤悄悄擴大）
+     Step 2（僅 Step 1 通過才做，一次輕量連線測試呼叫，`ModelProvider.
+     probe()`：max_tokens=1、強制關閉 reasoning，避免 thinking model 把
+     這一點點 budget 燒在 reasoning 上而誤判為探測失敗）：
+       回應是 rate limit（HTTP 429，`ProviderError.is_rate_limited`）
+         → 提示使用者（預期內、非使用者的錯），這次跳過 semantic，CLI
+           印出訊息但 exit code 維持 0
            （避免後面每個 scope 都再撞一次同樣的 429，浪費呼叫）
        回應是其他失敗原因
          → retry 一次；仍失敗 → 這次跳過 semantic，但大聲失敗
            （明確錯誤訊息，代表真的有問題：key 錯誤、model 名稱
-           provider 端不認得等），決定性索引照常完成
+           provider 端不認得等），決定性索引照常完成，CLI 對這個狀態
+           也回傳 exit code 1（「大聲失敗」）
        成功
          → 照現有方式跑每個 scope 的刷新（各自既有的 fallback ladder 不變）
    ```
-   實作上需要 `provider.py` 補上能分辨「是不是 429」的機制（目前 `ProviderError` 只是一句字串，
-   沒有結構化資訊可以判斷是哪種失敗），以及在 `update.py`/`worker.py` 新增這個一次性的 precheck
-   步驟（跟 semantic refresh 本身一樣，只在 `not full` 時跑）。CLI 需要能把這些訊息實際印給使用者
-   看（不能只塞進回傳的 stats dict，使用者當下就要看得到）。
+   `ProviderError` 新增 `status_code`（HTTP 狀態碼，網路層級失敗時為 `None`）與
+   `is_rate_limited` 屬性；`update.py` 在 `not full` 時跑這個一次性 precheck；CLI
+   的 `update` 指令把 `run_update` 回傳的 `semantic_health_status`/`semantic_health_message`
+   從一般 stats k=v 那行拆出來，另外印一行、且依狀態決定 exit code，不會被埋沒在一堆數字裡。
+
+   **實作時發現並修正的一點（相對於第十輪文件原始措辭的修正）**：原始設計把「model 是空字串」跟
+   「API key 沒設」一起歸類為 Step 1 的「設定錯誤」。但 `SemanticConfig` 的預設值正是
+   `enabled=True, model=""`——也就是說每一個從沒碰過 semantic 設定的全新專案都會落在這個狀態，
+   若真的當成「設定錯誤」處理，會讓每個從未設定過 semantic 的專案在每一次 `rune update` 都大聲
+   失敗，這既不是使用者的本意也不是「打錯字/忘記 export」這種情境（那兩個情境都預設使用者*已經*
+   嘗試設定了什麼）。因此在實作時把「`enabled=True` 但 `model` 是空字串」重新歸類為等同
+   `disabled`（靜默跳過，不印訊息），把 `config_error`（連同 CLI 的 exit code 1）保留給「使用者
+   確實設定了 model，但缺 API key 或 provider 名稱打錯」這種更貼近原意的情境。這是實作過程中發現
+   的必要澄清，不是重新開放已確認的設計本身——三層檢查的結構、`possibly_stale` 的觸發規則、
+   retrieval 端不顯示舊摘要的規則都完全比照第十輪的決議。
 
 **第二輪品質複查（外部 review 轉述，本輪新增）修正的 5 個問題**：
 

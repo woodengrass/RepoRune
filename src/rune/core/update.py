@@ -34,10 +34,16 @@ from rune.core.scopes.model import (
     load_scopes,
     save_scopes,
 )
-from rune.core.semantic.provider import ModelProvider, ProviderError, build_provider
+from rune.core.semantic.provider import (
+    ModelProvider,
+    SemanticHealthCheck,
+    SemanticHealthStatus,
+    check_semantic_health,
+)
 from rune.core.semantic.worker import (
     aggregate_metrics,
     detect_orphaned_scopes,
+    mark_possibly_stale,
     run_semantic_refresh,
 )
 from rune.core.storage.canonical import (
@@ -176,36 +182,24 @@ def _extract_references_only(scanned: ScannedFile) -> list[RawReference]:
         return []
 
 
-def _build_semantic_providers(config: RuneConfig) -> tuple[ModelProvider | None, ModelProvider | None]:
-    """Builds (primary, fallback) providers for the semantic worker, or
-    (None, None) if semantic refresh can't run this update — disabled in
-    config, no model configured, or the required API key env var is
-    missing. Never raises: a semantic-provider problem must never abort
-    the deterministic index update (ARCHITECTURE.md §4.9's failure-
-    isolation principle applies here too), it just means no scopes get
-    refreshed this run.
+def _build_semantic_providers(
+    config: RuneConfig,
+) -> tuple[ModelProvider | None, ModelProvider | None, SemanticHealthCheck]:
+    """Runs the three-tier provider health check (ARCHITECTURE.md §4.5,
+    `check_semantic_health`) and returns the (primary, fallback) providers
+    to use this run alongside the check's own result. `primary` is only
+    ever non-None when `health.status is SemanticHealthStatus.ok`; every
+    other status means semantic refresh can't run this update at all —
+    disabled in config, a Step 1 config error (empty model / missing API
+    key), or a Step 2 startup probe that failed (rate-limited or, after
+    one retry, some other failure). Never raises: a semantic-provider
+    problem must never abort the deterministic index update
+    (ARCHITECTURE.md §4.9's failure-isolation principle applies here too);
+    the caller uses `health` to decide whether to fall back to
+    `mark_possibly_stale` and what to tell the user.
     """
-    if not config.semantic.enabled or not config.semantic.model:
-        return None, None
-    try:
-        primary = build_provider(
-            provider_name=config.semantic.provider,
-            model=config.semantic.model,
-            reasoning=config.semantic.reasoning,
-        )
-    except ProviderError:
-        return None, None
-    fallback = None
-    if config.semantic.fallback_model:
-        try:
-            fallback = build_provider(
-                provider_name=config.semantic.provider,
-                model=config.semantic.fallback_model,
-                reasoning=config.semantic.reasoning,
-            )
-        except ProviderError:
-            fallback = None
-    return primary, fallback
+    health, primary, fallback = check_semantic_health(config.semantic)
+    return primary, fallback, health
 
 
 def _append_semantic_log(layout: RuneLayout, lines: list[str]) -> None:
@@ -217,7 +211,7 @@ def _append_semantic_log(layout: RuneLayout, lines: list[str]) -> None:
             f.write(f"{utc_now_iso()} {line}\n")
 
 
-def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]:
+def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float | str]:
     config = load_config(layout.config_path)
     repo_root = layout.repo_root
     now = utc_now_iso()
@@ -368,8 +362,10 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]
     # module's docstring, is "zero LLM calls, zero network, local parsing
     # only". Confirmed by hand this was being violated: rebuild-cache with
     # a configured provider was silently making real API calls.
+    semantic_health: SemanticHealthCheck | None = None
+    possibly_stale_revisions: list[ScopeSummary] = []
     if not full:
-        primary_provider, fallback_provider = _build_semantic_providers(config)
+        primary_provider, fallback_provider, semantic_health = _build_semantic_providers(config)
         if primary_provider is not None:
             refresh_result = run_semantic_refresh(
                 repo_root=repo_root,
@@ -405,6 +401,21 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]
                     total_cost=semantic_metrics_summary["cost"],
                     total_latency_seconds=semantic_metrics_summary["latency_seconds"],
                 )
+        else:
+            # No provider usable this run at all -- disabled, a Step 1
+            # config error, or a failed Step 2 startup probe
+            # (ARCHITECTURE.md §4.5). DATA_MODEL.md §2.4: a scope whose
+            # member files changed since its last real summary must not
+            # keep silently reporting fresh/stale against content that no
+            # longer matches, so it gets a possibly_stale marker instead.
+            possibly_stale_revisions = mark_possibly_stale(
+                scopes_for_semantic,
+                current_summaries,
+                {f.path: f.content_hash for f in new_files},
+                new_symbols,
+                now,
+            )
+            new_semantic_revisions.extend(possibly_stale_revisions)
 
     if new_semantic_revisions:
         semantic_override = [*existing_semantic, *new_semantic_revisions]
@@ -452,7 +463,20 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]
             "files_deleted": len(changeset.deleted_paths),
             "scope_files_auto_assigned": len(auto_assigned_scope_ids),
             "semantic_scopes_refreshed": len(new_semantic_revisions),
+            "semantic_scopes_possibly_stale": len(possibly_stale_revisions),
             **{f"semantic_{key}": value for key, value in semantic_metrics_summary.items()},
         }
     )
+    # `disabled`/`ok` are the expected, silent-by-design outcomes (see
+    # SemanticHealthStatus) and deliberately don't surface here at all --
+    # everything else must reach the CLI as a distinct, clearly-labeled
+    # field rather than blending into the generic k=v stats line, so it
+    # can't be missed the way a silently-skipped semantic refresh could be
+    # before this health check existed.
+    if semantic_health is not None and semantic_health.status not in (
+        SemanticHealthStatus.ok,
+        SemanticHealthStatus.disabled,
+    ):
+        stats["semantic_health_status"] = semantic_health.status.value
+        stats["semantic_health_message"] = semantic_health.message or ""
     return stats

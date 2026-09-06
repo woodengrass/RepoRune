@@ -83,36 +83,37 @@ DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但
 
 175 個測試全綠，`ruff check` 全綠。
 
-**第十五輪修訂（確認設計、尚未實作）**：針對第 70 條記錄的「provider 不可用時 possibly_stale
-沒有觸發邏輯」缺口，跟使用者討論後定案三項設計，但**刻意不在本輪動手**——使用者要求先把決議完整寫
-進文件，下一個 session 開工前先讀，再開始寫程式碼。細節見 IMPLEMENTATION_PLAN.md 第 82-84 條、
-ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4：
+**第十五輪修訂（確認設計）**：針對第 70 條記錄的「provider 不可用時 possibly_stale 沒有觸發邏輯」
+缺口，跟使用者討論後定案三項設計，當輪只寫文件、刻意不動手——使用者要求先把決議完整寫進文件，
+下一個 session 開工前先讀，再開始寫程式碼。
 
-1. **`possibly_stale` 只在「曾有內容、hash 對不上、這次沒 provider」時觸發**：附加新 revision，
-   複製前一筆 current revision 內容，只改 `status=possibly_stale`／`source_hash`／
-   `source_files`／`generated_at`。**「從沒成功過」的 scope 不需要額外處理**——`needs_refresh`
-   對 `current=None`／`unavailable` 本來就無條件回傳 `True`，不必為此多留一筆空白 revision（使用
-   者主動指出這點可以簡化，不需要比照第一點一樣特別處理）。
-2. **`possibly_stale`／`stale` 在 retrieval 端絕不能把舊摘要文字當作可信內容提供**：跟 Note 的
-   `[STALE]`（顯示舊內容 + 警告）刻意不同——LLM 生成的長篇散文比人工寫的短筆記有更高的
-   hallucination 風險，「看起來權威但過期」的摘要比完全沒有更危險。canonical 仍保留舊內容（稽核、
-   以及程式碼還原成舊版時可不必重新呼叫 LLM），但 Milestone 6 的 retrieval 對這兩種 status 必須
-   回傳「摘要已過期，請直接讀取 `source_files` 確認」之類的提示，不能回傳舊摘要本身。
-3. **Provider 健康檢查從靜默吞掉一切改成三層，每次 `rune update` 開頭跑一次**（而非每個 scope
-   各自跑）：
-   - `semantic.enabled != true` → 維持現狀，靜默跳過。
-   - `enabled == true` 時，Step 1（純靜態，不連網）：model 是空字串，或對應 provider 的 API key
-     環境變數沒設 → **設定錯誤**，印出明確訊息告訴使用者缺什麼、怎麼補，這次 semantic 整段跳過，
-     決定性索引照常完成。
-   - Step 2（僅 Step 1 通過才做，一次輕量連線測試）：HTTP 429 → 提示使用者（預期內、非使用者的
-     錯），跳過 semantic；其他失敗 → retry 一次，仍失敗則跳過 semantic 但**大聲失敗**（明確錯誤
-     訊息），決定性索引照常完成；成功 → 照現有方式跑每個 scope 的刷新。
-   - 需要 `provider.py` 補上分辨「是不是 429」的結構化機制（目前 `ProviderError` 只是字串）、
-     `update.py`/`worker.py` 新增這個一次性 precheck、CLI 要能把訊息實際印出來（不能只塞進 stats
-     dict）。**這是下一個 session 開工的第一個任務。**
+**第十六輪修訂（完成第十五輪確認設計的實作，見 IMPLEMENTATION_PLAN.md 第 85-90 條）**：
 
-**Milestone 6（Policies & Memory）是再下一步**（等三層 provider 健康檢查與 possibly_stale
-觸發邏輯做完之後）。
+1. **`possibly_stale` 觸發邏輯已實作**（`mark_possibly_stale`，`rune.core.semantic.worker`）：
+   只在「曾有內容、hash 對不上、這次沒 provider」時觸發，附加新 revision，複製前一筆 current
+   revision 內容，只改 `status=possibly_stale`／`source_hash`／`source_files`／`generated_at`。
+   「從沒成功過」的 scope 不需要額外處理——`needs_refresh` 對 `current=None`／`unavailable` 本來
+   就無條件回傳 `True`。
+2. **Provider 健康檢查已實作為三層**（`check_semantic_health`，`rune.core.semantic.provider`），
+   每次 `rune update` 開頭跑一次（`not full` 時）：`semantic.enabled != true` → 靜默跳過；Step 1
+   （純靜態，不連網）API key 環境變數沒設或 provider 名稱不認得 → **設定錯誤**，印出訊息，CLI exit
+   code 1；Step 2（一次輕量連線測試，`ModelProvider.probe()`）HTTP 429 → 提示使用者，exit code 0；
+   其他失敗 retry 一次仍失敗 → **大聲失敗**，exit code 1；成功 → 照現有方式刷新每個 scope。
+   `ProviderError` 新增 `status_code`/`is_rate_limited`；CLI 的 `update` 指令把健康狀態訊息從一般
+   stats 那行拆出來單獨印出。
+3. **實作時發現並修正一處對第十五輪原始措辭的必要澄清**：`SemanticConfig` 的預設值正是
+   `enabled=True, model=""`——如果照原始措辭把「model 是空字串」也算進「設定錯誤」，每個從未設定過
+   semantic 的全新專案會在每次 `rune update` 都大聲失敗、exit code 1。用既有測試
+   `test_update_then_status_reports_fresh_again`（預期未動過 semantic 設定時 exit code 0）重現確認
+   這個問題後，把「`enabled=True` 且 `model=""`」改歸類為等同 `disabled`（靜默跳過），`config_error`
+   保留給「已經設定了 model，但缺 key 或名稱打錯」這種更貼近使用者原話的情境。已同步更新
+   ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4 的措辭記錄這個澄清。
+
+新增 17 個測試，每個都用 `git stash` 只還原 `src/` 改動、保留新測試，確認修法前確實會失敗才算數。
+192 個測試全綠，`ruff check` 全綠。
+
+retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、改指向 `source_files`」的規則（第十五輪決議
+第 2 點）尚未實作，屬於 Milestone 6 範圍，留到那時再做——見下方「立刻可以做的下一步」。
 
 ## 專案是什麼
 
@@ -128,10 +129,10 @@ commit，全部已 push，沒有未提交的變更）。
 
 ## 必看的三份設計文件（優先順序：先讀這三份，再看程式碼）
 
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第十輪
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — 系統設計、模組職責、資料流、package 邊界。目前**第十一輪
   修訂**。
 - [`DATA_MODEL.md`](DATA_MODEL.md) — 所有 canonical Pydantic model、SQLite schema、revision
-  lifecycle 規則。目前**第九輪修訂**（這個輪數指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
+  lifecycle 規則。目前**第十輪修訂**（這個輪數指的是 DATA_MODEL 自己的版號，跟 ARCHITECTURE/
   IMPLEMENTATION_PLAN 的輪數不是同一套計數，不要混淆——三份文件各自獨立記錄自己的修訂輪次）。
 - [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) — 8 個 Milestone 的交付項目、驗收標準、
   **文末的「設計決策記錄」按輪次列出每一次修正**，這是最重要的部分：每個 milestone 完成後都有
@@ -193,7 +194,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**175 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**192 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
@@ -335,22 +336,14 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-**第一優先：實作第十五輪確認的三層 provider 健康檢查 + `possibly_stale` 觸發邏輯**（設計已定案，
-尚未動手，見上方「第十五輪修訂」段落與 IMPLEMENTATION_PLAN.md 第 82-84 條、ARCHITECTURE.md §4.5、
-DATA_MODEL.md §2.4）。開工前重讀這三處，順序建議：
-1. `provider.py` 先補結構化的錯誤區分（至少要能分辨「HTTP 429」跟「其他失敗」，目前 `ProviderError`
-   只是一句字串），這是後面兩步的地基。
-2. `update.py`/`worker.py` 新增一次性 precheck（config 靜態檢查 → 輕量連線測試），只在
-   `semantic.enabled == true` 且 `not full` 時跑；三種結果（設定錯誤／429／其他失敗重試後仍失敗／
-   成功）分別對應文件裡寫的訊息與後續行為。
-3. CLI（`cli/main.py`）要把 precheck 的訊息實際印給使用者看，不能只塞進 stats dict。
-4. `possibly_stale` 觸發邏輯接在 precheck 判定「這次沒有可用 provider」之後：對曾經成功過的
-   scope 附加一筆複製舊內容、只改 status/hash/timestamp 的新 revision；從沒成功過的 scope 不必
-   特別處理。
-5. retrieval 端的「不顯示舊摘要、改指向 source_files」規則屬於 Milestone 6 範圍，這次先不用做，
-   但寫 possibly_stale 邏輯時要留意欄位（`source_files`）確實有更新，供 Milestone 6 直接使用。
+**第十五輪確認的三層 provider 健康檢查 + `possibly_stale` 觸發邏輯已在第十六輪實作完成**
+（`check_semantic_health`、`ModelProvider.probe()`、`mark_possibly_stale`，見上方「第十六輪修訂」
+段落與 IMPLEMENTATION_PLAN.md 第 85-90 條）。**唯一還沒做的部分**：retrieval 端「`possibly_stale`/
+`stale` 不顯示舊摘要文字、改指向 `source_files`」的規則（第十五輪決議第 2 點）——這個屬於
+Milestone 6 的 retrieval 範圍，`mark_possibly_stale` 已經確保 `source_files` 欄位在每次觸發時都
+正確更新，Milestone 6 可以直接使用，不需要回頭修 Milestone 5 的程式碼。
 
-**再來才是 Milestone 6（Policies & Memory）**：`rune.core.memory.{decisions,constraints,notes,
+**Milestone 6（Policies & Memory）**：`rune.core.memory.{decisions,constraints,notes,
 staleness}`。開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 6 整段（含驗收標準）與 DATA_MODEL.md
 §1、§3、§6——「current 與 visible 分離」是這個 milestone 最容易重犯的錯誤點，文件裡已經明講必須有
 專門測試鎖死 `rev1=active, rev2=inactive` 這個 case。Note 的 revision 化現在有 Milestone 5 的

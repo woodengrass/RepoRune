@@ -1,6 +1,6 @@
 # RepoRune（rune）— 資料模型
 
-狀態：**已確認（第九輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
+狀態：**已確認（第十輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
 必須分離）、補上 `source_bound`/`scope_bound`/`temporary` Constraint 實際可實作所需的 snapshot 欄位、
 補上 Note 的 revision 機制、以及 ScopeSummary `source_files` 的推導 invariant。第三輪修正
 `created_by` 的型別（改為 `RevisionAuthor` enum，解決與「系統自動附加 revision」的矛盾）、補上
@@ -26,8 +26,13 @@ current revision 的完整內容、只改動 status/last_error（首次生成就
 `CACHE_SCHEMA_VERSION` 機制讓舊 shape 的 memory.db 自動被丟棄重建（§5）；`needs_refresh` 對
 `orphaned` 的處理修正、§2.4 的 `source_files={}` 措辭澄清（不改變行為，只精確化文件表達）。**第九輪
 確認 `possibly_stale` 的觸發規則**（§2.4 的失敗時 revision 語意表新增一列）：只在「曾經有內容、hash
-對不上、這次沒有可用 provider」時觸發，從未成功過的 scope 不需要為此額外處理；尚未實作，是下一個
-session 的第一個任務，細節與 provider 健康檢查設計見 ARCHITECTURE.md §4.5。這是
+對不上、這次沒有可用 provider」時觸發，從未成功過的 scope 不需要為此額外處理。**第十輪完成第九輪
+確認設計的實作**（`mark_possibly_stale`，見 `rune.core.semantic.worker`），並修正了 §2.4 表格原本
+「設定關閉／API key 缺／連線測試失敗」三者並列的措辭中的一個不精確之處：`semantic.enabled=True`
+但 `model` 為空字串（每個全新專案未設定過 semantic 時的預設狀態）在實作時歸類為等同「設定關閉」
+的靜默跳過，而不是需要使用者立即處理的設定錯誤——這只影響 provider 健康檢查怎麼分類「沒有可用
+provider」的原因，不影響這裡記錄的 `possibly_stale` 觸發規則本身（三種原因都一樣視為「這次沒有
+可用的 provider」）。provider 健康檢查設計細節見 ARCHITECTURE.md §4.5。這是
 Milestone 1–6/7 實作時遵循的契約。
 
 ## 1. 慣例
@@ -241,7 +246,7 @@ member 之後恢復存在時也會自我修復）。
 | 產生失敗／被拒絕，**且該 scope 之前已有成功產生過的 revision** | **複製上一個 current revision 的完整內容**（`purpose`/`responsibilities`/.../`source_files` 全部原樣帶過去，比照 §2.5 系統自動附加 revision 的「完整 snapshot」規則），只改動 `status=stale`、`last_error=<清洗後的分類字串>`、`generated_at`、`source_hash`/`source_files` 更新為**目前**的（不是舊的）——因為即使沒有新內容，staleness 判斷仍要對照現在的原始碼狀態，下次 hash 若又變了才知道要不要再試一次 |
 | 產生失敗，**且該 scope 從未成功產生過任何 revision**（`revision=1` 就失敗） | 附加 `revision=1`，`status=unavailable`，內容欄位一律留空（`purpose=""`、其餘 list 為 `[]`），不得虛構內容 |
 | scope 被刪除（scopes.json 不再有這個 scope_id，但 semantic.jsonl 有既有 current revision） | 附加新 revision，複製上一筆 current revision 的完整內容，只改動 `status=orphaned`、`generated_at`；排除於 SQLite `semantic_objects` 之外 |
-| member 檔案 hash 對不上、但這次沒有可用的 provider（設定關閉／API key 缺／連線測試失敗），**且該 scope 之前已有成功產生過的 revision**（本輪確認設計，尚未實作） | 附加新 revision，複製上一筆 current revision 的完整內容，只改動 `status=possibly_stale`、`source_hash`/`source_files`（更新為目前的）、`generated_at`。**從未成功產生過（`current=None` 或 `status=unavailable`）的 scope 不需要為此額外附加任何 revision**——`needs_refresh` 對這兩種情況本來就無條件回傳 `True`，等有 provider 可用時自然會被重新嘗試 |
+| member 檔案 hash 對不上、但這次沒有可用的 provider（`semantic.enabled=false`，或 `enabled=true` 但 `model` 為空字串——兩者實作上視為同一種「沒有可用 provider」原因，見 ARCHITECTURE.md §4.5，或 API key 缺／連線測試失敗），**且該 scope 之前已有成功產生過的 revision** | 附加新 revision，複製上一筆 current revision 的完整內容，只改動 `status=possibly_stale`、`source_hash`/`source_files`（更新為目前的）、`generated_at`。**從未成功產生過（`current=None` 或 `status=unavailable`）的 scope 不需要為此額外附加任何 revision**——`needs_refresh` 對這兩種情況本來就無條件回傳 `True`，等有 provider 可用時自然會被重新嘗試（實作於 `mark_possibly_stale`，`rune.core.semantic.worker`） |
 
 Append-only JSONL：每次 `rune update` 對某 scope 附加新的一行（不論成功或失敗，見上表），`current
 = max(revision)`（per `scope_id`），與 Decision/Constraint/Note 共用同一套「current」定義。SQLite

@@ -196,7 +196,27 @@ def update(
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
 
+    # Pulled out of `stats` before printing the generic k=v line so a
+    # semantic-provider problem can't blend into it and get missed --
+    # ARCHITECTURE.md §4.5's three-tier health check exists specifically
+    # because that used to happen silently. `disabled`/`ok` never reach
+    # here at all (run_update only sets these keys for the other three
+    # statuses), so this block is a no-op on the common path.
+    health_status = stats.pop("semantic_health_status", None)
+    health_message = stats.pop("semantic_health_message", None)
+
     typer.echo("Updated: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+
+    if health_status == "rate_limited":
+        # Expected, not the user's fault -- a heads-up, not a failure.
+        typer.echo(f"semantic: {health_message}")
+    elif health_status in ("config_error", "probe_failed"):
+        # Something needs the user's attention right now (a setup mistake
+        # or a genuinely broken provider) -- the deterministic index above
+        # already completed and was printed, so failing loudly here can't
+        # lose or hide that work.
+        _err(f"semantic: {health_message}")
+        raise typer.Exit(code=1)
 
 
 @app.command(name="rebuild-cache")

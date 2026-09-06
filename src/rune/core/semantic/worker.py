@@ -154,6 +154,59 @@ def detect_orphaned_scopes(
     return orphaned
 
 
+def mark_possibly_stale(
+    scopes: list[Scope],
+    current_summaries: dict[str, ScopeSummary],
+    file_hashes: dict[str, str],
+    symbols: list[Symbol],
+    now: str,
+) -> list[ScopeSummary]:
+    """Called instead of `run_semantic_refresh` for a run where no provider
+    is usable at all -- `semantic.enabled=false`, a Step 1 config error, or
+    a failed Step 2 startup probe (ARCHITECTURE.md §4.5's three-tier health
+    check) -- so a scope whose member files changed doesn't keep silently
+    reporting `fresh`/`stale` against content that no longer matches.
+
+    Only scopes that already have real content get a new revision here:
+    `current is None` or `status=unavailable` means the scope has never
+    successfully generated anything, and `needs_refresh` already returns
+    True unconditionally for both of those, so it will be attempted again
+    the moment a provider becomes available with no extra bookkeeping
+    needed in the meantime (DATA_MODEL.md §2.4's possibly_stale row --
+    this was confirmed with the user as a deliberate simplification, not
+    an oversight). For every scope that DOES have prior content, this
+    follows the same "complete snapshot, only status/hash/timestamp
+    changed" rule every other system-triggered revision in this project
+    uses: full content copied forward from the current revision, `status=
+    possibly_stale`, `source_hash`/`source_files` updated to the current
+    values, `generated_at` bumped. Fires again (bumping source_hash again)
+    if the source changes yet again while still no provider is available,
+    same as any other hash-driven revision.
+    """
+    symbol_owning_file = {symbol.symbol_id: symbol.file for symbol in symbols}
+    stale_markers: list[ScopeSummary] = []
+    for scope in scopes:
+        current = current_summaries.get(scope.id)
+        if current is None or current.status is SemanticStatus.unavailable:
+            continue
+        source_files = compute_source_files(scope, file_hashes, symbol_owning_file)
+        source_hash = working_tree_fingerprint(source_files)
+        if current.source_hash == source_hash:
+            continue
+        stale_markers.append(
+            current.model_copy(
+                update={
+                    "revision": current.revision + 1,
+                    "status": SemanticStatus.possibly_stale,
+                    "source_hash": source_hash,
+                    "source_files": source_files,
+                    "generated_at": now,
+                }
+            )
+        )
+    return stale_markers
+
+
 _MAX_SNIPPET_LINES = 200
 # Per-symbol cap on how much of a member's source gets embedded in the
 # prompt. Without this, one unusually large symbol (a generated file, a

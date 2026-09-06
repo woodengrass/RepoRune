@@ -1350,3 +1350,51 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     不是要去翻資料才知道）。**這是下一個 session 開工的第一個任務**。
 
 本輪沒有程式碼變更，175 個測試維持全綠，`ruff check` 全綠。
+
+### 第十六輪修訂（實作第十五輪確認的三層 provider 健康檢查與 `possibly_stale` 觸發邏輯）
+
+85. **`ProviderError` 新增 `status_code`（HTTP 狀態碼，網路層級失敗時為 `None`）與 `is_rate_limited`
+    屬性**（`provider.py`）：`complete()` 的每個 `ProviderError` raise 點都補上 `status_code`；這是
+    後面「是不是 429」判斷唯一需要的結構化資訊，不需要新增例外子類別。
+86. **`OpenAICompatibleProvider.probe()`**：一次最小化的請求（`max_tokens=1`，強制
+    `reasoning={"enabled": False}`），只確認 200/非 200，不解析 `content`——刻意不重用 `complete()`，
+    因為 probe 的目的只是「金鑰跟 model 名稱有沒有用」，不是「這次能不能拿到一個完整回應」；強制關掉
+    reasoning 是因為一個 thinking model 完全可能把這極小的 `max_tokens` budget 燒在 reasoning 上，
+    讓 `complete()` 判成「空 content」而誤判成探測失敗。
+87. **`check_semantic_health(config: SemanticConfig) -> (SemanticHealthCheck, primary, fallback)`**
+    （`provider.py`，新增 `SemanticHealthStatus` enum：`ok`/`disabled`/`config_error`/`rate_limited`/
+    `probe_failed`）：完整實作第十五輪確認的三層檢查。`update.py` 的 `_build_semantic_providers`
+    改為委派給這個函式（回傳值從 `(primary, fallback)` 改成 `(primary, fallback, health)` 三元組），
+    對應更新了 `tests/integration/test_update_flow.py` 裡 9 處 monkeypatch 這個函式的測試，改回傳
+    `SemanticHealthCheck(status=ok)` 作為第三個元素。
+88. **實作時發現並修正對第十五輪原始措辭的一處必要澄清**：原始設計把「model 是空字串」跟「API key
+    沒設」都歸類為 Step 1 的「設定錯誤」，會讓每個從未設定過 semantic 的全新專案（`SemanticConfig`
+    預設值正是 `enabled=True, model=""`）在每一次 `rune update` 都大聲失敗、exit code 1——用
+    `tests/unit/test_cli.py::test_update_then_status_reports_fresh_again`（既有測試，預期 update 對
+    未動過 semantic 設定的專案回傳 exit code 0）重現確認這個問題後修正：「`enabled=True` 且
+    `model=""`」改歸類為等同 `disabled`（靜默跳過，不印訊息），`config_error`（連同 CLI exit code 1）
+    保留給「已經設定了 model，但缺 API key 或 provider 名稱打錯」這種更貼近使用者原話「打錯字的
+    model 名稱或忘記 export 的 API key」的情境。已同步更新 ARCHITECTURE.md §4.5 與 DATA_MODEL.md
+    §2.4 的措辭，記錄這是實作階段發現的必要澄清，不是重新開放已確認的設計本身。
+89. **`mark_possibly_stale`**（`worker.py`）：`update.py` 在 `_build_semantic_providers` 回傳
+    `primary_provider is None`（即 health 不是 `ok`）時呼叫，取代原本「直接什麼都不做」的行為。對
+    `scopes_for_semantic` 裡每個目前有 current summary 的 scope，若 `status != unavailable` 且
+    `source_hash` 跟目前重新計算的不一致，附加一筆複製舊內容、只改
+    `status=possibly_stale`/`source_hash`/`source_files`/`generated_at` 的新 revision；`current is
+    None` 或 `status=unavailable` 的 scope 完全跳過（`needs_refresh` 已無條件涵蓋）。`run_update`
+    的 stats 新增 `semantic_scopes_possibly_stale` 計數。
+90. **CLI `update` 指令依健康狀態決定輸出與 exit code**（`cli/main.py`）：`run_update` 只在健康狀態
+    不是 `ok`/`disabled` 時才把 `semantic_health_status`/`semantic_health_message` 放進 stats（這兩
+    種預期、無需使用者處理的狀態完全不留痕跡）；CLI 把這兩個欄位從一般 `k=v` 那行拆出來，印出獨立
+    的 `semantic: ...` 訊息，`rate_limited` 維持 exit code 0（只是提示），`config_error`/
+    `probe_failed` 都回傳 exit code 1（大聲失敗），且都是在印出「Updated: ...」那行（決定性索引
+    的結果）之後才失敗，確保索引本身的成功結果不會被吞掉或搞混。
+
+新增 17 個測試（`tests/unit/test_semantic.py`：`probe()` 成功/429/傳輸錯誤、`ProviderError.
+is_rate_limited`、`check_semantic_health` 的 5 種狀態、`mark_possibly_stale` 的 4 種情境；
+`tests/unit/test_cli.py`：config_error 的 exit code 與訊息、possibly_stale 端到端）。每個新測試都
+用 `git stash` 只還原 `src/` 的改動、保留新測試，確認測試在修法前確實會失敗（`ImportError`／
+`assert 0 == 1` 等），再還原改動。192 個測試全綠，`ruff check` 全綠。
+
+Milestone 6（Policies & Memory）是下一步；retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、
+改指向 `source_files`」的規則（第十五輪決議第 2 點）屬於 Milestone 6 範圍，留到那時再做。
