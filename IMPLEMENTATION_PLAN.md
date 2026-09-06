@@ -1450,3 +1450,72 @@ orphan 偵測、單一寫入者衝突偵測、FTS5、`rune search` 排序、`run
 
 新增 7 個測試，199 個測試全綠，`ruff check` 全綠。這是 Milestone 6 的第一塊基礎，proposal 流程、
 staleness、orphan 偵測等其餘交付項目待下一階段確認範圍與順序後再進行。
+
+### 第十九輪修訂（使用者要求一路做到 Milestone 6 完成：proposal 流程、Note CRUD、staleness/orphan 偵測、FTS5）
+
+使用者明確要求「接下來直接一路做直到把 M6 做完」，不再逐項確認範圍。以下每項都是照著
+IMPLEMENTATION_PLAN 第 410 行起、DATA_MODEL.md §2.5/§2.5a/§2.6/§6、ARCHITECTURE.md §4.6/§4.7/§4.8
+已確認的設計直接實作，沒有新的開放設計問題——唯一一處需要對照兩份文件用語做出取捨的地方在第 96 條
+記錄。
+
+95. **`rune.core.memory.hashes`**：`compute_source_hashes()`（重用 `core.semantic.worker.
+    compute_source_files` 的「files ∪ symbol owning files」union 規則，供 constraint 的
+    `source_bound` 與 Note 的 source-bound snapshot 共用）、`compute_scope_membership_hash()`
+    （scope 的 files/symbols 排序後雜湊，刻意獨立於檔案內容，只偵測 membership 本身變動，供
+    `scope_bound` 使用）。
+96. **`rune.core.memory.proposals`**：`propose()`/`approve()`/`reject()`/`deactivate()`。`approve()`
+    在核准當下自動計算 `source_hashes`/`scope_hashes`（讀取 SQLite 已索引的 files/symbols 與
+    canonical `scopes.json`，人類完全不需手動輸入 hash），並在 `persistence_mode=temporary` 缺
+    `expires_at`、`source_bound`/`scope_bound` 引用集合為空或指向不存在的 scope 時直接拒絕核准
+    （`ProposalValidationError`）。`propose()` 在寫入當下就先做一次同樣的形狀驗證（decision 不能帶
+    severity/persistence_mode/expires_at；constraint 必須帶 severity+persistence_mode），提早失敗，
+    不必等到核准才發現無法核准的提案。`[E]dit` 走 `approve(edited_payload=...)`，`created_by` 固定
+    記為 `RevisionAuthor.human`（編輯動作本身就是人類行為，即使原提案是 agent 提的）；純核准（未編輯）
+    則沿用原提案 `created_by` 對應的 `RevisionAuthor`。`deactivate()` 是人類明確停用（附加
+    `status=inactive` 完整 snapshot），與系統自動附加的 revision 分開的動作，`core.memory.staleness`
+    永遠不會自動附加 `inactive`。
+97. **`rune.core.memory.notes`**：`note_add()`/`note_update()`，不需要 proposal/approval 關卡。
+    `files`/`symbols` 非空時自動計算 `source_hashes`（比照 constraint 的 approve 邏輯），這正是
+    DATA_MODEL §6「只有設了 source_hashes 才 source-bound」規則的寫入端。寫入前套用既有的
+    `redact_text`（Milestone 5 的 redaction 模組，重用不重寫，比照 IMPLEMENTATION_PLAN 的要求）。
+    `note_update()` 附加新 revision 時預設完整帶過未指定的欄位（比照系統 revision 的 snapshot
+    規則，即使這是 agent/human 動作而非系統動作，理由相同：不能讓後續讀者遺失欄位）。
+98. **`rune.core.memory.staleness`**：`detect_decision_transitions()`/`detect_constraint_transitions()`
+    /`detect_note_transitions()`，純結構/hash 比對，不呼叫 LLM。Decision 的觸發規則完全是存在性
+    檢查（引用檔案內容改變不觸發，file/symbol 被刪除才 `review_required`，scope 整個消失才
+    `orphaned`）；Constraint 的 `persistent` 模式完全比照 DATA_MODEL §6 表格字面意思「永不自動變動」
+    ——連 scope/file 被刪除都不觸發，這是刻意的全面豁免，不是只豁免內容變動；`source_bound`/
+    `scope_bound`/`temporary` 各自比對對應的 snapshot。已用「已經是 review_required/orphaned/
+    inactive 的 revision 不重複觸發」的終止狀態集合確保冪等，不會每次 `rune update` 都重複附加一筆
+    一樣的 revision。Note 的 orphan（scope 消失）優先權高於 TTL 到期，TTL 到期優先權高於
+    source-hash 比對。
+99. **記錄一處需要在兩份既有文件之間取捨用語的地方**：IMPLEMENTATION_PLAN 原本「Orphan 偵測」一句
+    寫的是「Decision/Constraint/Note 引用的所有 scope/file/symbol 皆已從索引刪除時」附加 orphaned，
+    但 ARCHITECTURE.md §4.6 的表格更精確地把「scope 整個消失」（→ orphaned）與「file/symbol 被刪除
+    但 scope 還在」（→ review_required）分開描述。實作採用 ARCHITECTURE §4.6 表格的版本（更詳細、
+    本輪稍早才確認）作為權威：orphaned 只在引用的 scope 真的消失時觸發，不是「所有引用都消失」這種
+    更寬鬆的條件。這是調和既有文件用語，不是引入新行為。
+100. **`core.update` 接線**：比照 semantic 的 orphan 偵測（`detect_orphaned_scopes`）「永遠跑，不受
+    `full`/provider 是否可用影響」的既有模式，新的 decision/constraint/note revision 透過
+    `rebuild_cache` 的新參數 `decisions_override`/`constraints_override`/`notes_override`（比照
+    `scopes_override`/`semantic_override`）在同一次 transaction 內落地，canonical JSONL 的 append
+    延後到 `rebuild_cache` 成功之後才執行（同樣的 all-or-nothing 理由）。`stats` 新增
+    `decisions_transitioned`/`constraints_transitioned`/`notes_transitioned` 三個計數。
+101. **FTS5 索引補上實際的寫入邏輯**：`fts_decisions`/`fts_constraints`/`fts_notes`/`fts_semantic`/
+    `fts_symbols` 這五張虛擬表格自 Milestone 1 起就宣告在 schema.sql，但**從未有任何程式碼寫入過**
+    （grep 確認過），代表 `rune search` 若真的接上 FTS5 查詢會永遠查到空結果——已用一個手工重現測試
+    （`test_rebuild_cache_populates_fts5_indexes`）確認這個問題確實存在，修法前跑過一次真的失敗
+    （`fetchone() == None`）。新增 `_materialize_fts()`：因為虛擬表格不受既有的 FK cascade 清空機制
+    影響，每次 materialize 手動 `DELETE` 後重新寫入，只索引 current revision（不論 status，可見性
+    過濾留給查詢層），驗證過「取代掉的舊 revision 內容不會繼續留在 FTS 索引裡」（新增第二個 regression
+    case）。
+
+新增 48 個測試：`test_memory_staleness.py` 20 個純函式測試、`test_memory_proposals.py` 15 個、
+`test_memory_notes.py` 6 個、`test_memory_staleness_flow.py` 6 個端到端整合測試、`test_materialize.py`
+新增 1 個 FTS5 regression test。端到端測試都透過 `python_simple_repo` fixture 跑過真實的
+`init_project` → `run_update` → `rebuild_cache` 流程，不是只測純函式。FTS5 的 regression test 已用
+`git stash` 只還原 `materialize.py` 確認修法前真的會失敗（`fetchone()` 回傳 `None`）。247 個測試
+全綠，`ruff check` 全綠。
+
+尚未完成：`rune.core.retrieval.search`（八層排序）、`rune check`、CLI 子命令
+（`decision`/`constraint`/`note`/`proposal`/`search`/`check`）。

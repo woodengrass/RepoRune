@@ -320,6 +320,59 @@ def _materialize_proposals(conn: sqlite3.Connection, proposals: list[Proposal]) 
         )
 
 
+def _materialize_fts(
+    conn: sqlite3.Connection,
+    decisions: list[MemoryRevision],
+    constraints: list[MemoryRevision],
+    notes: list[Note],
+    semantic: list[ScopeSummary],
+    symbols: list[Symbol],
+) -> None:
+    """Rebuilds every FTS5 index in full on each materialize pass
+    (ARCHITECTURE.md §4.8, DATA_MODEL.md §5's `fts_*` tables). These are
+    virtual tables with no FK relationship to the tables they index, so
+    they are NOT covered by `_clear_all_content`'s cascading deletes --
+    they must be cleared and repopulated here explicitly, same "full
+    rebuild every time" contract as everything else in this function.
+    Only *current* revisions are indexed (regardless of status/
+    visibility): `core.retrieval.search` filters visibility at query
+    time, not at index time, so a search covers everything current, and
+    a non-visible hit (e.g. `orphaned`) simply gets ranked/labeled
+    accordingly rather than being invisible to FTS entirely.
+    """
+    conn.execute("DELETE FROM fts_decisions;")
+    conn.execute("DELETE FROM fts_constraints;")
+    conn.execute("DELETE FROM fts_notes;")
+    conn.execute("DELETE FROM fts_semantic;")
+    conn.execute("DELETE FROM fts_symbols;")
+
+    for record_id, revs in _group_current_by_id(decisions, "record_id", "decisions.jsonl").items():
+        current = revs[-1]
+        conn.execute(
+            "INSERT INTO fts_decisions (record_id, text) VALUES (?, ?)",
+            (record_id, f"{current.content}\n{current.rationale}"),
+        )
+    for record_id, revs in _group_current_by_id(constraints, "record_id", "constraints.jsonl").items():
+        current = revs[-1]
+        conn.execute(
+            "INSERT INTO fts_constraints (record_id, text) VALUES (?, ?)",
+            (record_id, f"{current.content}\n{current.rationale}"),
+        )
+    for note_id, revs in _group_current_by_id(notes, "id", "notes.jsonl").items():
+        current = revs[-1]
+        conn.execute(
+            "INSERT INTO fts_notes (note_id, text) VALUES (?, ?)",
+            (note_id, f"{current.content}\n{current.why_persist}"),
+        )
+    for scope_id, summary in current_scope_summaries(semantic).items():
+        conn.execute(
+            "INSERT INTO fts_semantic (scope_id, text) VALUES (?, ?)", (scope_id, summary.purpose)
+        )
+    for symbol in symbols:
+        text = symbol.qualified_name if not symbol.signature else f"{symbol.qualified_name} {symbol.signature}"
+        conn.execute("INSERT INTO fts_symbols (symbol_id, text) VALUES (?, ?)", (symbol.symbol_id, text))
+
+
 def _materialize_semantic(conn: sqlite3.Connection, summaries: list[ScopeSummary]) -> None:
     # current_revision = MAX(revision) per scope_id, same convention (and
     # same duplicate-(id, revision) conflict detection) as Decision/
@@ -552,6 +605,9 @@ def rebuild_cache(
     scopes_override: ScopesFile | None = None,
     semantic_override: list[ScopeSummary] | None = None,
     semantic_run_metrics: SemanticRunMetricsRecord | None = None,
+    decisions_override: list[MemoryRevision] | None = None,
+    constraints_override: list[MemoryRevision] | None = None,
+    notes_override: list[Note] | None = None,
 ) -> dict[str, int]:
     """Fully rebuilds memory.db from canonical files (and, from Milestone 2
     on, the caller-supplied `code_index`). Zero LLM calls, zero network.
@@ -591,6 +647,14 @@ def rebuild_cache(
     actually ran this update (never for `rune rebuild-cache`, which makes
     no LLM calls at all).
 
+    `decisions_override`/`constraints_override`/`notes_override`, when
+    given, are materialized in place of reading the corresponding
+    canonical JSONL from disk — same rationale and pattern as
+    `scopes_override`/`semantic_override` above (Milestone 6):
+    `core.memory.staleness`'s freshly computed lifecycle-transition
+    revisions must land in this same transaction, with the canonical
+    append deferred until after `rebuild_cache` succeeds.
+
     Rebuilds **in place**, inside a single SQLite transaction (clear every
     table, then re-insert everything, then commit) rather than building a
     separate file and swapping it in. An earlier version used a temp-file
@@ -617,9 +681,17 @@ def rebuild_cache(
             if scopes_override is not None
             else read_json_model(layout.scopes_json, ScopesFile) or ScopesFile()
         )
-        decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
-        constraints = read_jsonl(layout.constraints_jsonl, MemoryRevision)
-        notes = read_jsonl(layout.notes_jsonl, Note)
+        decisions = (
+            decisions_override
+            if decisions_override is not None
+            else read_jsonl(layout.decisions_jsonl, MemoryRevision)
+        )
+        constraints = (
+            constraints_override
+            if constraints_override is not None
+            else read_jsonl(layout.constraints_jsonl, MemoryRevision)
+        )
+        notes = notes_override if notes_override is not None else read_jsonl(layout.notes_jsonl, Note)
         proposals = read_jsonl(layout.proposals_jsonl, Proposal)
         semantic = (
             semantic_override
@@ -637,6 +709,7 @@ def rebuild_cache(
         _materialize_proposals(conn, proposals)
         _materialize_semantic(conn, semantic)
         _materialize_semantic_run_metrics(conn, semantic_run_metrics)
+        _materialize_fts(conn, decisions, constraints, notes, semantic, code_index.symbols)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
             (str(CACHE_SCHEMA_VERSION),),

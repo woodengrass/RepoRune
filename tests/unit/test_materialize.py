@@ -485,3 +485,60 @@ def test_rebuild_cache_self_heals_an_old_shape_memory_db(git_repo: Path) -> None
         "SELECT current_revision, purpose FROM semantic_objects WHERE scope_id = 'app'"
     ).fetchone()
     assert row == (1, "old purpose")
+
+
+def test_rebuild_cache_populates_fts5_indexes(git_repo: Path) -> None:
+    """ARCHITECTURE.md §4.8/DATA_MODEL.md §5's fts_* tables were declared
+    in schema.sql since Milestone 1 but nothing ever actually inserted
+    into them (grep confirmed zero writers before this fix) -- `rune
+    search` would have queried permanently-empty FTS tables. Only current
+    revisions are indexed; a non-current revision must not appear.
+    """
+    layout = init_project(git_repo)
+    append_jsonl(
+        layout.decisions_jsonl,
+        _decision("d1", 1, RecordStatus.active),
+    )
+    append_jsonl(
+        layout.constraints_jsonl,
+        MemoryRevision(
+            record_id="c1", revision=1, type=RecordType.constraint, status=RecordStatus.active,
+            content="no bare except", severity=Severity.must,
+            persistence_mode=PersistenceMode.persistent,
+            created_by=RevisionAuthor.human, created_at="2026-01-01T00:00:00Z",
+        ),
+    )
+    append_jsonl(
+        layout.notes_jsonl,
+        Note(
+            id="n1", revision=1, category=NoteCategory.pitfall, content="watch the retry loop",
+            why_persist="bit us once", source=RevisionAuthor.agent,
+            created_at="2026-01-01T00:00:00Z", last_verified_at="2026-01-01T00:00:00Z",
+            status=NoteStatus.active,
+        ),
+    )
+
+    rebuild_cache(layout, code_index=CodeIndexData())
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT record_id FROM fts_decisions WHERE fts_decisions MATCH 'postgresql'"
+    ).fetchone() == ("d1",)
+    assert conn.execute(
+        "SELECT record_id FROM fts_constraints WHERE fts_constraints MATCH 'except'"
+    ).fetchone() == ("c1",)
+    assert conn.execute(
+        "SELECT note_id FROM fts_notes WHERE fts_notes MATCH 'retry'"
+    ).fetchone() == ("n1",)
+
+    # a second revision replacing rev1's content must not leave the old
+    # text still findable via FTS -- only the current revision is indexed
+    append_jsonl(
+        layout.decisions_jsonl,
+        _decision("d1", 2, RecordStatus.inactive),
+    )
+    rebuild_cache(layout, code_index=CodeIndexData())
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM fts_decisions WHERE record_id = 'd1'"
+    ).fetchone() == (1,)  # exactly one row (the current one), not two

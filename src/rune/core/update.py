@@ -28,6 +28,12 @@ from rune.core.index.imports import build_import_edges
 from rune.core.index.references import group_symbols_by_path, resolve_references
 from rune.core.index.scanner import ScannedFile, diff_against_previous, scan_files
 from rune.core.index.treesitter import RawReference, get_parser_adapter
+from rune.core.memory.records import current_by_note_id, current_by_record_id
+from rune.core.memory.staleness import (
+    detect_constraint_transitions,
+    detect_decision_transitions,
+    detect_note_transitions,
+)
 from rune.core.project import RuneLayout, utc_now_iso
 from rune.core.scopes.model import (
     assign_new_files_from_imports,
@@ -57,7 +63,10 @@ from rune.core.storage.models import (
     EdgeType,
     IndexedFile,
     IndexedFileStatus,
+    MemoryRevision,
+    Note,
     ProjectFile,
+    RecordType,
     RuneConfig,
     ScopeSummary,
     Symbol,
@@ -420,12 +429,60 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     if new_semantic_revisions:
         semantic_override = [*existing_semantic, *new_semantic_revisions]
 
+    # Decision/Constraint/Note lifecycle transitions (Milestone 6,
+    # ARCHITECTURE.md §4.6, DATA_MODEL.md §6): a pure structural/hash
+    # comparison, never an LLM call, so unlike the semantic refresh above
+    # this always runs — including on `rune rebuild-cache` (full=True).
+    # Same in-memory-then-defer-canonical-write pattern as scopes/semantic
+    # above: the new revisions must land in this run's rebuild_cache
+    # transaction, but decisions.jsonl/constraints.jsonl/notes.jsonl are
+    # only appended to after rebuild_cache actually succeeds.
+    known_scope_ids = {scope.id for scope in scopes_for_semantic}
+    known_files = {f.path for f in new_files}
+    known_symbol_ids = {s.symbol_id for s in new_symbols}
+    file_hashes = {f.path: f.content_hash for f in new_files}
+    symbol_owning_file = {s.symbol_id: s.file for s in new_symbols}
+    scope_by_id = {scope.id: scope for scope in scopes_for_semantic}
+
+    existing_decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
+    existing_constraints = read_jsonl(layout.constraints_jsonl, MemoryRevision)
+    existing_notes = read_jsonl(layout.notes_jsonl, Note)
+    current_decisions = current_by_record_id(
+        [r for r in existing_decisions if r.type is RecordType.decision]
+    )
+    current_constraints = current_by_record_id(
+        [r for r in existing_constraints if r.type is RecordType.constraint]
+    )
+    current_notes = current_by_note_id(existing_notes)
+
+    new_decision_revisions = detect_decision_transitions(
+        current_decisions, known_scope_ids, known_files, known_symbol_ids, now
+    )
+    new_constraint_revisions = detect_constraint_transitions(
+        current_constraints, known_scope_ids, known_files, known_symbol_ids,
+        file_hashes, symbol_owning_file, scope_by_id, now,
+    )
+    new_note_revisions = detect_note_transitions(
+        current_notes, known_scope_ids, file_hashes, symbol_owning_file, now
+    )
+
+    decisions_override = (
+        [*existing_decisions, *new_decision_revisions] if new_decision_revisions else None
+    )
+    constraints_override = (
+        [*existing_constraints, *new_constraint_revisions] if new_constraint_revisions else None
+    )
+    notes_override = [*existing_notes, *new_note_revisions] if new_note_revisions else None
+
     stats = rebuild_cache(
         layout,
         code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges),
         scopes_override=updated_scopes_file,
         semantic_override=semantic_override,
         semantic_run_metrics=semantic_run_metrics_record,
+        decisions_override=decisions_override,
+        constraints_override=constraints_override,
+        notes_override=notes_override,
     )
     if updated_scopes_file is not None:
         save_scopes(layout, updated_scopes_file)
@@ -437,6 +494,12 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     # SQLite transaction above reflects for some scopes but not others.
     append_jsonl_many(layout.semantic_jsonl, new_semantic_revisions)
     _append_semantic_log(layout, semantic_local_log)
+    # Same all-or-nothing rationale as semantic.jsonl above: these
+    # canonical appends only happen after rebuild_cache has already
+    # committed the same revisions into this run's SQLite transaction.
+    append_jsonl_many(layout.decisions_jsonl, new_decision_revisions)
+    append_jsonl_many(layout.constraints_jsonl, new_constraint_revisions)
+    append_jsonl_many(layout.notes_jsonl, new_note_revisions)
 
     # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not
     # atomic with the SQLite commit above — memory.db and project.json are
@@ -464,6 +527,9 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
             "scope_files_auto_assigned": len(auto_assigned_scope_ids),
             "semantic_scopes_refreshed": len(new_semantic_revisions),
             "semantic_scopes_possibly_stale": len(possibly_stale_revisions),
+            "decisions_transitioned": len(new_decision_revisions),
+            "constraints_transitioned": len(new_constraint_revisions),
+            "notes_transitioned": len(new_note_revisions),
             **{f"semantic_{key}": value for key, value in semantic_metrics_summary.items()},
         }
     )
