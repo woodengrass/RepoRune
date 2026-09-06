@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from rune.core.config import write_default_config
-from rune.core.storage.canonical import write_json_model
+from rune.core.storage.canonical import atomic_write_text, write_json_model
 from rune.core.storage.models import ProjectFile, ScopesFile
 
 RUNE_DIR_NAME = ".rune"
@@ -38,14 +38,29 @@ def _utc_now_iso() -> str:
 
 
 def find_repo_root(start: Path) -> Path:
-    """Walks upward from `start` looking for a `.git` entry (dir or, for a
-    worktree, file). Raises NotAGitRepoError if none is found.
+    """Asks git itself whether `start` is inside a working tree, and if so
+    where its root is. Deliberately does not just look for a `.git`
+    directory/file — that only checks for a filesystem marker, which a
+    stray or fake `.git` entry would satisfy without there being a real,
+    usable git repo underneath (spec §48: "確認為 git repo").
     """
-    current = start.resolve()
-    for candidate in [current, *current.parents]:
-        if (candidate / ".git").exists():
-            return candidate
-    raise NotAGitRepoError(f"no .git found above {start}")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+    except OSError as exc:
+        raise NotAGitRepoError(f"git is not available to verify {start}: {exc}") from exc
+    if result.returncode != 0:
+        raise NotAGitRepoError(
+            f"{start} is not inside a git working tree "
+            f"(git rev-parse --show-toplevel failed: {result.stderr.strip()})"
+        )
+    return Path(result.stdout.strip())
 
 
 @dataclass(frozen=True)
@@ -120,7 +135,7 @@ def _write_gitignore(layout: RuneLayout, commit_proposals_to_git: bool) -> None:
     lines = ["cache/"]
     if not commit_proposals_to_git:
         lines.append("proposals.jsonl")
-    layout.gitignore.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(layout.gitignore, "\n".join(lines) + "\n")
 
 
 def _touch_empty_jsonl_files(layout: RuneLayout) -> None:
@@ -132,8 +147,7 @@ def _touch_empty_jsonl_files(layout: RuneLayout) -> None:
         layout.proposals_jsonl,
     ):
         if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("", encoding="utf-8")
+            atomic_write_text(path, "")
 
 
 def init_project(repo_root: Path, force: bool = False) -> RuneLayout:

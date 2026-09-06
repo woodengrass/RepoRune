@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from rune.core.storage.schema_versions import check_schema_version
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
@@ -49,7 +49,7 @@ def read_json_model[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> M
 
 def write_json_model(path: Path, model: BaseModel) -> None:
     content = model.model_dump_json(indent=2) + "\n"
-    _atomic_write_text(path, content)
+    atomic_write_text(path, content)
 
 
 def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[ModelT]:
@@ -78,7 +78,7 @@ def append_jsonl(path: Path, model: BaseModel) -> None:
     if existing and not existing.endswith("\n"):
         existing += "\n"
     new_line = model.model_dump_json() + "\n"
-    _atomic_write_text(path, existing + new_line)
+    atomic_write_text(path, existing + new_line)
 
 
 def rewrite_jsonl(path: Path, models: list[BaseModel]) -> None:
@@ -86,4 +86,4 @@ def rewrite_jsonl(path: Path, models: list[BaseModel]) -> None:
     paths and tests; not used for normal append flows.
     """
     content = "".join(m.model_dump_json() + "\n" for m in models)
-    _atomic_write_text(path, content)
+    atomic_write_text(path, content)

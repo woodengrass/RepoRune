@@ -1,6 +1,8 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第五輪修訂）**（V1 設計）。將規格 §70-77 展開為具體交付項目、模組目標與各 Milestone
+狀態：**已確認（第六輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
+修訂」。將規格 §70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
 before`/`after`、session events、custom tool 皆為真實 API），並針對前一輪列出的風險（import/
@@ -33,12 +35,24 @@ Python.Python.3.12` 補裝 3.12.10 並重建 venv；考量此專案預期使用�
 `tree-sitter-typescript`，本次確認採此路線而非 `tree-sitter-languages` bundle）、`httpx` 呼叫
 provider、`pytest` + `ruff`、git CLI 以 `subprocess` 呼叫。
 
-**Milestone 1 目前狀態：已實作並通過測試**（`src/rune/`，32 個單元測試全綠，`ruff check` 全綠，含
-Global Code Standards 支援欄位）。
-實作過程中修正了一個設計審查沒抓到的 bug：`rebuild_cache` 原本會在驗證 canonical 資料前就刪除舊的
-`memory.db`，若 canonical 有衝突（例如重複 `(record_id, revision)`），會連同銷毀原本可用的 cache；
-修法是先在暫存檔完整建好新 DB、確認成功後才用 `os.replace` 原子性換掉正式檔案，失敗時舊 cache
-完全不受影響——已補上對應的回歸測試（`tests/unit/test_materialize.py`）。
+**Milestone 1 目前狀態：已實作並通過測試**（`src/rune/`，41 個單元測試全綠，`ruff check` 全綠，含
+Global Code Standards 支援欄位）。經過兩輪實測（第一輪自測、第二輪外部 code review）發現並修正了
+兩個設計審查沒抓到的 bug：
+
+1. **`rebuild_cache` 刪除順序**：原本會在驗證 canonical 資料前就刪除舊的 `memory.db`，若 canonical
+   有衝突（例如重複 `(record_id, revision)`），會連同銷毀原本可用的 cache。
+2. **`rebuild_cache` 的 crash-safety 機制在 Windows 上與並行 reader 不相容**（本輪 code review 加測
+   併發案例後才發現，屬於「紙上設計看不出來、只有真的跑才會發現」的問題）：第 1 點的第一版修法是
+   「先在暫存檔完整建好新 DB，確認成功後才用 `os.replace` 原子性換掉正式檔案」。這個做法在單獨執行時
+   沒問題，但一旦有其他 connection（例如一個還開著的 reader）持有 `memory.db`，Windows 的檔案鎖定
+   語意會讓 `os.replace` 直接丟出 `PermissionError`——等於「只要有人在讀，寫入就會失敗」，比原本要
+   解決的問題更嚴重。**最終修法**：放棄「另建檔案再置換」，改成在**同一個檔案內用一個 SQLite
+   transaction**做「清空全部內容表 → 重新寫入 → commit」，crash-safety 直接交給 SQLite 自己的
+   rollback journal（transaction 中斷時，下次開啟會自動回滾到上次 commit 的狀態，語意上等同於檔案置
+   換法想要的效果，但不需要真的置換檔案），也因此天然與 WAL 模式下的並行 reader 相容——reader 的
+   already-open 讀取交易在自己 commit/rollback 前，本來就只看得到舊快照，不受同檔案上另一個
+   transaction 的影響。已補上對應的回歸測試（`tests/unit/test_materialize.py`：衝突偵測維持舊
+   cache 不變、reader 在 rebuild 期間維持一致快照、`os.replace` 中斷前後 canonical 檔案不受影響）。
 
 ## Milestone 1 — Core foundation
 **模組**：`rune.core.config`、`rune.core.project`、`rune.core.storage.canonical`、
@@ -572,3 +586,50 @@ text 解析）。
     「某個 library 有 bug」→ Note；「我們決定從 A 改用 B」→ Decision（必要時另外提出對應
     Constraint）。三者不可混用同一種 record type。這不是新規則，只是本輪明確點出常見誤用情境，供
     Milestone 6/7 的 propose 流程文件與 CLI help text 參照。
+
+### 第六輪修訂（外部 code review 發現的 Milestone 1 實作落差）
+
+本輪對已完成的 Milestone 1 程式碼做 code review，發現多處「文件說了、程式碼沒做到」的落差，逐一修正：
+
+38. **`.rune/config.toml` 補上 `extra="forbid"`**：先前所有 config model 都是普通 `BaseModel`，
+    Pydantic 預設會靜默忽略未知欄位——一個打錯字的 `[semanic]` 區塊會被整段無聲吞掉，使用者以為設定
+    生效了，其實完全沒讀到。新增共用 `StrictModel` 基底類別（`model_config =
+    ConfigDict(extra="forbid")`），所有 config class 改繼承它，未知欄位（含巢狀區塊內的）現在會直接
+    拋出驗證錯誤，實作於 Milestone 1。
+39. **Git repo 驗證改為真的問 git**：`find_repo_root` 原本只檢查 `.git` 路徑是否存在，一個偽造的
+    `.git` 空目錄就能騙過去。改用 `git rev-parse --show-toplevel`（`subprocess`），失敗才視為
+    `NotAGitRepoError`；同時這個做法能正確處理 git worktree（`.git` 是檔案而非目錄）等原本手動判斷
+    容易漏掉的情況，實作於 Milestone 1。
+40. **`config.toml`／`.gitignore`／空 JSONL 骨架補齊 atomic write**：`write_default_config`、
+    `_write_gitignore`、`_touch_empty_jsonl_files` 先前直接呼叫 `Path.write_text`，違反 Milestone 1
+    「canonical JSON/JSONL/TOML 全部走 atomic temp-file+rename」的要求。`canonical.py` 的
+    `_atomic_write_text` 改為公開的 `atomic_write_text`，三處呼叫點都改用它，實作於 Milestone 1。
+41. **資料模型補上文件早就寫明但沒真正檢查的邊界**：`MemoryRevision`/`Note`/`Proposal.revision`
+    加 `Field(ge=1)`；`Edge.confidence`、`Note.importance`/`confidence` 收斂到 `[0.0, 1.0]`
+    （共用 `Confidence` annotated type）；`created_at`/`generated_at`/`last_verified_at`/
+    `expires_at`/`resolved_at` 等時間戳位改用共用的 `Timestamp` annotated type，驗證必須是
+    ISO-8601 且 UTC offset 為零（拒絕 naive datetime 與非 UTC offset）；`Proposal.created_by` 從
+    `str` 收斂為 `Literal["agent", "human"]`（proposal 只會是 agent 或 human 提出，不會是
+    system-generated）。皆為既有欄位收斂型別，非新增欄位，實作於 Milestone 1，附帶單元測試（正向與
+    邊界值兩種案例）。
+42. **`scope_files`/`scope_symbols` 缺 FK 的張力，明確定案並記錄**：DATA_MODEL.md §5 的文件版
+    schema 對這兩個 join 表的 `file`/`symbol_id` 宣告了 `REFERENCES files(path)`／
+    `REFERENCES symbols(symbol_id)`，但實作故意省略——因為 `files`/`symbols` 表要到 Milestone 2
+    才會被填入，而 `scopes.json` 在 M1 就可能已經帶 file/symbol membership。這是刻意的實作偏離，本輪
+    在 `schema.sql`、DATA_MODEL.md、ARCHITECTURE.md 都補上明確註記：**Milestone 2 索引器落地後補上
+    這兩個 FK**，並加對應回歸測試。同時發現先前完全沒有 `PRAGMA foreign_keys=ON`——即使宣告了 FK
+    （例如 `symbols.file REFERENCES files(path)`），沒開這個 pragma 等於裝飾用、`ON DELETE CASCADE`
+    從未真正生效。本輪已在 `materialize.connect()` 開啟，並確認既有的插入順序（父列先於子列）不受
+    影響，實作於 Milestone 1。
+43. **`rebuild_cache` 改為原地 transaction，不再用「另建檔案＋置換」**：這是本輪最重要的發現，起因是
+    新增的併發測試（reader 開著讀取交易時觸發 rebuild）在 Windows 上直接讓 `os.replace` 拋出
+    `PermissionError`——第一版的 crash-safety 修法（見上方「Milestone 1 目前狀態」說明）在有並行
+    reader 時反而讓 writer 失敗，比原本要解決的問題更糟。修正為在同一個檔案內用一個 SQLite
+    transaction 做「清空全部內容表（六個根表，靠 `ON DELETE CASCADE` 帶走所有衛星表）→ 重新寫入 →
+    commit」，crash-safety 交給 SQLite 自己的 rollback journal，也因此天然相容 WAL 模式下的並行
+    reader。實作於 Milestone 1，回歸測試：`test_reader_sees_consistent_snapshot_during_rebuild`、
+    `test_duplicate_revision_raises_conflict_and_preserves_old_cache`。
+44. **測試覆蓋補齊**：新增 atomic write 在 `os.replace` 前中斷的存活性測試（含檔案原本存在／不存在
+    兩種情境）、git 驗證測試（假 `.git`／Unicode 路徑）、config 未知欄位拒絕測試（頂層與巢狀）、
+    proposal 的 rebuild-cache 還原與核准後 current 更新測試、SQLite reader 併發快照測試。目前共
+    41 個測試，實作於 Milestone 1。

@@ -36,3 +36,26 @@ def test_load_config_bad_field_type_raises(tmp_path: Path) -> None:
     path.write_text('version = "not-an-int"\n', encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+def test_load_config_rejects_unknown_top_level_field(tmp_path: Path) -> None:
+    """A typo'd or stray top-level key must be a loud error, not silently
+    ignored — otherwise a misspelled config section (e.g. `[rune]` instead
+    of `[semantic]`) would look accepted while doing nothing.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text('unexpected_field = 1\n', encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_load_config_rejects_unknown_nested_field(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[semantic]\n"
+        'provider = "openrouter"\n'
+        "typo_field = true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_config(path)

@@ -24,6 +24,35 @@ def test_find_repo_root_raises_outside_git(tmp_path: Path) -> None:
         find_repo_root(tmp_path)
 
 
+def test_find_repo_root_rejects_fake_git_directory(tmp_path: Path) -> None:
+    """A `.git` entry that exists but isn't a real repo (e.g. an empty
+    directory someone created by hand, or a leftover from a failed clone)
+    must be rejected — checking for the marker's mere presence is not
+    validation. find_repo_root asks git itself via `rev-parse
+    --show-toplevel` instead of just checking `Path.exists()`.
+    """
+    fake_repo = tmp_path / "fake"
+    (fake_repo / ".git").mkdir(parents=True)
+    with pytest.raises(NotAGitRepoError):
+        find_repo_root(fake_repo)
+
+
+def test_find_repo_root_works_with_unicode_path(tmp_path: Path) -> None:
+    import subprocess
+
+    repo = tmp_path / "中文目錄" / "réponse"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t",
+         "commit", "-q", "--allow-empty", "-m", "init"],
+        cwd=repo, check=True,
+    )
+    nested = repo / "a"
+    nested.mkdir()
+    assert find_repo_root(nested).resolve() == repo.resolve()
+
+
 def test_init_creates_rune_layout(git_repo: Path) -> None:
     layout = init_project(git_repo)
     assert layout.rune_dir.exists()

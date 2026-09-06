@@ -51,6 +51,15 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
+    # SQLite ignores declared foreign keys unless this is turned on per
+    # connection — without it, every `REFERENCES ... ON DELETE CASCADE` in
+    # schema.sql is decorative only. `scope_files.file`/`scope_symbols.
+    # symbol_id` deliberately do NOT declare a FK to files/symbols yet (see
+    # schema.sql comment): those tables stay empty until Milestone 2, while
+    # scopes.json can already carry file/symbol members in Milestone 1
+    # (e.g. via --force-preserved content), so enforcing that particular FK
+    # now would break legitimate M1 materialization.
+    conn.execute("PRAGMA foreign_keys=ON;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -250,26 +259,47 @@ def _materialize_semantic(conn: sqlite3.Connection, summaries: list[ScopeSummary
         )
 
 
+# Tables that own their family via ON DELETE CASCADE — clearing just these
+# six also clears every dependent table (symbols/edges under files;
+# scope_files/scope_symbols/semantic_objects under scopes; the *_scopes/
+# *_files/*_symbols satellite tables under each decision/constraint/note
+# revision). See schema.sql for the FK graph. pending_proposals has no
+# parent, so it's cleared directly.
+_ROOT_TABLES_TO_CLEAR = (
+    "files",
+    "scopes",
+    "decision_records",
+    "constraint_records",
+    "note_records",
+    "pending_proposals",
+)
+
+
+def _clear_all_content(conn: sqlite3.Connection) -> None:
+    for table in _ROOT_TABLES_TO_CLEAR:
+        conn.execute(f"DELETE FROM {table};")
+
+
 def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
     """Fully rebuilds memory.db from canonical files. Zero LLM calls, zero
     network. Returns a small stats dict for `rune rebuild-cache` output.
 
-    Builds into a temporary sibling file and only replaces the real
-    memory.db on success (os.replace). If canonical parsing or
-    materialization fails partway (e.g. a CanonicalConflictError), the
-    previous memory.db — which may still be a perfectly good, working
-    cache — is left untouched. Deleting the old cache before confirming the
-    new one is valid would turn "canonical has a conflict" into "you also
-    lost your working cache," which defeats the point of memory.db being a
-    safely-rebuildable derived artifact.
+    Rebuilds **in place**, inside a single SQLite transaction (clear every
+    table, then re-insert everything, then commit) rather than building a
+    separate file and swapping it in. An earlier version used a temp-file
+    + os.replace() swap for crash safety, but that approach turned out to
+    be broken on Windows: os.replace() raises PermissionError when any
+    other connection (e.g. a concurrent reader) still has memory.db open,
+    which means the writer itself would fail whenever a reader was active
+    — worse than the problem it was meant to solve. A single transaction
+    on the real file gets the same crash-safety from SQLite's own
+    rollback journal (an interrupted rebuild rolls back to the previous
+    committed state on next open, same as any other failed transaction),
+    and it composes correctly with WAL readers: a reader's already-open
+    read transaction keeps seeing its snapshot until it starts a new one,
+    without the underlying file ever needing to be swapped out.
     """
-    tmp_db = layout.memory_db.with_name(layout.memory_db.name + ".rebuilding.tmp")
-    for suffix in ("", "-wal", "-shm"):
-        stale_tmp = tmp_db.with_name(tmp_db.name + suffix)
-        if stale_tmp.exists():
-            stale_tmp.unlink()
-
-    conn = connect(tmp_db)
+    conn = connect(layout.memory_db)
     try:
         create_schema(conn)
 
@@ -281,6 +311,7 @@ def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
         semantic = read_jsonl(layout.semantic_jsonl, ScopeSummary)
 
         conn.execute("BEGIN;")
+        _clear_all_content(conn)
         _materialize_scopes(conn, scopes_file)
         _materialize_decisions_or_constraints(conn, decisions, RecordType.decision)
         _materialize_decisions_or_constraints(conn, constraints, RecordType.constraint)
@@ -291,27 +322,11 @@ def rebuild_cache(layout: RuneLayout) -> dict[str, int]:
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '1')"
         )
         conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
     except BaseException:
         conn.rollback()
-        conn.close()
-        for suffix in ("", "-wal", "-shm"):
-            stale_tmp = tmp_db.with_name(tmp_db.name + suffix)
-            if stale_tmp.exists():
-                stale_tmp.unlink()
         raise
-    else:
+    finally:
         conn.close()
-
-    for suffix in ("", "-wal", "-shm"):
-        target = layout.memory_db.with_name(layout.memory_db.name + suffix)
-        source = tmp_db.with_name(tmp_db.name + suffix)
-        if source.exists():
-            source.replace(target)
-        elif target.exists():
-            # tmp build produced no -wal/-shm (checkpointed away) but a
-            # stale one from a previous run may still sit next to the old db
-            target.unlink()
 
     return {
         "scopes": len(scopes_file.scopes),

@@ -8,6 +8,7 @@ from pathlib import Path
 import tomli_w
 from pydantic import ValidationError
 
+from rune.core.storage.canonical import atomic_write_text
 from rune.core.storage.models import RuneConfig
 
 
@@ -39,8 +40,7 @@ def write_default_config(config_path: Path) -> None:
     (e.g. `rune init`, or `rune init --force` repairing a missing file) —
     never overwrites an existing config.toml.
     """
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(
+    atomic_write_text(
+        config_path,
         tomli_w.dumps(default_config().model_dump(mode="json", exclude_none=True)),
-        encoding="utf-8",
     )

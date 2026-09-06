@@ -270,6 +270,7 @@ staleness 判斷，只知道「files 欄位列了這個路徑」，不知道核�
 ```sql
 PRAGMA journal_mode=WAL;
 PRAGMA busy_timeout=5000;
+PRAGMA foreign_keys=ON;
 ```
 
 `rune update`／`rune rebuild-cache` 是唯一的 writer，且**整次 materialize 在單一 SQLite transaction
@@ -277,7 +278,11 @@ PRAGMA busy_timeout=5000;
 永遠讀到「上一次完整 materialize 完成後的一致快照」，不會讀到半個 materialization 的中間狀態。WAL
 模式讓 reader 不需要等 writer 完成即可讀取舊快照，`busy_timeout` 則處理極少數 reader/writer 短暫
 互鎖的情況，不需要更複雜的 lock 管理。V1 不支援多個 `rune update` 行程同時執行（該情境由
-`busy_timeout` 逾時後報錯處理，不做 queue/排隊機制）。
+`busy_timeout` 逾時後報錯處理，不做 queue/排隊機制）。**`PRAGMA foreign_keys=ON`（本輪新增）**：
+SQLite 預設不強制外鍵，宣告 `REFERENCES` 卻不開這個 pragma等於裝飾用；開啟後 `scope_files.file`／
+`scope_symbols.symbol_id` 暫時不宣告 FK（見 DATA_MODEL §5 的已知偏離說明），因為 M1 的
+`files`/`symbols` 表本來就是空的，等 Milestone 2 索引器填入後才補上，避免 M1 就無法 materialize
+帶有 file/symbol membership 的 scope。
 
 ### 4.8 Retrieval（`core.retrieval`）
 `search.py` 包裝 SQLite FTS5，涵蓋 scope summary、current decision、current constraint、active（含 stale

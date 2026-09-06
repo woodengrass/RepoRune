@@ -7,9 +7,43 @@ per CLAUDE-facing governance rules in ARCHITECTURE.md / IMPLEMENTATION_PLAN.md.
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+# --------------------------------------------------------------------------
+# Shared validators / constrained types
+# --------------------------------------------------------------------------
+
+
+def _validate_iso8601_utc(value: str) -> str:
+    """Enforces the convention documented in DATA_MODEL.md §1: timestamps
+    are ISO-8601 UTC strings (e.g. "2026-09-06T11:11:00Z"). Rejects naive
+    datetimes and non-UTC offsets rather than silently accepting them.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"not a valid ISO-8601 timestamp: {value!r}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 0:
+        raise ValueError(f"timestamp must be UTC (zero offset): {value!r}")
+    return value
+
+
+Timestamp = Annotated[str, AfterValidator(_validate_iso8601_utc)]
+Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+
+
+class StrictModel(BaseModel):
+    """Base for `.rune/config.toml` models: unknown keys are a config typo,
+    not something to silently ignore (a misspelled `[semanic]` table or a
+    stray field should fail loudly, not vanish).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
 
 # --------------------------------------------------------------------------
 # Shared enums
@@ -40,10 +74,10 @@ class ProjectFile(BaseModel):
     schema_version: int = 1
     project_id: str
     name: str
-    created_at: str
+    created_at: Timestamp
     last_indexed_head: str | None = None
     last_indexed_tree_hash: str | None = None
-    last_indexed_at: str | None = None
+    last_indexed_at: Timestamp | None = None
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +138,7 @@ class Edge(BaseModel):
     target_symbol: str | None = None
     target_file: str | None = None
     edge_type: EdgeType
-    confidence: float = 1.0
+    confidence: Confidence = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -159,7 +193,7 @@ class ScopeSummary(BaseModel):
     invariants: list[str] = Field(default_factory=list)
     known_risks: list[str] = Field(default_factory=list)
     open_questions: list[str] = Field(default_factory=list)
-    generated_at: str
+    generated_at: Timestamp
     model: str
     source_hash: str
     source_files: dict[str, str] = Field(default_factory=dict)
@@ -201,7 +235,7 @@ class PersistenceMode(str, Enum):
 
 class MemoryRevision(BaseModel):
     record_id: str
-    revision: int
+    revision: int = Field(ge=1)
     type: RecordType
     status: RecordStatus
     content: str
@@ -214,7 +248,7 @@ class MemoryRevision(BaseModel):
 
     source_hashes: dict[str, str] = Field(default_factory=dict)
     scope_hashes: dict[str, str] = Field(default_factory=dict)
-    expires_at: str | None = None
+    expires_at: Timestamp | None = None
 
     # Global Code Standards / Hard Policy Injection support (ARCHITECTURE.md §7).
     critical: bool = False
@@ -234,7 +268,7 @@ class MemoryRevision(BaseModel):
 
     created_by: RevisionAuthor
     approved_by: str | None = None
-    created_at: str
+    created_at: Timestamp
     schema_version: int = 1
 
 
@@ -252,14 +286,14 @@ class ProposalStatus(str, Enum):
 
 class Proposal(BaseModel):
     proposal_id: str
-    revision: int
+    revision: int = Field(ge=1)
     type: RecordType
     record_id: str
     payload: MemoryRevision
     status: ProposalStatus = ProposalStatus.pending
-    created_by: str  # "agent" | "human" — propose actions are never system-generated
-    created_at: str
-    resolved_at: str | None = None
+    created_by: Literal["agent", "human"]  # propose actions are never system-generated
+    created_at: Timestamp
+    resolved_at: Timestamp | None = None
     resolved_by: str | None = None
     schema_version: int = 1
 
@@ -289,20 +323,20 @@ class NoteStatus(str, Enum):
 
 class Note(BaseModel):
     id: str
-    revision: int
+    revision: int = Field(ge=1)
     category: NoteCategory
     content: str
     why_persist: str
     scopes: list[str] = Field(default_factory=list)
     files: list[str] = Field(default_factory=list)
     symbols: list[str] = Field(default_factory=list)
-    importance: float = 0.5
-    confidence: float = 0.5
+    importance: Confidence = 0.5
+    confidence: Confidence = 0.5
     source: RevisionAuthor
     evidence: list[str] = Field(default_factory=list)
-    created_at: str
-    last_verified_at: str
-    expires_at: str | None = None
+    created_at: Timestamp
+    last_verified_at: Timestamp
+    expires_at: Timestamp | None = None
     source_hashes: dict[str, str] = Field(default_factory=dict)
     status: NoteStatus = NoteStatus.active
     schema_version: int = 1
@@ -313,18 +347,18 @@ class Note(BaseModel):
 # --------------------------------------------------------------------------
 
 
-class IndexConfig(BaseModel):
+class IndexConfig(StrictModel):
     include: list[str] = Field(default_factory=lambda: ["**/*"])
     exclude: list[str] = Field(
         default_factory=lambda: ["**/node_modules/**", "**/.git/**", ".rune/cache/**"]
     )
 
 
-class SemanticBudget(BaseModel):
+class SemanticBudget(StrictModel):
     max_input_tokens_per_run: int = 150_000
 
 
-class SemanticConfig(BaseModel):
+class SemanticConfig(StrictModel):
     enabled: bool = True
     provider: str = "openrouter"
     model: str = ""
@@ -332,25 +366,25 @@ class SemanticConfig(BaseModel):
     budget: SemanticBudget = Field(default_factory=SemanticBudget)
 
 
-class NotesConfig(BaseModel):
+class NotesConfig(StrictModel):
     temporary_context_ttl_days: int = 7
     investigation_result_ttl_days: int = 30
 
 
-class SecurityConfig(BaseModel):
+class SecurityConfig(StrictModel):
     redact_secrets: bool = True
 
 
-class ProposalsConfig(BaseModel):
+class ProposalsConfig(StrictModel):
     commit_to_git: bool = False
 
 
-class PricingConfig(BaseModel):
+class PricingConfig(StrictModel):
     input_per_million: float = 0.0
     output_per_million: float = 0.0
 
 
-class BootstrapConfig(BaseModel):
+class BootstrapConfig(StrictModel):
     """See ARCHITECTURE.md §7.7. Hard bootstrap must never silently drop a
     MUST constraint when it exceeds `hard_budget_tokens` — the CLI reports
     `overflow=True` instead. `must_count_warn_threshold` drives a `rune
@@ -362,7 +396,7 @@ class BootstrapConfig(BaseModel):
     must_count_warn_threshold: int = 30
 
 
-class RuneConfig(BaseModel):
+class RuneConfig(StrictModel):
     version: int = 1
     index: IndexConfig = Field(default_factory=IndexConfig)
     semantic: SemanticConfig = Field(default_factory=SemanticConfig)
