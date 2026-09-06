@@ -140,6 +140,30 @@ def test_python_multiple_inheritance_produces_one_extends_ref_per_base() -> None
     assert extends == {"Base1", "Base2"}
 
 
+def test_python_qualified_and_generic_bases_still_produce_extends_refs() -> None:
+    """Regression test: `class Foo(pkg.Base):` and `class Bar(Base[T]):`
+    used to be silently dropped -- the walker only matched a bare
+    `identifier` superclass node, so a qualified (`attribute`) or generic
+    (`subscript`) base produced no RawReference at all. That violates
+    ARCHITECTURE.md §4.3: an unresolvable reference must still be
+    *recorded* (as unresolved), never dropped outright, the same way an
+    unresolved import is kept with `target_file=None` rather than omitted.
+    Best-effort name extraction takes the rightmost/innermost identifier
+    (`pkg.Base` -> "Base", `pkg.sub.Base[T]` -> "Base"), mirroring the
+    existing convention for `self.db.fetch()`-style call targets.
+    """
+    adapter = PythonParserAdapter()
+    refs = adapter.extract_references(
+        "a.py",
+        b"class Foo(pkg.Base):\n    pass\n\n"
+        b"class Bar(Base[T]):\n    pass\n\n"
+        b"class Baz(pkg.sub.Base[T]):\n    pass\n",
+    )
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    assert extends == {"Base"}
+    assert len(refs) == 3  # each class still contributes its own reference
+
+
 def test_typescript_multiple_implements_produces_one_ref_per_interface() -> None:
     adapter = TypeScriptParserAdapter()
     refs = adapter.extract_references(
@@ -147,6 +171,25 @@ def test_typescript_multiple_implements_produces_one_ref_per_interface() -> None
     )
     implements = {r.name for r in refs if r.edge_type == EdgeType.implements}
     assert implements == {"A", "B"}
+
+
+def test_typescript_qualified_and_generic_heritage_still_produce_refs() -> None:
+    """Regression test: `extends ns.Base` (a `member_expression`) and
+    `implements ns.Shape` (a `nested_type_identifier`, a distinct grammar
+    node from `member_expression`) used to be silently dropped -- only
+    bare `identifier`/`type_identifier` heritage values were recorded. Also
+    covers `implements Comparable<Foo>` (`generic_type`), which must
+    recurse to the un-parameterized name rather than being dropped too.
+    """
+    adapter = TypeScriptParserAdapter()
+    refs = adapter.extract_references(
+        "a.ts",
+        b"class Foo extends ns.Base implements ns.Shape, Comparable<Foo> {\n}\n",
+    )
+    extends = {r.name for r in refs if r.edge_type == EdgeType.extends}
+    implements = {r.name for r in refs if r.edge_type == EdgeType.implements}
+    assert extends == {"Base"}
+    assert implements == {"Shape", "Comparable"}
 
 
 def test_javascript_extracts_function_class_method_and_arrow_const() -> None:

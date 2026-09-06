@@ -69,8 +69,17 @@ def resolve_references(
         target_symbol: str | None = None
         target_file: str | None = None
         confidence = _CONFIDENCE_UNRESOLVED
+        # extends/implements can only ever target a class/interface — a
+        # same-named function or variable is a coincidental name collision,
+        # not the base type, and must be left unresolved rather than
+        # confidently (and wrongly) matched. calls has no such constraint:
+        # any callable-ish name is fair game (methods, functions, even
+        # classes via their constructor).
+        allowed_kinds = _TYPE_KINDS if ref.edge_type in (EdgeType.extends, EdgeType.implements) else None
 
-        local_matches = [s for s in local_symbols if s.name == ref.name]
+        local_matches = [
+            s for s in local_symbols if s.name == ref.name and (allowed_kinds is None or s.kind in allowed_kinds)
+        ]
         if local_matches:
             target_symbol = local_matches[0].symbol_id
             target_file = file_path
@@ -86,7 +95,11 @@ def resolve_references(
             # project relies on (verified: it actually did, across 5
             # separate process invocations, before this fix).
             for imported_file in sorted(imported_files):
-                candidates = [s for s in symbols_by_path.get(imported_file, []) if s.name == ref.name]
+                candidates = [
+                    s
+                    for s in symbols_by_path.get(imported_file, [])
+                    if s.name == ref.name and (allowed_kinds is None or s.kind in allowed_kinds)
+                ]
                 if candidates:
                     target_symbol = candidates[0].symbol_id
                     target_file = imported_file

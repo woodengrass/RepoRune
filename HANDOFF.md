@@ -1,7 +1,13 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-06，Milestone 4 已實作、完成驗證、commit `edd87d8`，並經下一個 session 自我複查
-修正 1 個 `rune scope suggest` 的崩潰 bug（見 IMPLEMENTATION_PLAN.md 第 50 條）。
+最後更新：2026-09-06，Milestone 4 已實作、完成驗證、commit `edd87d8`。之後兩輪自我複查／使用者轉述
+外部 finding 各修正若干問題：`rune scope suggest` 崩潰 bug（IMPLEMENTATION_PLAN.md 第 50 條）；接著
+使用者轉述 6 條 Milestone 3／4 finding，逐條重現後全部確認為真並修正（第九輪修訂，見 IMPLEMENTATION_
+PLAN.md 第 51-56 條）：unchanged caller 的 reference edge 不會重新解析、Python/TS 的
+qualified/generic 繼承 reference 被整個丟棄、extends/implements target 沒有 kind 限制導致誤配、
+scope 自動併入在 `rebuild_cache` 之前就寫入 canonical `scopes.json`（破壞 all-or-nothing 交易）、
+真實 repo 品質實驗第二個樣本改用真正中型的 `honeypot-discord-bot`、補齊 locked scope 的端對端測試。
+121 個測試全綠，`ruff check` 全綠。**Milestone 3、4 目前已重新確認完成，沒有已知未修的問題。**
 
 ## 專案是什麼
 
@@ -82,7 +88,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**113 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**121 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

@@ -281,12 +281,15 @@ class PythonParserAdapter:
             superclasses = node.child_by_field_name("superclasses")
             if superclasses is not None:
                 for child in superclasses.children:
-                    # skip `metaclass=Meta`-style keyword_argument entries —
-                    # only plain identifiers are real base classes
-                    if child.type == "identifier":
+                    # `_base_class_name` returns None for punctuation and for
+                    # `metaclass=Meta`-style keyword_argument entries (neither
+                    # is a real base class), so no extra type check is needed
+                    # here beyond what that helper already filters.
+                    name = self._base_class_name(child)
+                    if name is not None:
                         refs.append(
                             RawReference(
-                                name=child.text.decode("utf-8"),
+                                name=name,
                                 edge_type=EdgeType.extends,
                                 line=node.start_point[0] + 1,
                             )
@@ -302,6 +305,27 @@ class PythonParserAdapter:
             attr = fn_node.child_by_field_name("attribute")
             if attr is not None:
                 return attr.text.decode("utf-8")
+        return None
+
+    @classmethod
+    def _base_class_name(cls, node: Node) -> str | None:
+        """Best-effort name for a base-class expression, so a reference is
+        still *recorded* (per ARCHITECTURE.md §4.3, unresolved is never the
+        same as dropped) even when the base isn't a bare identifier:
+        `pkg.Base` -> "Base" (rightmost attribute, same convention already
+        used for `self.db.fetch()`-style call targets), `Base[T]`/
+        `pkg.Base[T]` -> recurses into the subscripted value. Returns None
+        only for genuinely non-reference children (punctuation, a
+        `metaclass=Meta` keyword_argument), which the caller drops.
+        """
+        if node.type == "identifier":
+            return node.text.decode("utf-8")
+        if node.type == "attribute":
+            attr = node.child_by_field_name("attribute")
+            return attr.text.decode("utf-8") if attr is not None else None
+        if node.type == "subscript":
+            value = node.child_by_field_name("value")
+            return cls._base_class_name(value) if value is not None else None
         return None
 
 
@@ -520,20 +544,22 @@ class _JsFamilyParserAdapter:
                 for clause in heritage.children:
                     if clause.type == "extends_clause":
                         value = clause.child_by_field_name("value")
-                        if value is not None and value.type in ("identifier", "type_identifier"):
+                        name = self._heritage_type_name(value) if value is not None else None
+                        if name is not None:
                             refs.append(
                                 RawReference(
-                                    name=value.text.decode("utf-8"),
+                                    name=name,
                                     edge_type=EdgeType.extends,
                                     line=node.start_point[0] + 1,
                                 )
                             )
                     elif clause.type == "implements_clause":
                         for c in clause.children:
-                            if c.type == "type_identifier":
+                            name = self._heritage_type_name(c)
+                            if name is not None:
                                 refs.append(
                                     RawReference(
-                                        name=c.text.decode("utf-8"),
+                                        name=name,
                                         edge_type=EdgeType.implements,
                                         line=node.start_point[0] + 1,
                                     )
@@ -549,6 +575,31 @@ class _JsFamilyParserAdapter:
             prop = fn_node.child_by_field_name("property")
             if prop is not None:
                 return prop.text.decode("utf-8")
+        return None
+
+    @classmethod
+    def _heritage_type_name(cls, node: Node) -> str | None:
+        """Best-effort name for an `extends`/`implements` type expression,
+        so a reference is still *recorded* (ARCHITECTURE.md §4.3: unresolved
+        is never the same as dropped) even when it isn't a bare identifier:
+        `ns.Base` -> "Base" (rightmost property, same convention as
+        `_call_target_name`'s member-expression handling), `ns.Shape` (a
+        `nested_type_identifier`, distinct from `member_expression` in this
+        grammar) -> "Shape", `Comparable<Foo>`/`Base<T>` (`generic_type`)
+        -> recurses into the un-parameterized name. Returns None only for
+        punctuation (commas between `implements` entries).
+        """
+        if node.type in ("identifier", "type_identifier"):
+            return node.text.decode("utf-8")
+        if node.type == "member_expression":
+            prop = node.child_by_field_name("property")
+            return prop.text.decode("utf-8") if prop is not None else None
+        if node.type == "nested_type_identifier":
+            name = node.child_by_field_name("name")
+            return name.text.decode("utf-8") if name is not None else None
+        if node.type == "generic_type":
+            name = node.child_by_field_name("name")
+            return cls._heritage_type_name(name) if name is not None else None
         return None
 
 

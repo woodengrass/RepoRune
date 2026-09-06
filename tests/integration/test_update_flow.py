@@ -192,6 +192,62 @@ def test_reference_resolution_entirely_unresolved_does_not_break_update(
     assert stats["files"] == 3
 
 
+def test_unchanged_callers_reference_edge_is_re_resolved_after_target_gains_the_symbol(
+    python_simple_repo: Path,
+) -> None:
+    """Regression test: `app/main.py` calls `compute_total()`, which
+    doesn't exist anywhere yet, so it's recorded unresolved. Later,
+    `compute_total` is added to a file `app/main.py` already imports --
+    but `app/main.py` itself is never touched, so it stays in
+    `changeset.unchanged` on the next incremental `rune update`. Before
+    this fix, an unchanged file's edges were reused verbatim from last
+    run's SQLite state, so this reference stayed unresolved forever until
+    a full rebuild -- silently diverging from what a full rebuild would
+    produce for the exact same source, which is the equivalence guarantee
+    `rebuild-cache` depends on. Only `imports` edges are safe to reuse
+    verbatim for an unchanged file (resolution depends solely on that
+    file's own unchanged import statements); `calls`/`extends`/
+    `implements` depend on the *target's* symbol table too, which can
+    change on a run where the caller itself doesn't.
+    """
+    (python_simple_repo / "app" / "main.py").write_text(
+        (python_simple_repo / "app" / "main.py").read_text(encoding="utf-8")
+        + "\n\ndef run2():\n    compute_total()\n",
+        encoding="utf-8",
+    )
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    before = conn.execute(
+        "SELECT target_symbol, confidence FROM edges "
+        "WHERE source_file = 'app/main.py' AND edge_type = 'calls' "
+        "AND target_symbol IS NULL"
+    ).fetchall()
+    assert len(before) == 1  # compute_total() recorded unresolved, not dropped
+
+    (python_simple_repo / "app" / "services.py").write_text(
+        (python_simple_repo / "app" / "services.py").read_text(encoding="utf-8")
+        + "\n\ndef compute_total():\n    return 42\n",
+        encoding="utf-8",
+    )
+    stats = run_update(layout, full=False)
+    assert stats["files_parsed"] == 1  # only services.py was re-parsed
+    assert stats["files_reused"] == 2  # main.py (the caller) was NOT re-parsed
+
+    conn2 = sqlite3.connect(str(layout.memory_db))
+    target_id = conn2.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'compute_total'"
+    ).fetchone()[0]
+    resolved = conn2.execute(
+        "SELECT target_symbol, target_file, confidence FROM edges "
+        "WHERE source_file = 'app/main.py' AND edge_type = 'calls' "
+        "AND target_symbol = ?",
+        (target_id,),
+    ).fetchone()
+    assert resolved == (target_id, "app/services.py", 0.6)
+
+
 def test_ts_simple_fixture_indexes_expected_symbols_and_edge(ts_simple_repo: Path) -> None:
     layout = init_project(ts_simple_repo)
     run_update(layout, full=True)
@@ -256,6 +312,94 @@ def test_new_file_with_one_unlocked_import_scope_is_auto_assigned(python_simple_
     assert conn.execute(
         "SELECT scope_id FROM scope_files WHERE file = ?", ("app/new.py",)
     ).fetchone() == ("app",)
+
+
+def test_new_file_with_only_locked_import_scope_is_not_auto_assigned_end_to_end(
+    python_simple_repo: Path,
+) -> None:
+    """End-to-end counterpart to `test_incremental_assignment_requires_one_
+    unlocked_import_target` in tests/unit/test_scopes.py, which only
+    exercises `assign_new_files_from_imports` directly. That unit-level
+    test can't catch a wiring bug in `core.update.run_update` itself (e.g.
+    the locked check being bypassed, or `scopes_override` being threaded
+    through incorrectly) -- only a full `rune update` run, asserting
+    against the actual SQLite `scope_files` table, can.
+    """
+    from rune.core.storage.canonical import write_json_model
+    from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=True, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    run_update(layout, full=True)
+    (python_simple_repo / "app" / "new.py").write_text(
+        "from .services import UserService\n\nservice = UserService()\n", encoding="utf-8"
+    )
+
+    stats = run_update(layout, full=False)
+
+    assert stats["scope_files_auto_assigned"] == 0
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT scope_id FROM scope_files WHERE file = ?", ("app/new.py",)
+    ).fetchone() is None
+    # the locked scope's own membership is untouched too
+    assert conn.execute(
+        "SELECT file FROM scope_files WHERE scope_id = 'app'"
+    ).fetchall() == [("app/services.py",)]
+
+
+def test_failed_rebuild_cache_does_not_leave_partial_scope_auto_assignment(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Regression test: `assign_new_files_from_imports` used to be applied
+    and immediately written to canonical `scopes.json` *before*
+    `rebuild_cache` ran, so a `rebuild_cache` failure (a canonical
+    conflict, a disk error) left the new membership durably written to
+    disk even though the cache that was supposed to reflect it was never
+    committed -- violating the "update is all-or-nothing" contract
+    ARCHITECTURE.md §4.9 makes for the rest of `rune update`. Reproduced
+    here by monkeypatching `rebuild_cache` to raise; canonical
+    `scopes.json` must come back byte-for-byte unchanged.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_json_model, write_json_model
+    from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    run_update(layout, full=True)
+    scopes_before = layout.scopes_json.read_text(encoding="utf-8")
+
+    (python_simple_repo / "app" / "new.py").write_text(
+        "from .services import UserService\n\nservice = UserService()\n", encoding="utf-8"
+    )
+
+    def failing_rebuild_cache(*args, **kwargs):
+        raise RuntimeError("simulated rebuild_cache failure")
+
+    monkeypatch.setattr(update_module, "rebuild_cache", failing_rebuild_cache)
+
+    try:
+        run_update(layout, full=False)
+        raise AssertionError("expected the simulated rebuild_cache failure to propagate")
+    except RuntimeError:
+        pass
+
+    assert layout.scopes_json.read_text(encoding="utf-8") == scopes_before
+    scopes_after = read_json_model(layout.scopes_json, ScopesFile)
+    assert scopes_after.scopes[0].members.files == ["app/services.py"]  # not app/new.py
 
 
 def test_symbol_rename_produces_new_id_and_removes_old(python_simple_repo: Path) -> None:

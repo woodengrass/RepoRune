@@ -1,10 +1,14 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第七輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+狀態：**已確認（第九輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
 做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
-修訂」。**第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
-持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認**，細節見文末「第七輪
-修訂」與 ARCHITECTURE.md §4.4。將規格 §70-77 展開為具體交付項目、模組目標與各 Milestone
+修訂」。第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
+持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認，細節見文末「第七輪
+修訂」與 ARCHITECTURE.md §4.4。**第九輪是使用者轉述的 6 條 Milestone 3／4 finding 逐條重現後的
+修正**（unchanged caller 的 reference edge 不會重新解析、qualified/generic 繼承 reference 被丟棄、
+extends/implements target 沒有 kind 限制、scope 自動併入在 rebuild_cache 前就寫入 canonical、真實
+repo 品質實驗的第二個樣本改用真正中型的 repo、補齊 locked scope 的端對端測試），細節見文末「第九輪
+修訂」。將規格 §70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
 before`/`after`、session events、custom tool 皆為真實 API），並針對前一輪列出的風險（import/
@@ -823,7 +827,9 @@ text 解析）。
     graph 產出兩個 fixture app 的 2 檔候選，人工判定合理。第二個 repo 的 graph 產出 7 個緊耦合
     application/test 檔案的單一候選，適合當起點但仍須人類拆分。此樣本共 5 個候選，2 個可直接採用、1 個
     可作起點、2 個過寬；現階段保留「建議而非正確性需求」定位，不據此鎖死 threshold，後續以更多中型
-    repo 觀察是否需要將 path heuristic 從頂層目錄收斂到更細的共同前綴。
+    repo 觀察是否需要將 path heuristic 從頂層目錄收斂到更細的共同前綴。**（第九輪第 55 條更新：
+    這裡的第二個樣本`兌換碼腳本`只有 7 個檔案，不構成「中型 repo」，已改用 `honeypot-discord-bot`
+    重跑，這條記錄的 RepoRune 樣本本身仍然有效、繼續採用，不需要重跑。）**
 
 **下一個 session 對已完成的 Milestone 4 做自我複查發現並修正 1 個問題**（實際跑 CLI 重現後才修，
 不是憑讀程式碼猜測）：
@@ -844,3 +850,117 @@ text 解析）。
     `rune update` 建立 cache 再手動刪除 `memory.db`，驗證指令乾淨地以 exit code 1 結束、不留下任何
     新的 `memory.db` 副作用；透過暫時 `git stash` 掉修法本身確認這個測試在修法之前確實會失敗（而非
     誤測了不存在的東西），才確定它真的在測這個 bug。
+
+### 第九輪修訂（使用者轉述的 6 條 Milestone 3／4 finding，逐條重現後修正）
+
+本輪的 6 條 finding 都是使用者直接轉述（而非本 agent 自己複查發現），依專案既定方法論「外部
+finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後才動手修——全部 6 條都重現成立，沒有一條是
+誤報。
+
+51. **高：unchanged caller 的 reference edge 不會因為 import target 後來補上符合的 symbol 而重新
+    解析**：`run_update`（`core/update.py`）對 `changeset.unchanged` 的檔案，原本把上一輪的
+    `calls`/`extends`/`implements` edge 原樣沿用（`edges_by_path.get(...)`），跟 `imports` edge
+    用同一套「不變就重用」邏輯，理由寫在舊註解裡是「兩者都不用重新解析」。這個類比是錯的：
+    `imports` edge 的正確性只取決於**這個檔案自己**的 import 陳述句（沒變），但 `calls`/
+    `extends`/`implements` 的正確性同時取決於**目標檔案的 symbol table**——後者即使呼叫端檔案本身
+    毫無變動，也可能在同一次 `rune update` 因為另一個檔案被修改而改變。實測重現：`app/main.py`
+    呼叫一個當時不存在的 `helper()`，記錄為 unresolved；之後只在 `app/main.py` 已 import 的
+    `app/helpers.py` 補上 `helper` 函式（`app/main.py` 本身完全沒動），跑 `rune update`
+    （`full=False`）後這條 edge 仍然是 unresolved——必須整個 `full=True` 重建才會拿到正確 target。
+    這直接違反「相同狀態輸入、相同結果輸出」的 rebuild-cache 等價性保證（第 6 條記錄過的同一條保證，
+    這次是 incremental 沒有追上 full rebuild，而非 hash-seed 造成不一致）。既有的
+    `test_rebuild_cache_full_rescan_matches_incremental_state` 測不出這個 bug，因為它只比對
+    symbols/files/edges **數量**，不比對 edge 實際指向的 target 是否一致。
+    修法：`changeset.unchanged` 的檔案改成只沿用上一輪的 `imports` edge（`edge_type ==
+    EdgeType.imports` 過濾），`calls`/`extends`/`implements` 一律靠新增的 `_extract_references_only`
+    輔助函式重新跑一次 `adapter.extract_references`（只重新抽取 reference，不重新抽取
+    symbols/imports，因為那兩者確實只取決於檔案自身內容，可以放心沿用）取得新的 raw reference，
+    納入既有的 `pending_references` 統一解析流程。代價是每次 `rune update`（即使是完全無修改的
+    no-op）現在都要對每個檔案重新跑一次 tree-sitter 的 reference walker，不再是純粹的 O(變更檔案數)；
+    這是刻意接受的取捨——純本地解析、零 LLM/網路成本，跟既有「`full=True` 重新掃描全部檔案也可接受」
+    的判斷基準一致，正確性優先於這裡的增量省下的解析成本。新增整合回歸測試
+    `test_unchanged_callers_reference_edge_is_re_resolved_after_target_gains_the_symbol`
+    （`tests/integration/test_update_flow.py`），並確認它在修法前確實會失敗。
+52. **中：Python/TypeScript 的 qualified／generic 繼承 reference 被整個丟棄，不是記錄為
+    unresolved**：`treesitter.py` 的 `_collect_references` 原本判斷 base class／heritage 節點時只
+    接受裸 `identifier`/`type_identifier`，遇到 `pkg.Base`（Python `attribute`）、`Base[T]`
+    （Python `subscript`）、`ns.Base`（TS `member_expression`）、`ns.Shape`（TS
+    `nested_type_identifier`，這是跟 `member_expression`不同的文法節點）時，整個迴圈跳過，
+    連一筆 unresolved 的 `RawReference` 都不產生——直接違反 ARCHITECTURE.md §4.3「無法解析的
+    reference 仍要記錄，不能丟棄」的規則（這條規則原本是為了 unresolved import 訂的，但同一原則
+    對 reference 同樣適用，Milestone 3 的既有測試已經在驗證這件事，只是沒蓋到這幾種節點形狀）。
+    實測重現：`class Foo(pkg.Base)`／`class Bar(Base[T])`／TS 的 `class Foo extends ns.Base`
+    在修法前都完全不產生 `extends` edge（`SELECT ... WHERE edge_type='extends'` 回傳空）。修法：
+    新增遞迴的 best-effort 名稱擷取（Python 的 `_base_class_name`、TS 的
+    `_heritage_type_name`），沿用既有「取最右側/最內層識別字」的慣例（跟呼叫端的
+    `self.db.fetch()` 取 `fetch` 同一套邏輯）：`pkg.Base`/`ns.Base` 取 `Base`／`Shape`，
+    `Base[T]`／`Comparable<Foo>`（TS `generic_type`）遞迴取被參數化的名稱本身。修完後這些案例都會
+    產生一筆 `RawReference`，交給既有的 `resolve_references` 走正常的 best-effort 比對流程（可能
+    resolve 成功，也可能維持 unresolved，但絕不會是「完全沒有這筆紀錄」）。新增
+    `test_python_qualified_and_generic_bases_still_produce_extends_refs`、
+    `test_typescript_qualified_and_generic_heritage_still_produce_refs`
+    （`tests/unit/test_treesitter.py`），並確認兩者在修法前都會失敗。
+53. **中：`extends`/`implements` 的 target 沒有限制必須是 class/interface，可能誤配到同名的
+    function/variable**：`references.py` 的 `resolve_references` 在算 `source_symbol`（呼叫/繼承
+    陳述句所在的那個 symbol）時已經正確依 edge_type 分開 `_CALLABLE_KINDS`/`_TYPE_KINDS`
+    （`_find_enclosing_symbol`），但算 `target_symbol`（呼叫/繼承陳述句**指向**的那個 symbol）時完全
+    沒有套用同樣的 kind 限制，`local_matches`/`candidates` 都只比對名稱。實測重現：同一個檔案裡有
+    `def Base(): ...` 和 `class Foo(Base): ...`，`extends` edge 的 target 被錯誤 resolve 成那個
+    **function** 的 symbol_id，而非正確地留白（因為 `Base` 根本沒有真正的類別定義）。修法：對
+    `extends`/`implements` 的 target 比對加上 `s.kind in _TYPE_KINDS` 過濾（`calls` 不受影響，
+    因為呼叫目標本來就可以是 function/method，甚至透過建構子呼叫 class 本身，沒有這個限制）。新增
+    `test_resolve_references_extends_target_ignores_same_named_function`、
+    `test_resolve_references_implements_target_ignores_same_named_variable_in_imported_file`
+    （`tests/unit/test_references.py`）——特別記錄：既有的
+    `test_resolve_references_extends_does_not_match_function_symbols` 這個名字聽起來像測了同一件事，
+    但實際讀過之後發現它測的是 `source_symbol` 的 kind 限制（`_find_enclosing_symbol`），從未在
+    `symbols_by_path` 放入一個同名 function 讓 target 比對有機會選錯，所以完全沒蓋到這條 finding，
+    這正是「連自己寫的回歸測試都要驗證它是不是真的在測它宣稱要測的東西」這條方法論要抓的情況。
+54. **高：Scope 自動併入（Milestone 4）在 `rebuild_cache` 之前就把新 membership 寫進 canonical
+    `scopes.json`**：`run_update` 原本的順序是「算出新 membership → `save_scopes`（寫入磁碟）→
+    呼叫 `rebuild_cache`」。若 `rebuild_cache` 中途失敗（canonical 衝突、SQLite 錯誤、磁碟錯誤），
+    整個 `run_update` 會拋例外，但 `scopes.json` 已經帶著新 membership 落地，SQLite 卻完全沒有反映
+    這次的變更——直接違反 ARCHITECTURE §4.9「決定性索引更新要嘛整體成功、要嘛整次 update 乾淨
+    中止，不留部分決定性狀態」的交易要求（scope 自動併入是這次 `rune update` 呼叫裡的一部分，理應
+    適用同一個 all-or-nothing 契約）。這跟 `project.json` 那個「已知限制」不是同一類問題：
+    `project.json` 只是可自我修復的 freshness metadata（下次 update 一定會重新算，不依賴它），但
+    `scopes.json` 是**權威 canonical 內容**，不是衍生資料，一旦提前落地又沒被對應的 cache 反映，
+    不會自己修復。實測重現：monkeypatch `rebuild_cache` 讓它拋例外，`run_update` 如預期往外拋，但
+    `scopes.json` 讀回來已經多了新檔案的 membership。修法：`materialize.rebuild_cache` 新增選填參數
+    `scopes_override`，有給值時直接拿它 materialize（不重新從磁碟讀 `scopes.json`）；`run_update`
+    改成把算好但**尚未寫入磁碟**的 `ScopesFile` 透過 `scopes_override` 傳給同一次 `rebuild_cache`
+    呼叫（讓這次的自動併入結果跟其餘決定性索引一樣，在同一個 SQLite transaction 裡一起 commit），
+    直到 `rebuild_cache` 成功回傳後才呼叫 `save_scopes` 把它寫進 canonical——如果 `rebuild_cache`
+    失敗，`save_scopes` 根本不會被呼叫，`scopes.json` 維持失敗前的原樣。這個順序（先讓 cache 反映、
+    成功後才寫 canonical）刻意跟 `project.json` 的順序理由一致（都是「先算好、最後才落地，縮小
+    視窗」），但這裡多了 `scopes_override` 這一步，確保 canonical 落地之前 cache 已經跟它一致，而
+    不是像 `project.json` 那樣接受一個短暫不一致的視窗——因為 `scopes.json` 不像 `project.json`
+    那樣是純粹的展示用 metadata，容不下同一等級的風險。新增回歸測試
+    `test_failed_rebuild_cache_does_not_leave_partial_scope_auto_assignment`
+    （`tests/integration/test_update_flow.py`），並確認它在修法前會失敗（`scopes.json` 讀回來的
+    membership 跟修法前的舊值不同）。
+55. **低，驗收資料補齊：真實 repo 品質實驗第二個樣本改用真正的中型 repo**：Milestone 4 完成時記錄的
+    第二個真實 repo 樣本（`兌換碼腳本`）只有 7 個索引檔，稱不上「中型 repo」，不滿足 IMPLEMENTATION_
+    PLAN.md 自己訂的「至少 2 個真實中型 repo」驗收標準。本輪改用 IMPLEMENTATION_PLAN.md 這條驗收
+    標準本身點名的範例 repo `honeypot-discord-bot`（186 個索引檔、1662 個 symbol、7422 條 edge，
+    明確是中型規模）重跑一次實驗（本機 clone 到暫存目錄執行，不寫回原始 repo）。結果：路徑啟發式
+    產出 7 個候選（`admin` 2 檔、`core` 13 檔、`discord_plugin_platform` 84 檔、`features` 50 檔、
+    `hubs` 7 檔、`scripts` 3 檔、`tests` 25 檔），其中 `admin`/`core`/`hubs`/`scripts` 大小合理、
+    像人會畫的架構邊界，`discord_plugin_platform`/`features`/`tests` 過寬（`features` 底下其實是
+    十幾個彼此獨立的 feature cog，不該被合併成單一 scope，跟 RepoRune 自己實驗時觀察到的「頂層目錄
+    heuristic 偏寬」問題一致，不是這個 repo 特有的）。Graph clustering 產出的結果更明確暴露既有的
+    已知限制：一個由 `bot.py`/`core/` 當中樞、透過 import 把幾乎所有 feature/test 檔案串在一起的
+    102 檔巨型 connected component，加上 3 個小型（2-3 檔）真正像獨立單元的候選——單一巨大 component
+    完全不可用，這正是 ARCHITECTURE §4.4／IMPLEMENTATION_PLAN 已經記錄的「connected components 對
+    透過中樞模組互相耦合的大型 repo效果不佳」風險在真實資料上的具體體現，不是本輪新發現的 bug，而是
+    確認了「clustering 品質定位為實驗、不鎖死 threshold」這個決定本身是對的。連同 Milestone 4 原本
+    記錄的 RepoRune 自身實驗，現在共 2 個真正的中型 repo 樣本，滿足驗收標準的樣本數量要求。
+56. **測試缺口補齊：locked scope 的 incremental 自動併入補上端對端測試**：原本只有
+    `tests/unit/test_scopes.py` 對 `assign_new_files_from_imports` 這個 core 函式的直接單元測試，
+    沒有任何測試透過完整的 `run_update`（`full=False`）驗證 locked scope 在真實 SQLite materialize
+    流程裡確實不會被自動寫入——單元測試測不出 `core/update.py` 自己接線接錯的情況（例如
+    `scopes_override` 傳遞邏輯或呼叫順序寫錯）。新增
+    `test_new_file_with_only_locked_import_scope_is_not_auto_assigned_end_to_end`
+    （`tests/integration/test_update_flow.py`），對一個 `locked=True` 的 scope 跑一次完整
+    `rune update`，斷言 `stats["scope_files_auto_assigned"] == 0`、SQLite `scope_files` 表裡新檔案
+    沒有任何 membership、原本的 membership 也完全不變。

@@ -128,6 +128,39 @@ def _parse_file(
     return symbols, import_edges, raw_references, status
 
 
+def _extract_references_only(scanned: ScannedFile) -> list[RawReference]:
+    """Re-extracts just the raw (unresolved) references for a file whose
+    content_hash hasn't changed this run, so its calls/extends/implements
+    edges get re-resolved against the *current* run's symbol table rather
+    than reused verbatim from last run.
+
+    This file's own symbols/imports are still safely reused as-is from the
+    cache: both depend only on this file's own (unchanged) content. But a
+    resolved reference edge's correctness also depends on the *target's*
+    symbol table, which can change even when this file doesn't — e.g. a
+    function this file already calls gets added to an already-imported
+    module. `edges_by_path` reuse alone would carry the old, now-stale
+    resolution forward and never revisit it, since this file would never
+    be re-parsed again unless *its own* content changes. Reusing only the
+    `imports` edges for unchanged files and always recomputing references
+    from a fresh extraction closes that gap.
+
+    Deliberately not folded into `_parse_file`: this only re-runs
+    `extract_references`, not the (already-trusted, unnecessary-to-redo)
+    `extract_symbols`/`extract_imports`, and it must never change the
+    file's `status` — a reference-extraction hiccup here isn't a full
+    parse failure, so it's isolated the same way `_parse_file` isolates
+    its own failures (best effort, no symbols/edges rather than aborting
+    the whole update), just without touching `IndexedFileStatus`.
+    """
+    try:
+        source = scanned.absolute_path.read_bytes()
+        adapter = get_parser_adapter(scanned.language, scanned.path)
+        return adapter.extract_references(scanned.path, source)
+    except Exception:  # noqa: BLE001 - same isolation principle as _parse_file
+        return []
+
+
 def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
     config = load_config(layout.config_path)
     repo_root = layout.repo_root
@@ -168,7 +201,18 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
         previous_status = previous_status_by_path.get(scanned_file.path, IndexedFileStatus.ok)
         new_files.append(_to_indexed_file(scanned_file, now, previous_status))
         new_symbols.extend(symbols_by_path.get(scanned_file.path, []))
-        new_edges.extend(edges_by_path.get(scanned_file.path, []))
+        # Only `imports` edges are safe to reuse verbatim here: import
+        # resolution depends solely on this file's own (unchanged) import
+        # statements. calls/extends/implements depend on the *target's*
+        # symbol table too, which can change on a run where this file
+        # itself doesn't — so those must be recomputed from a fresh
+        # reference extraction below, not carried over from last run.
+        new_edges.extend(
+            edge
+            for edge in edges_by_path.get(scanned_file.path, [])
+            if edge.edge_type == EdgeType.imports
+        )
+        pending_references[scanned_file.path] = _extract_references_only(scanned_file)
 
     for scanned_file in (*changeset.added, *changeset.modified):
         symbols, import_edges, raw_references, status = _parse_file(repo_root, scanned_file)
@@ -214,21 +258,35 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int]:
         else None
     )
 
+    # Computed here (in memory only) so it can be materialized into this
+    # same rebuild_cache transaction via `scopes_override` — see that
+    # parameter's docstring. The canonical `scopes.json` write is
+    # deliberately deferred until *after* rebuild_cache succeeds (below):
+    # scopes.json is authoritative canonical content, not derived cache, so
+    # writing it before a rebuild_cache that then fails (a canonical
+    # conflict, a disk error) would leave canonical membership ahead of
+    # what the cache — and every other reader relying on `rune update`
+    # being all-or-nothing (ARCHITECTURE.md §4.9) — actually reflects.
     auto_assigned_scope_ids: list[str] = []
+    updated_scopes_file = None
     if not full and changeset.added:
-        scopes_file = load_scopes(layout)
+        updated_scopes_file = load_scopes(layout)
         auto_assigned_scope_ids = assign_new_files_from_imports(
-            scopes_file,
+            updated_scopes_file,
             {scanned_file.path for scanned_file in changeset.added},
             new_edges,
             new_symbols,
         )
-        if auto_assigned_scope_ids:
-            save_scopes(layout, scopes_file)
+        if not auto_assigned_scope_ids:
+            updated_scopes_file = None
 
     stats = rebuild_cache(
-        layout, code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges)
+        layout,
+        code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges),
+        scopes_override=updated_scopes_file,
     )
+    if updated_scopes_file is not None:
+        save_scopes(layout, updated_scopes_file)
 
     # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not
     # atomic with the SQLite commit above — memory.db and project.json are

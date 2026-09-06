@@ -426,7 +426,9 @@ def _clear_all_content(conn: sqlite3.Connection) -> None:
 
 
 def rebuild_cache(
-    layout: RuneLayout, code_index: CodeIndexData | None = None
+    layout: RuneLayout,
+    code_index: CodeIndexData | None = None,
+    scopes_override: ScopesFile | None = None,
 ) -> dict[str, int]:
     """Fully rebuilds memory.db from canonical files (and, from Milestone 2
     on, the caller-supplied `code_index`). Zero LLM calls, zero network.
@@ -440,6 +442,17 @@ def rebuild_cache(
     incremental diff-and-reuse pass for `rune update`) and passes the
     result in. Omitting it (the Milestone 1 behavior, and what plain
     canonical-only tests use) simply leaves files/symbols/edges empty.
+
+    `scopes_override`, when given, is materialized in place of reading
+    `layout.scopes_json` from disk. This exists solely so `core.update`'s
+    incremental auto-assignment (Milestone 4) can have its just-computed,
+    not-yet-written `ScopesFile` land in this same SQLite transaction
+    *before* the canonical `scopes.json` write happens — see the call site
+    for why the ordering (commit cache first, write canonical scopes.json
+    only after) matters for all-or-nothing update semantics. Every other
+    canonical file (decisions/constraints/notes/proposals/semantic) still
+    always reads fresh from disk here; scopes.json is the only one with an
+    in-flight in-memory mutation to reconcile in Milestone 4's scope.
 
     Rebuilds **in place**, inside a single SQLite transaction (clear every
     table, then re-insert everything, then commit) rather than building a
@@ -461,7 +474,11 @@ def rebuild_cache(
     try:
         create_schema(conn)
 
-        scopes_file = read_json_model(layout.scopes_json, ScopesFile) or ScopesFile()
+        scopes_file = (
+            scopes_override
+            if scopes_override is not None
+            else read_json_model(layout.scopes_json, ScopesFile) or ScopesFile()
+        )
         decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
         constraints = read_jsonl(layout.constraints_jsonl, MemoryRevision)
         notes = read_jsonl(layout.notes_jsonl, Note)

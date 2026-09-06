@@ -161,6 +161,48 @@ def test_resolve_references_extends_does_not_match_function_symbols() -> None:
     assert edges[0].source_symbol == cls.symbol_id
 
 
+def test_resolve_references_extends_target_ignores_same_named_function() -> None:
+    """Regression test, distinct from
+    `test_resolve_references_extends_does_not_match_function_symbols`
+    above (that one only constrains which symbol counts as the *source*
+    of an extends/implements edge -- it never actually put a same-named
+    function into `symbols_by_path`, so it could not have caught this).
+    This one covers the *target* side: `class Foo(Base):` where `Base` is
+    coincidentally also the name of a function or variable in scope must
+    not resolve `target_symbol` to that function/variable -- a same-named
+    non-type symbol is not the base class, and confidently matching it
+    would be worse than leaving the reference unresolved.
+    """
+    base_fn = _symbol("a.py", "Base", "Base", SymbolKind.function, 1, 2)
+    cls = _symbol("a.py", "Foo", "Foo", SymbolKind.class_, 4, 5)
+    edges = resolve_references(
+        "a.py",
+        [RawReference(name="Base", edge_type=EdgeType.extends, line=4)],
+        {"a.py": [base_fn, cls]},
+        imported_files=set(),
+    )
+    assert edges[0].target_symbol is None
+    assert edges[0].target_file is None
+    assert edges[0].confidence == 0.3
+
+
+def test_resolve_references_implements_target_ignores_same_named_variable_in_imported_file() -> None:
+    """Same as above but for the imported-file match path (confidence 0.6)
+    and `implements` rather than `extends`: a same-named constant in an
+    imported file must not satisfy an `implements` reference either.
+    """
+    fake_shape = _symbol("b.py", "Shape", "Shape", SymbolKind.constant, 1, 1)
+    edges = resolve_references(
+        "a.py",
+        [RawReference(name="Shape", edge_type=EdgeType.implements, line=1)],
+        {"a.py": [], "b.py": [fake_shape]},
+        imported_files={"b.py"},
+    )
+    assert edges[0].target_symbol is None
+    assert edges[0].target_file is None
+    assert edges[0].confidence == 0.3
+
+
 def test_resolve_references_nested_class_picks_innermost_as_source() -> None:
     outer = _symbol("a.py", "Outer", "Outer", SymbolKind.class_, 1, 20)
     inner = _symbol("a.py", "Inner", "Outer.Inner", SymbolKind.class_, 5, 8)
