@@ -1,6 +1,6 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-06，commit `d9cc48a`（Milestone 3 完成 + 2 個 code review 修正）
+最後更新：2026-09-06，commit `dba8d85`（Milestone 4 開工前設計決策記錄，尚未寫程式碼）
 
 ## 專案是什麼
 
@@ -30,7 +30,46 @@ commit，全部已 push，沒有未提交的變更）。
 Decision/Constraint 語意、staleness 語意、agent-injection 語意的變更，都要求先更新文件、記錄決策
 理由，才能動程式碼。**接手的人／agent 請延續這個習慣**，不要跳過文件直接改 code。
 
-## 目前進度：Milestone 1-3 完成，Milestone 4 尚未開始
+## 目前進度：Milestone 1-3 完成並通過測試；Milestone 4 設計決策已定案，程式碼尚未開始寫
+
+**這是本次交接的重點**：上一個 session 沒有寫任何 Milestone 4 的程式碼，只做了「開工前先問清楚
+設計決策」這件事（延續本專案的既定工作方式，見下方「工作方式」第 5 條）。三個決策已經討論確認、
+寫進文件、commit + push（`dba8d85`），**下一個 session 應該直接開始實作 `rune.core.scopes`，不需要
+再重新討論這三個決策**，除非你重新審視後想推翻它們。
+
+### Milestone 4 開工前確認的三個設計決策（第七輪修訂，見 ARCHITECTURE.md §4.4、
+IMPLEMENTATION_PLAN.md 設計決策記錄第 45-47 條）
+
+1. **候選 scope（heuristic + clustering）不持久化，純一次性 CLI 互動**：`rune scope suggest` 當場
+   計算候選、當場印出、當場人類 `[y]es/[n]o` 確認，才會寫成 `source=model` 的 scope；不新增
+   `scope_candidates.jsonl` 之類的 canonical 檔案，關掉終端候選就消失，下次重跑重新計算即可。這與
+   Decision/Constraint 的 `proposals.jsonl`（代表「尚待處理的治理狀態」，必須撐過重開機/cache 刪除）
+   刻意不同——scope 候選在確認前只是可低成本重算的建議。
+2. **Clustering 候選建議可以同時使用 import 與 best-effort reference edge（calls/extends/
+   implements）做圖聚類**：這不違反 ARCHITECTURE §4.3「Scope/Constraint 系統不得把 reference
+   graph 當唯一依據」——那條原則管的是治理系統（無人把關的自動寫入），clustering 建議一定要經人類
+   確認才會寫進 `scopes.json`，human review 本身就是對 reference 解析不完美的防線。
+3. **新檔案 incremental 自動併入既有 scope，只認 import edge、且僅限單一候選**：`rune update` 對
+   新檔案，若透過 `edge_type=imports`（`confidence=1.0`）**恰好命中一個**現有、非 `locked` 的
+   scope，才自動加進該 scope 的 `members.files`，不需人類確認。以下情況一律落回人類確認的 CLI
+   流程：零個或多個候選 scope（模糊）、只有 best-effort reference 命中（沒有 import edge）、目標
+   scope 是 `locked`、任何會移除既有 membership 或建立新 scope 的動作。這個判準刻意比 clustering
+   建議嚴格，因為 incremental 自動併入是唯一無人把關的寫入路徑，只能用 high-confidence 訊號。
+   `locked` scope 永遠不受任何形式（clustering 建議或 incremental 自動併入）影響。
+
+### Milestone 4 下一步實作建議
+
+開工前先重讀一次：IMPLEMENTATION_PLAN.md 的 Milestone 4 整段（交付項目已依上述三個決策改寫）、
+ARCHITECTURE.md §4.4（含新增的決策段落）。模組落在 `rune.core.scopes.{model,heuristics,clustering}`，
+CLI 大概需要新增 `rune scope` 相關子命令（例如 `list`/`create`/`lock`/`unlock`/`suggest`），但**子
+命令的確切介面規格文件裡沒有寫死，屬於實作細節，可以邊做邊定**（跟前三個「會改變 scope model 語意」
+的決策不同層級，不需要先問過使用者）。建議先寫 `model.py`（Scope CRUD，`scopes.json` 讀寫）、再
+`heuristics.py`（路徑啟發式候選）、最後 `clustering.py`（NetworkX connected-components，注意
+`ParserAdapter`/`references.py` 已經有的 import/reference edge 可以直接從 SQLite `edges` 表讀取，
+不需要重新解析）。記得延續「自己寫腳本重現邊界情況」與「修完補 IMPLEMENTATION_PLAN.md 決策記錄」
+的習慣。
+
+## 舊進度記錄（Milestone 1-3，供對照）
 
 專案採 8 個 Milestone（見 IMPLEMENTATION_PLAN.md 開頭）：
 
@@ -39,7 +78,7 @@ Decision/Constraint 語意、staleness 語意、agent-injection 語意的變更�
 | 1. Core foundation | ✅ 完成 | canonical storage、config、project init、SQLite materialize、CLI 骨架 |
 | 2. Code index | ✅ 完成 | Tree-sitter 掃描/解析、symbol 擷取、import graph |
 | 3. References / graph | ✅ 完成 | best-effort calls/extends/implements 解析 |
-| 4. Scopes | ❌ 未開始 | **下一步** |
+| 4. Scopes | ❌ 設計決策已定案，程式碼未開始 | **下一步（見上方「Milestone 4 開工前確認的三個設計決策」）** |
 | 5. Semantic worker | ❌ 未開始 | 便宜模型 scope summary |
 | 6. Policies & Memory | ❌ 未開始 | Decision/Constraint/Note 生命週期、search |
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
@@ -167,14 +206,6 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-**Milestone 4 — Scopes**（`rune.core.scopes.{model,heuristics,clustering}`）：
-
-- 對 `scopes.json` 的 `Scope` CRUD
-- 路徑啟發式候選產生
-- 用 NetworkX 做 graph-assisted 候選建議（**不要**用 igraph/Leiden，規格明確排除）
-- 候選 scope 一律先經人類確認才寫成 `source=model`
-- `locked` scope 永遠不受 clustering 影響
-- 驗收標準包含「真實 repo scope 品質實驗」（不是固定 threshold，是收集 precision/可用率資料）
-
-開工前建議：重新讀一次 IMPLEMENTATION_PLAN.md 的 Milestone 4 那一整段（含驗收標準），以及
-ARCHITECTURE.md §4.4（Scope System 的職責與 clustering 定位）。
+見文件最上方「目前進度」段落的「Milestone 4 開工前確認的三個設計決策」與「Milestone 4 下一步實作
+建議」——設計決策已經定案並寫進 ARCHITECTURE.md §4.4、IMPLEMENTATION_PLAN.md，下一個 session 可以
+直接開始寫 `rune.core.scopes` 的程式碼，不需要重新走一次確認流程。
