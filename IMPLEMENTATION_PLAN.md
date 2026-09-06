@@ -1425,3 +1425,28 @@ Milestone 6（Policies & Memory）是下一步；retrieval 端「`possibly_stale
 已同步更新 ARCHITECTURE.md §4.5（第十二輪）、DATA_MODEL.md §2.4（第十一輪）的措辭，移除「`model`
 空字串視同 disabled」這個已撤回的描述。192 個測試維持全綠，`ruff check` 全綠——本輪淨變更只有
 `check_semantic_health` 裡一個 `if` 分支的邏輯，以及兩個既有測試的修正，沒有新增功能。
+
+### 第十八輪修訂（Milestone 6 開工：current/visible 分離基礎 spike）
+
+Milestone 6（Policies & Memory）的設計已在文件裡確認完畢（DATA_MODEL §1、§2.5、§2.6、§3、§6，
+IMPLEMENTATION_PLAN 第 410 行起），沒有卡著的開放問題；範圍很大，跟使用者確認後決定先做一個小
+spike 驗證最容易犯錯的「current 與 visible 分離」這條規則，其餘部分（proposal 流程、staleness、
+orphan 偵測、單一寫入者衝突偵測、FTS5、`rune search` 排序、`rune check`）留到下一階段確認後再做。
+
+93. **`rune.core.memory.revisions`（新模組）**：`current_revision(revisions: list[T]) -> T | None`
+    純以 `max(revision)` 計算 current，完全不依 `status` 過濾候選集合；`is_decision_constraint_
+    visible(status: RecordStatus)` 與 `is_note_visible(status: NoteStatus)` 分別實作 DATA_MODEL
+    §3、§2.6 的可見性表格。用 PEP 695 泛型語法（`def current_revision[T: _Revisioned](...)`）讓
+    同一個函式同時適用 `MemoryRevision`（Decision/Constraint）與 `Note`——兩者結構不同但都只需要
+    `revision: int` 這個共同欄位，不需要各寫一份。
+94. **鎖死 DATA_MODEL §3 明講的關鍵回歸案例**：`tests/unit/test_memory_revisions.py::
+    test_current_revision_is_rev2_inactive_not_rev1_active`——`rev1=active, rev2=inactive` 時
+    current 必須是 rev2，不能因為 rev1 的 status 在「可見集合」裡就被誤選為 current。用手動注入
+    一版「naive」的錯誤實作（只在 `active`/`review_required` 狀態的 revision 裡取最大值）重新驗證
+    這個測試真的會抓到這個錯誤（改完後 assert 失敗，訊息顯示誤選了 rev1），再改回正確實作——不是
+    只憑直覺相信測試寫對了。另外 6 個測試涵蓋：輸入順序不影響結果、空 list 回傳 None、單一
+    revision、Decision/Constraint 與 Note 各自的可見性表格、以及 Note 也能重用同一個
+    `current_revision` 函式。
+
+新增 7 個測試，199 個測試全綠，`ruff check` 全綠。這是 Milestone 6 的第一塊基礎，proposal 流程、
+staleness、orphan 偵測等其餘交付項目待下一階段確認範圍與順序後再進行。
