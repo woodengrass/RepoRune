@@ -40,6 +40,29 @@ repair prompt——**這不是假設情境，第 60 條記錄的真實 API 驗�
 本身不可靠。修復第二條時第一版改法過寬，意外讓既有測試失敗，重新精確區分「provider 層級失敗」與
 「回應到了但格式錯」才修好——連自己剛寫的修法都要重新驗證。162 個測試全綠，`ruff check` 全綠。
 
+**使用者接著轉述另一份針對 Milestone 5 的 code review，10 條 finding，逐條重現後全部確認為真
+（第十三輪修訂，見 IMPLEMENTATION_PLAN.md 第 67-76 條，細節同步記錄在 ARCHITECTURE.md §4.5、
+DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但不修：
+
+- **修了的（重要性由高到低）**：`rune rebuild-cache` 會誤觸發 LLM 呼叫（違反自己宣稱的 zero LLM
+  calls）；刪除已有 summary 的 scope 會讓 materialize 因 FK violation **持續** crash（新增
+  `SemanticStatus.orphaned`，完全比照 Decision/Constraint 既有的 orphaned 語意）；多 scope 同時
+  刷新時 canonical 的 append 不是原子操作（新增 `append_jsonl_many`）；provider request 缺少
+  `response_format: {"type":"json_object"}`（先用真實 API 驗證過才接線）；redaction 沒有尊重
+  `config.security.redact_secrets` 開關、且遺漏 `dependencies` 欄位；schema 驗證把不合法型別
+  （例如 dict 型的 `purpose`）默默轉換而非拒絕；fallback model 產生的內容被誤標成 primary model；
+  prompt 只有 symbol metadata、沒有實際程式碼（新增 `repo_root` 參數，利用既有的
+  `start_line`/`end_line` 截取程式碼片段，200 行截斷保護）；六項 run-level metrics 沒有持久化
+  （新增 SQLite `semantic_run_metrics` 表，不受 `rebuild_cache` 清空重建影響）。
+- **記錄但不修的**：provider 不可用時（沒 API key／`semantic.enabled=false`／預算用完），已變 stale
+  的 scope 仍顯示 fresh，`possibly_stale` 沒有觸發邏輯——使用者明確要求先記錄、留待後續討論設計
+  （例如要不要在無 provider 時也附加一筆不呼叫 LLM 的 `possibly_stale` revision），不要自己選方案
+  動手。
+
+新增 12 個回歸測試（4 個既有測試從 `full=True` 改為 `full=False`，因為修好 bug 後它們原本用來
+「意外觸發」semantic refresh 的路徑被關掉了；8 個全新測試），每個都驗證過修法前確實會失敗。
+173 個測試全綠，`ruff check` 全綠。
+
 **Milestone 6（Policies & Memory）是下一步。**
 
 ## 專案是什麼
@@ -121,7 +144,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**162 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**173 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

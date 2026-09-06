@@ -91,6 +91,15 @@ class OpenAICompatibleProvider:
                 {"role": "user", "content": user_prompt},
             ],
             "max_tokens": max_tokens,
+            # Best-effort strengthening, not a hard dependency: this is the
+            # standard OpenAI-compatible field for "the message content
+            # must be a JSON object", confirmed by hand to work against the
+            # real OpenRouter API with qwen/qwen3.8-flash. Worker.py's own
+            # JSON extraction (which tolerates markdown fences/prose) stays
+            # in place regardless, so a provider/model that ignores this
+            # field entirely degrades to exactly today's behavior rather
+            # than breaking.
+            "response_format": {"type": "json_object"},
         }
         if self._reasoning is not None:
             payload["reasoning"] = self._reasoning

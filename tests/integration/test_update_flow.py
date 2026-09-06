@@ -649,10 +649,12 @@ class _FakeSemanticProvider:
     def __init__(self, model: str, responses: list) -> None:
         self.model = model
         self._responses = list(responses)
+        self.call_count = 0
 
     def complete(self, *, system_prompt, user_prompt, max_tokens):
         from rune.core.semantic.provider import ProviderResponse
 
+        self.call_count += 1
         item = self._responses.pop(0)
         if isinstance(item, Exception):
             raise item
@@ -695,7 +697,7 @@ def test_semantic_refresh_end_to_end_appends_new_revision(
         update_module, "_build_semantic_providers", lambda config: (provider, None)
     )
 
-    stats = run_update(layout, full=True)
+    stats = run_update(layout, full=False)
 
     assert stats["semantic_scopes_refreshed"] == 1
     revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
@@ -741,7 +743,7 @@ def test_semantic_refresh_regenerates_after_member_file_content_changes(
     monkeypatch.setattr(
         update_module, "_build_semantic_providers", lambda config: (provider, None)
     )
-    run_update(layout, full=True)
+    run_update(layout, full=False)
     first = read_jsonl(layout.semantic_jsonl, ScopeSummary)
     assert len(first) == 1
     assert first[0].status.value == "fresh"
@@ -809,7 +811,7 @@ def test_semantic_refresh_failure_does_not_leave_partial_canonical_state(
     monkeypatch.setattr(update_module, "rebuild_cache", failing_rebuild_cache)
 
     try:
-        run_update(layout, full=True)
+        run_update(layout, full=False)
         raise AssertionError("expected the simulated rebuild_cache failure to propagate")
     except RuntimeError:
         pass
@@ -852,7 +854,7 @@ def test_semantic_refresh_failure_writes_sanitized_error_to_canonical_and_full_d
         update_module, "_build_semantic_providers", lambda config: (provider, None)
     )
 
-    run_update(layout, full=True)
+    run_update(layout, full=False)
 
     revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
     assert len(revisions) == 1
@@ -862,3 +864,207 @@ def test_semantic_refresh_failure_writes_sanitized_error_to_canonical_and_full_d
 
     log_text = layout.semantic_log.read_text(encoding="utf-8")
     assert detailed_error in log_text
+
+
+def test_rebuild_cache_never_calls_the_semantic_provider(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Regression test: `rune rebuild-cache` (run_update(..., full=True))
+    is documented everywhere -- its own --help text, this module's
+    docstring -- as "zero LLM calls, zero network". Confirmed by hand this
+    was being violated: with a provider configured, a stale scope's
+    summary was silently regenerated (a real network call) during what's
+    supposed to be a purely local, offline rebuild.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+
+    stats = run_update(layout, full=True)
+
+    assert provider.call_count == 0
+    assert stats["semantic_scopes_refreshed"] == 0
+    assert read_jsonl(layout.semantic_jsonl, ScopeSummary) == []
+
+
+def test_deleted_scope_orphans_its_semantic_summary_instead_of_crashing(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Regression test: deleting a scope that has prior semantic history
+    used to crash every subsequent `rune update`/`rebuild-cache` with a
+    raw sqlite3.IntegrityError -- semantic_objects.scope_id has a real FK
+    to scopes(id), and materialize tried to insert a row for a scope_id
+    that no longer existed. Confirmed by hand before this fix. Full parity
+    with Decision/Constraint's existing orphan handling: the scope's
+    summary gets one more revision (status=orphaned, content copied
+    forward) in canonical semantic.jsonl, excluded from SQLite.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json("original purpose")])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+    run_update(layout, full=False)
+
+    write_json_model(layout.scopes_json, ScopesFile(scopes=[]))  # delete the scope
+
+    stats = run_update(layout, full=True)  # must not raise IntegrityError
+
+    revisions = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    assert len(revisions) == 2
+    assert revisions[1].revision == 2
+    assert revisions[1].status.value == "orphaned"
+    assert revisions[1].purpose == "original purpose"  # content copied forward
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT COUNT(*) FROM semantic_objects WHERE scope_id = 'app'"
+    ).fetchone()[0] == 0
+    assert stats["files"] == 3  # the rest of the update still completed normally
+
+
+def test_multiple_semantic_revisions_append_atomically_in_one_run(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """Regression test: two scopes refreshed in the same `rune update` used
+    to be appended to semantic.jsonl via two separate append_jsonl calls.
+    If the second one failed, SQLite (already committed with both new
+    revisions via semantic_override) ended up reporting both scopes as
+    current while canonical only had the first -- reproduced by hand
+    before this fix (SQLite: ['scope_a', 'scope_b'], canonical:
+    ['scope_a']). append_jsonl_many's single atomic write means a failure
+    can't land in that in-between state: either both lines are written or
+    neither is.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import read_jsonl, write_json_model
+    from rune.core.storage.models import (
+        Scope,
+        ScopeMembers,
+        ScopesFile,
+        ScopeSource,
+        ScopeSummary,
+    )
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="scope_a", name="A", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+            Scope(id="scope_b", name="B", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/main.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider(
+        "fake-model", [_good_semantic_json("purpose a"), _good_semantic_json("purpose b")]
+    )
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+
+    def failing_append_jsonl_many(path, models):
+        raise OSError("simulated disk-full failure")
+
+    monkeypatch.setattr(update_module, "append_jsonl_many", failing_append_jsonl_many)
+
+    try:
+        run_update(layout, full=False)
+        raise AssertionError("expected the simulated append_jsonl_many failure to propagate")
+    except OSError:
+        pass
+
+    # Nothing was written to canonical -- not "the first scope only".
+    assert read_jsonl(layout.semantic_jsonl, ScopeSummary) == []
+    # But the (unpatched, real) SQLite commit already happened inside
+    # rebuild_cache before append_jsonl_many was ever called -- this is
+    # the pre-existing, accepted asymmetry (same as project.json), not
+    # something this test is trying to fix.
+    conn = sqlite3.connect(str(layout.memory_db))
+    sqlite_scopes = {row[0] for row in conn.execute("SELECT scope_id FROM semantic_objects")}
+    assert sqlite_scopes == {"scope_a", "scope_b"}
+
+
+def test_semantic_run_metrics_persist_across_runs(python_simple_repo: Path, monkeypatch) -> None:
+    """Regression test: the six run-level metrics ARCHITECTURE.md §4.5
+    calls for used to exist only in the stats dict `rune update` prints
+    and returns -- nothing persisted them, so there was no way to compare
+    provider/model performance across runs. `semantic_run_metrics` should
+    gain one row per run that actually attempted a refresh, and rows
+    should accumulate (not get cleared) across multiple runs.
+    """
+    import rune.core.update as update_module
+    from rune.core.storage.canonical import write_json_model
+    from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
+
+    layout = init_project(python_simple_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    provider = _FakeSemanticProvider("fake-model", [_good_semantic_json()])
+    monkeypatch.setattr(
+        update_module, "_build_semantic_providers", lambda config: (provider, None)
+    )
+    run_update(layout, full=False)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    rows = conn.execute(
+        "SELECT scopes_attempted, schema_success_rate, fallback_rate, "
+        "provider_error_rate FROM semantic_run_metrics"
+    ).fetchall()
+    assert rows == [(1, 1.0, 0.0, 0.0)]
+
+    # A second run with nothing left to refresh (the scope is now fresh
+    # and unchanged) must not add an empty/meaningless row.
+    run_update(layout, full=False)
+    conn2 = sqlite3.connect(str(layout.memory_db))
+    assert conn2.execute("SELECT COUNT(*) FROM semantic_run_metrics").fetchone()[0] == 1
+
+    # A `rune rebuild-cache` (full=True) never even attempts a refresh
+    # (see test_rebuild_cache_never_calls_the_semantic_provider), so it
+    # must not touch this table either -- but the table must survive
+    # rebuild_cache's "clear and repopulate" pass, since it isn't one of
+    # the six root content tables that gets cleared.
+    run_update(layout, full=True)
+    conn3 = sqlite3.connect(str(layout.memory_db))
+    assert conn3.execute("SELECT COUNT(*) FROM semantic_run_metrics").fetchone()[0] == 1

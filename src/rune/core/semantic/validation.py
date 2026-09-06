@@ -55,11 +55,31 @@ def validate_and_build_scope_summary(
     known_files: set[str],
     known_symbol_ids: set[str],
 ) -> ValidationOutcome:
+    # `purpose` is the one core field IMPLEMENTATION_PLAN.md's schema-reject
+    # rule names explicitly -- it must be an actual string, not silently
+    # coerced from whatever shape the model returned. `str(raw.get(...))`
+    # used to accept e.g. a dict for `purpose` and stringify its Python
+    # repr into canonical as if it were a real description (confirmed by
+    # hand: `{"nested": "dict"}` became the literal text
+    # "{'nested': 'dict'}" and was accepted as a valid `fresh` summary).
+    # The list fields below stay lenient by design: a wrong shape there is
+    # treated the same as an unknown reference (best-effort, not a reason
+    # to reject an otherwise-good summary) -- only `purpose` is required to
+    # carry real information for the summary to mean anything at all.
+    raw_purpose = raw.get("purpose")
+    if not isinstance(raw_purpose, str):
+        return ValidationOutcome(
+            summary=None,
+            reject_reason=(
+                f"schema_validation_failed: purpose must be a string, "
+                f"got {type(raw_purpose).__name__}"
+            ),
+        )
     try:
         candidate = ScopeSummary(
             scope_id=scope_id,
             revision=revision,
-            purpose=str(raw.get("purpose", "")),
+            purpose=raw_purpose,
             responsibilities=_as_str_list(raw, "responsibilities"),
             entry_points=_as_str_list(raw, "entry_points"),
             important_symbols=_as_str_list(raw, "important_symbols"),

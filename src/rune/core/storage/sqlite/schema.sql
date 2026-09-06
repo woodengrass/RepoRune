@@ -206,6 +206,30 @@ CREATE TABLE IF NOT EXISTS note_symbols (
     FOREIGN KEY (id, revision) REFERENCES note_revisions(id, revision) ON DELETE CASCADE
 );
 
+-- Semantic worker run metrics (Milestone 5, ARCHITECTURE.md §4.5's six
+-- run-level metrics). Purely operational/historical data, not canonical --
+-- there is no semantic_run_metrics.jsonl backing this, so unlike every
+-- other table here it is NOT cleared and rebuilt from canonical on every
+-- materialize pass (see _ROOT_TABLES_TO_CLEAR in materialize.py): one row
+-- is appended per `rune update` run that actually attempted a semantic
+-- refresh, so history accumulates across runs within one memory.db. Lost
+-- entirely if memory.db itself is deleted/rebuilt from scratch (`rune
+-- rebuild-cache` after wiping .rune/cache/) -- accepted, since there is
+-- deliberately no canonical record of past runs to rebuild it from.
+CREATE TABLE IF NOT EXISTS semantic_run_metrics (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at                 TEXT NOT NULL,
+    provider               TEXT NOT NULL,
+    model                  TEXT NOT NULL,
+    scopes_attempted       INTEGER NOT NULL,
+    schema_success_rate    REAL NOT NULL,
+    reference_strip_rate   REAL NOT NULL,
+    fallback_rate          REAL NOT NULL,
+    provider_error_rate    REAL NOT NULL,
+    total_cost             REAL NOT NULL,
+    total_latency_seconds  REAL NOT NULL
+);
+
 -- FTS5 (rebuilt in full on every materialize pass)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_semantic USING fts5(scope_id UNINDEXED, text);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_decisions USING fts5(record_id UNINDEXED, text);

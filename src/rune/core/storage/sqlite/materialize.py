@@ -275,8 +275,26 @@ def _materialize_semantic(conn: sqlite3.Connection, summaries: list[ScopeSummary
     # same duplicate-(id, revision) conflict detection) as Decision/
     # Constraint/Note — see DATA_MODEL.md §2.4's revised revision mechanism,
     # which replaced the earlier "last line wins by append order" scheme.
+    #
+    # A scope that no longer exists (deleted from scopes.json) can still
+    # have semantic history in semantic.jsonl — `semantic_objects.scope_id`
+    # has a real FK to scopes(id), so inserting a row for a vanished scope
+    # would abort the whole materialize (confirmed by hand: deleting a
+    # scope with prior summary history made every subsequent `rune update`/
+    # `rebuild-cache` crash with IntegrityError). `core.update` is
+    # responsible for appending an `orphaned` revision to semantic.jsonl
+    # canonical history *before* this runs (mirroring Decision/Constraint's
+    # existing orphan handling); this function's job is only to make sure
+    # materialize never crashes on one, current or not — an `orphaned`
+    # summary (or, defensively, any summary whose scope vanished without
+    # one for some other reason) is excluded from `semantic_objects`
+    # entirely, same as a dangling scope_files/scope_symbols membership
+    # above.
+    valid_scope_ids = {row[0] for row in conn.execute("SELECT id FROM scopes")}
     grouped = _group_current_by_id(summaries, "scope_id", "semantic.jsonl")
     for scope_id, revs in grouped.items():
+        if scope_id not in valid_scope_ids:
+            continue
         current = revs[-1]
         conn.execute(
             "INSERT INTO semantic_objects "
@@ -438,11 +456,52 @@ def _clear_all_content(conn: sqlite3.Connection) -> None:
         conn.execute(f"DELETE FROM {table};")
 
 
+@dataclass(frozen=True)
+class SemanticRunMetricsRecord:
+    """One `semantic_run_metrics` row (ARCHITECTURE.md §4.5's six run-level
+    metrics, Milestone 5). `provider`/`model` are the run's *configured*
+    primary provider/model, not a per-scope breakdown — which scope used
+    the fallback model instead is already captured by `fallback_rate`.
+    """
+
+    run_at: str
+    provider: str
+    model: str
+    scopes_attempted: int
+    schema_success_rate: float
+    reference_strip_rate: float
+    fallback_rate: float
+    provider_error_rate: float
+    total_cost: float
+    total_latency_seconds: float
+
+
+def _materialize_semantic_run_metrics(
+    conn: sqlite3.Connection, record: SemanticRunMetricsRecord | None
+) -> None:
+    if record is None:
+        return
+    conn.execute(
+        "INSERT INTO semantic_run_metrics "
+        "(run_at, provider, model, scopes_attempted, schema_success_rate, "
+        " reference_strip_rate, fallback_rate, provider_error_rate, "
+        " total_cost, total_latency_seconds) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            record.run_at, record.provider, record.model, record.scopes_attempted,
+            record.schema_success_rate, record.reference_strip_rate,
+            record.fallback_rate, record.provider_error_rate,
+            record.total_cost, record.total_latency_seconds,
+        ),
+    )
+
+
 def rebuild_cache(
     layout: RuneLayout,
     code_index: CodeIndexData | None = None,
     scopes_override: ScopesFile | None = None,
     semantic_override: list[ScopeSummary] | None = None,
+    semantic_run_metrics: SemanticRunMetricsRecord | None = None,
 ) -> dict[str, int]:
     """Fully rebuilds memory.db from canonical files (and, from Milestone 2
     on, the caller-supplied `code_index`). Zero LLM calls, zero network.
@@ -475,6 +534,12 @@ def rebuild_cache(
     computed revisions must land in this same transaction, but the
     canonical `semantic.jsonl` append only happens after `rebuild_cache`
     actually succeeds — see the call site.
+
+    `semantic_run_metrics`, when given, appends one row to the (never
+    cleared, purely historical) `semantic_run_metrics` table in this same
+    transaction — `core.update` only passes one when a semantic refresh
+    actually ran this update (never for `rune rebuild-cache`, which makes
+    no LLM calls at all).
 
     Rebuilds **in place**, inside a single SQLite transaction (clear every
     table, then re-insert everything, then commit) rather than building a
@@ -520,6 +585,7 @@ def rebuild_cache(
         _materialize_notes(conn, notes)
         _materialize_proposals(conn, proposals)
         _materialize_semantic(conn, semantic)
+        _materialize_semantic_run_metrics(conn, semantic_run_metrics)
         conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '1')"
         )

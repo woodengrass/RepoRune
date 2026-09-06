@@ -1,6 +1,6 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第十二輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+狀態：**已確認（第十三輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
 做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
 修訂」。第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
 持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認，細節見文末「第七輪
@@ -17,7 +17,12 @@ validation,redaction}` 完整實作、接線進 `rune update`（`rebuild_cache` 
 `qwen/qwen3.8-flash` 做真實端到端驗證（不只 mock），細節見文末「第十一輪實作記錄」。**第十二輪是
 使用者要求對 Milestone 5 做的品質複查**，逐條重現後修正 3 個問題（`reference_strip_rate` 指標被
 非 list 欄位灌水、provider 層級失敗被誤用 repair prompt 重試、同一根因導致的 `provider_error`
-指標誤判），細節見文末「第十二輪修訂」。將規格
+指標誤判），細節見文末「第十二輪修訂」。**第十三輪是使用者轉述的 10 條 Milestone 5 finding，逐條
+重現後修正 9 個問題**（`rebuild-cache` 誤觸發 LLM、scope 刪除造成 materialize crash、多 scope
+刷新時 canonical 非原子寫入、redaction 未尊重設定且遺漏 `dependencies`、schema 驗證誤將不合法型別
+默默轉換、fallback model 產生內容被誤標、provider request 缺 structured output 提示、prompt 缺
+實際程式碼、六項 metrics 未持久化），記錄 1 個待討論（provider 不可用時 `possibly_stale` 的觸發
+邏輯），細節見文末「第十三輪修訂」與 ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4、§5。將規格
 §70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
@@ -343,9 +348,10 @@ edge；incremental 自動併入只認 import edge 且僅限單一候選，其餘
 
 ## Milestone 5 — Semantic worker
 
-**目前狀態：已實作並通過測試**（`src/rune/core/semantic/{provider,worker,validation,redaction}.py`，
-152 個測試全綠，`ruff check` 全綠，含 27 個新的 semantic 單元測試 + 4 個端對端整合測試）。細節、
-真實 API 驗證結果與已知未完成項見文末「第十一輪實作記錄」。
+**目前狀態：已實作並通過測試，並經兩輪品質複查修正共 12 個問題**（`src/rune/core/semantic/
+{provider,worker,validation,redaction}.py`，173 個測試全綠，`ruff check` 全綠）。細節、真實 API
+驗證結果與已知未完成項見文末「第十一輪實作記錄」（初版實作）、「第十二輪修訂」（自我複查修正 3 個
+metrics/prompt 邏輯問題）、「第十三輪修訂」（使用者轉述 10 條 finding，修正 9 個、記錄 1 個待討論）。
 
 **模組**：`rune.core.semantic.{provider,worker,validation,redaction}`。
 
@@ -1136,3 +1142,98 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
     `test_refresh_succeeds_on_repair_retry` 測試失敗——這正是「連自己剛寫的修法都要重新驗證，不能
     假設一次改對」的一個實例，發現後才補上更精確的區分邏輯。
     162 個測試全綠，`ruff check` 全綠。
+
+### 第十三輪修訂（使用者轉述的 10 條 Milestone 5 finding，逐條重現後修正 9 個問題、記錄 1 個待討論）
+
+使用者轉述另一份針對 Milestone 5 的 code review，10 條 finding 全部先寫最小重現腳本驗證，全部確認
+為真（其中 #1、#3、#6 的一半、#7、#8 直接寫腳本重現，#2、#4、#5、#9、#10 讀程式碼即可確認邏輯缺口，
+不需要另外重現）。9 條屬於純粹的 bug／既有設計缺口，直接修；1 條（#4，provider 不可用時的
+`possibly_stale` 標記）使用者明確要求先記錄、不在本輪修，留待後續討論設計。
+
+67. **高：`rune rebuild-cache` 違反自己宣稱的「zero LLM calls」**：`core.update.run_update` 的
+    semantic refresh 區塊完全沒有檢查 `full` 旗標，只要 `config.semantic` 設定了 provider，連
+    `rebuild-cache`（`full=True`）都會真的呼叫 LLM——實測用 FakeProvider 追蹤呼叫次數，重現
+    `rebuild-cache` 呼叫了 provider 一次。修法：semantic refresh 比照既有的 scope 自動併入
+    （`if not full and ...`），整段包進 `if not full:` 才執行；orphan 偵測（見下）是純結構檢查、
+    無 LLM 呼叫，不受這個限制，`full=True` 也照跑。新增 4 個既有整合測試從 `full=True` 改成
+    `full=False`（因為它們原本就是靠 `full=True` 意外觸發 semantic refresh 來測，修法後這個路徑
+    被關掉了，測試本身需要跟著改，否則會變成沒在測任何東西的假陽性）；新增
+    `test_rebuild_cache_never_calls_the_semantic_provider` 專門鎖住這個行為，修法前確認會失敗
+    （`provider.call_count == 1`）。
+68. **高：刪除已有 semantic summary 的 scope 會讓 materialize 因 FK violation crash**：
+    `semantic_objects.scope_id` 對 `scopes(id)` 有真正的 FK，`_materialize_semantic` 先前沒有像
+    `_materialize_scopes` 對 dangling file/symbol membership那樣做前置過濾——實測重現：對一個曾經
+    成功產生過 summary 的 scope，刪除該 scope 後再跑一次 `rune update`，直接丟
+    `sqlite3.IntegrityError: FOREIGN KEY constraint failed`，且會**持續**發生在往後每一次
+    `rune update`/`rebuild-cache`，等於這個 repo 從此無法再更新，除非手動編輯 `semantic.jsonl`。
+    這是本輪影響最大的一條。修法：`SemanticStatus` 新增 `orphaned`（完全比照 Decision/Constraint
+    既有的 orphaned 語意，DATA_MODEL §6），`core.update` 新增 `detect_orphaned_scopes`：偵測
+    「semantic.jsonl 現有 current revision 的 scope_id 不在目前 scopes.json 裡」，附加一筆內容
+    複製、只改 status/generated_at 的新 revision（跟系統自動附加 revision 的既有「完整 snapshot」
+    規則一致）；`_materialize_semantic` 在插入前查詢目前 `scopes` 表存在的 id，過濾掉任何已消失的
+    scope_id（不只是 orphaned 狀態的，防禦性地涵蓋任何理論上不該出現的情況）。這個偵測是純結構檢查、
+    無 LLM 呼叫，因此不受 #67 的 `full` 限制，`rebuild-cache` 也會正確 orphan 消失的 scope。新增
+    `test_deleted_scope_orphans_its_semantic_summary_instead_of_crashing`，修法前確認會失敗
+    （同樣的 `IntegrityError`）。
+69. **高：多個 scope 在同一次 run 刷新時，canonical 的 append 不是原子操作**：`core.update` 原本是
+    `for summary in new_semantic_revisions: append_jsonl(...)` 逐一呼叫，實測重現：兩個 scope 同時
+    刷新，模擬第二個 `append_jsonl` 失敗，結果 SQLite（已經在同一個 transaction 內反映了兩個 scope
+    的新內容）回報兩個 scope 都是 current，但 canonical `semantic.jsonl` 只有第一個——這是「部分
+    canonical 已發佈」的不一致狀態，比單純「cache 領先 canonical」更嚴重。修法：新增
+    `canonical.append_jsonl_many`，把整次 run 所有新 revision 合併成一次 atomic write（讀現有內容
+    + 疊加全部新行 + 一次 rewrite），取代逐筆呼叫。新增
+    `test_multiple_semantic_revisions_append_atomically_in_one_run`，確認失敗時 canonical 完全
+    沒有任何新內容（不是「第一個而已」），同時明確記錄「SQLite 已經在 append 之前提交」這個接受的
+    既有限制不變（跟 `project.json`/`scopes.json` 的既有 known limitation 同一類別，不是這條
+    finding 要解決的問題）。
+70. **高，記錄但本輪不修：provider 不可用時，已變 stale 的 scope 仍顯示 fresh**：沒有 API
+    key／`semantic.enabled=false`／預算用完時，semantic refresh 整段被跳過，`needs_refresh` 判定
+    為「需要刷新」的 scope 不會有任何狀態轉換，繼續顯示上一次的（可能早已過期的）`status`。
+    `possibly_stale` 這個 enum 值從 Milestone 5 一開始就沒有任何觸發邏輯，第 61 條已經記錄過這個
+    缺口。使用者明確表示「這個先不在本次任務修理，記下來我們等下討論」——需要決定的是：要不要在
+    provider 不可用時也附加一筆不呼叫 LLM 的 `possibly_stale` revision（內容複製、只改 status），
+    以及這筆 revision 要不要跟 #68 的 orphan 偵測一樣不受 `full` 限制。留待下次討論，不自己選方案
+    動手。
+71. **高：Provider request 完全沒有 structured output/JSON mode，只靠 prompt 文字要求**：確認
+    OpenRouter 對 `qwen/qwen3.8-flash` 的真實 API 支援 `response_format: {"type": "json_object"}`
+    （先實測驗證過才接線，不是照 API 文件猜）。已在 `OpenAICompatibleProvider.complete()` 加上這個
+    欄位，`worker.py` 既有的容錯 JSON 擷取（處理 markdown code fence／前後綴文字）原樣保留當安全網——
+    不支援這個欄位的 provider 會直接忽略，不會報錯，行為退化回今天的樣子而非變差。
+72. **中：Redaction 沒有尊重 `config.security.redact_secrets`，且遺漏 `dependencies` 欄位**：
+    `redact_secrets` 自 Milestone 1 存在，從未被讀取，redaction 永遠強制執行——已修正
+    `redact_raw_scope_summary` 新增 `enabled` 參數，`worker.py` 接上 `config.security.
+    redact_secrets`。另外，`entry_points`/`important_symbols` 因為驗證時會 strip 掉不符合已知
+    file/symbol 的條目，秘密字串不可能巧合符合真實路徑，等於間接被保護；但 `dependencies`
+    （可能是 scope_id 或外部套件名稱，沒有已知集合可比對）完全沒有這層保護，也沒有被排進 redaction
+    的 free-text 欄位清單——已補上。兩者都用最小重現腳本驗證過（redaction 開關真的能關掉/開啟，
+    `dependencies` 裡的秘密字串真的會被替換成 `[REDACTED]`）。
+73. **中：Schema 驗證把不合法型別默默轉換，違反「核心欄位不合法即拒絕」規則**：`purpose` 給一個
+    dict，原本會被 `str(...)` 轉成字面文字（例如 `"{'nested': 'dict'}"`）接受為有效的 `fresh`
+    summary——實測重現。已改為：`purpose` 不是字串就直接拒絕整份 generation，不再嘗試轉型。清單
+    欄位（`entry_points` 等）維持原本的寬鬆行為不變（非 list 視為空清單，不拒絕）——這是刻意的：
+    規格只把「核心欄位」的 schema 失敗訂為拒絕整份 generation 的條件，清單型欄位的形狀問題屬於
+    「best-effort、不影響其餘欄位」的既有寬鬆設計，只有 `purpose` 需要收緊。
+74. **中：Fallback model 產生的內容被誤標為 primary model**：`refresh_scope_summary` 內部的
+    `_validate` 閉包原本寫死 `model=primary_provider.model`，不論實際是哪個 provider 產生的內容——
+    實測重現：primary 失敗、fallback 成功後，`outcome.summary.model` 仍是 `"primary-model"`。
+    已改為 `_validate` 接受 `model` 參數，呼叫時傳入該次嘗試實際使用的 `provider.model`（全部失敗
+    時的 `unavailable`/`stale` revision 仍標 `primary_provider.model`，因為那代表「嘗試過的
+    主要模型」，不是「產生內容的模型」，語意上沒有問題）。
+75. **中：Prompt 只有 symbol metadata，沒有實際程式碼內容**：模型幾乎沒有實作細節可以參考就要生出
+    `purpose`/`data_flow`/`invariants` 等欄位。已利用既有的 `Symbol.start_line`/`end_line`（無需
+    重新解析）讀取每個 member symbol 的實際程式碼片段附進 prompt，單一片段超過 200 行截斷並標記
+    （避免一個異常大的 symbol 吃光整個 token 預算、餓死其他 symbol），讀檔失敗（檔案不存在/編碼
+    錯誤）時該片段留空但不中止整次 refresh（沿用既有的 failure-isolation 原則）。`refresh_scope_
+    summary`/`run_semantic_refresh` 新增必填的 `repo_root` 參數。
+76. **中：六項 run-level metrics 沒有任何持久化**：先前只存在 `rune update` 回傳的 stats dict，
+    無法跨 run/provider 比較。新增 SQLite `semantic_run_metrics` 表（DATA_MODEL §5），純操作性
+    歷史資料，**不在**每次 materialize「清空重建」的六張根表之列（沒有 canonical 背書可以重建它，
+    刻意不當成可衍生資料處理），只在這次 run 真的嘗試過 refresh（`scopes_attempted > 0`）時
+    append 一行，跟其餘決定性索引一樣在同一個 rebuild_cache transaction 內寫入。整合測試驗證：
+    一次成功 refresh 後有 1 行；接著一次「沒有東西要刷新」的 no-op update 不會多出空白行；
+    `rebuild-cache`（不呼叫 LLM）也不會動這張表，但表本身在 `rebuild_cache` 的清空重建流程裡
+    正確存活下來。
+
+新增 12 個回歸測試（4 個既有測試從 `full=True` 改為 `full=False`、8 個全新測試，橫跨
+`tests/integration/test_update_flow.py` 與 `tests/unit/test_semantic.py`），每個都用 `git stash`
+（或直接對照修法前後行為）驗證過修法前確實會失敗。173 個測試全綠，`ruff check` 全綠。

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from rune.core.hashing import working_tree_fingerprint
 from rune.core.project import utc_now_iso
@@ -91,7 +92,75 @@ def needs_refresh(current: ScopeSummary | None, source_hash: str) -> bool:
     return current.source_hash != source_hash
 
 
-def _build_user_prompt(scope: Scope, symbols: list[Symbol]) -> str:
+def detect_orphaned_scopes(
+    current_summaries: dict[str, ScopeSummary], current_scope_ids: set[str], now: str
+) -> list[ScopeSummary]:
+    """Scope-deletion counterpart to Decision/Constraint's existing orphan
+    handling (DATA_MODEL.md §6): a scope_id with semantic history but no
+    longer present in scopes.json gets one more revision, `status=
+    orphaned`, full content copied forward from the last current revision
+    (the same "complete snapshot, only status/generated_at changed" rule
+    every other system-triggered revision in this project follows) —
+    never re-orphans an already-orphaned revision. This is a pure
+    structural check (no LLM call), so unlike scope refresh it runs
+    regardless of whether a provider is configured and regardless of
+    `full`/incremental mode.
+    """
+    orphaned: list[ScopeSummary] = []
+    for scope_id, summary in current_summaries.items():
+        if scope_id in current_scope_ids or summary.status is SemanticStatus.orphaned:
+            continue
+        orphaned.append(
+            summary.model_copy(
+                update={
+                    "revision": summary.revision + 1,
+                    "status": SemanticStatus.orphaned,
+                    "generated_at": now,
+                }
+            )
+        )
+    return orphaned
+
+
+_MAX_SNIPPET_LINES = 200
+# Per-symbol cap on how much of a member's source gets embedded in the
+# prompt. Without this, one unusually large symbol (a generated file, a
+# giant class) could burn the entire max_tokens budget on a single
+# snippet, starving every other symbol in the scope of any content at
+# all — a truncated-but-present snippet is more useful than an empty
+# scope. Not currently config-driven; revisit if real usage shows this
+# needs tuning per repo.
+
+
+def _read_symbol_snippet(repo_root: Path, symbol: Symbol) -> str:
+    """Best-effort source snippet for one symbol, sliced by its own
+    start_line/end_line (already tracked per Symbol, so no re-parsing is
+    needed here). Returns "" on any read/decode failure or an out-of-range
+    line span rather than raising -- a missing snippet degrades the prompt
+    to metadata-only for that one symbol, it must never abort the whole
+    refresh (same failure-isolation principle as everywhere else in this
+    project).
+    """
+    try:
+        text = (repo_root / symbol.file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    file_lines = text.splitlines()
+    start = max(symbol.start_line - 1, 0)
+    end = min(symbol.end_line, len(file_lines))
+    if start >= end:
+        return ""
+    snippet_lines = file_lines[start:end]
+    truncated = len(snippet_lines) > _MAX_SNIPPET_LINES
+    if truncated:
+        snippet_lines = snippet_lines[:_MAX_SNIPPET_LINES]
+    snippet = "\n".join(snippet_lines)
+    if truncated:
+        snippet += "\n... (truncated)"
+    return snippet
+
+
+def _build_user_prompt(repo_root: Path, scope: Scope, symbols: list[Symbol]) -> str:
     lines = [f"Scope id: {scope.id}", f"Scope name: {scope.name}"]
     if scope.description:
         lines.append(f"Scope description: {scope.description}")
@@ -100,10 +169,17 @@ def _build_user_prompt(scope: Scope, symbols: list[Symbol]) -> str:
     for path in sorted(scope.members.files):
         lines.append(f"- {path}")
     lines.append("")
-    lines.append("Symbols (symbol_id :: qualified_name (kind) signature):")
+    lines.append(
+        "Symbols (symbol_id :: qualified_name (kind) signature, followed by its source):"
+    )
     for symbol in sorted(symbols, key=lambda s: s.symbol_id):
         signature = f" {symbol.signature}" if symbol.signature else ""
         lines.append(f"- {symbol.symbol_id} :: {symbol.qualified_name} ({symbol.kind.value}){signature}")
+        snippet = _read_symbol_snippet(repo_root, symbol)
+        if snippet:
+            lines.append("```")
+            lines.append(snippet)
+            lines.append("```")
     return "\n".join(lines)
 
 
@@ -239,6 +315,7 @@ def _attempt(
 
 def refresh_scope_summary(
     *,
+    repo_root: Path,
     scope: Scope,
     primary_provider: ModelProvider,
     fallback_provider: ModelProvider | None,
@@ -249,6 +326,7 @@ def refresh_scope_summary(
     current: ScopeSummary | None,
     max_tokens: int = 16000,
     pricing: PricingConfig | None = None,
+    redact_secrets: bool = True,
 ) -> RefreshOutcome:
     """Runs the full fallback-policy ladder for one scope (ARCHITECTURE.md
     §4.5): primary -> 1 repair-prompt retry on primary -> fallback model ->
@@ -263,15 +341,20 @@ def refresh_scope_summary(
     metrics = ScopeRefreshMetrics(scope_id=scope.id)
     local_log: list[str] = []
     system_prompt = _SYSTEM_PROMPT
-    user_prompt = _build_user_prompt(scope, symbols)
+    user_prompt = _build_user_prompt(repo_root, scope, symbols)
 
-    def _validate(raw: dict) -> ValidationOutcome:
-        sanitized = redact_raw_scope_summary(raw)
+    def _validate(raw: dict, *, model: str) -> ValidationOutcome:
+        # `model` must be whichever provider actually produced `raw` --
+        # not unconditionally `primary_provider.model`. A summary generated
+        # by the *fallback* model used to still get tagged with the
+        # primary's name, which would make provider/model audit data
+        # (e.g. "which model actually wrote this summary") silently wrong.
+        sanitized = redact_raw_scope_summary(raw, enabled=redact_secrets)
         return validate_and_build_scope_summary(
             sanitized,
             scope_id=scope.id,
             revision=next_revision,
-            model=primary_provider.model,
+            model=model,
             generated_at=now,
             source_hash=source_hash,
             source_files=source_files,
@@ -303,7 +386,7 @@ def refresh_scope_summary(
             last_reason = reason
             local_log.append(f"[{scope.id}] attempt failed: {reason}")
         else:
-            outcome = _validate(parsed)
+            outcome = _validate(parsed, model=provider.model)
             metrics.reference_total += _reference_list_len(parsed, "entry_points") + _reference_list_len(
                 parsed, "important_symbols"
             )
@@ -413,6 +496,7 @@ def aggregate_metrics(metrics: list[ScopeRefreshMetrics]) -> dict[str, float]:
 
 def run_semantic_refresh(
     *,
+    repo_root: Path,
     scopes: list[Scope],
     current_summaries: dict[str, ScopeSummary],
     file_hashes: dict[str, str],
@@ -422,6 +506,7 @@ def run_semantic_refresh(
     max_input_tokens_per_run: int,
     max_tokens_per_call: int = 16000,
     pricing: PricingConfig | None = None,
+    redact_secrets: bool = True,
 ) -> SemanticRefreshResult:
     """Refreshes every scope whose summary `needs_refresh`, stopping once
     the run-level `max_input_tokens_per_run` budget (DATA_MODEL.md §7's
@@ -461,6 +546,7 @@ def run_semantic_refresh(
         ]
 
         outcome = refresh_scope_summary(
+            repo_root=repo_root,
             scope=scope,
             primary_provider=primary_provider,
             fallback_provider=fallback_provider,
@@ -471,6 +557,7 @@ def run_semantic_refresh(
             current=current,
             max_tokens=max_tokens_per_call,
             pricing=pricing,
+            redact_secrets=redact_secrets,
         )
         new_revisions.append(outcome.summary)
         attempted.append(scope.id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -30,6 +31,13 @@ from rune.core.storage.models import (
     Symbol,
     SymbolKind,
 )
+
+# Deliberately nonexistent: these tests exercise prompt/retry/validation
+# logic, not the actual symbol-snippet file reads (covered separately by
+# test_read_symbol_snippet_* below). _read_symbol_snippet degrades to ""
+# on any read failure rather than raising, so a nonexistent root is a
+# safe stand-in wherever a real repo_root isn't the point of the test.
+_TEST_REPO_ROOT = Path("/nonexistent-repo-root-for-tests")
 
 
 def _symbol(symbol_id: str, file: str, name: str, kind: SymbolKind = SymbolKind.function) -> Symbol:
@@ -160,6 +168,25 @@ def test_provider_omits_reasoning_key_when_not_configured() -> None:
     assert "reasoning" not in captured["body"]
 
 
+def test_provider_requests_json_object_response_format() -> None:
+    """Best-effort JSON-mode request, confirmed by hand against the real
+    OpenRouter API with qwen/qwen3.8-flash before wiring this in -- not
+    a hard dependency (worker.py's tolerant JSON extraction stays as the
+    safety net regardless of whether a given provider honors this).
+    """
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=_client(handler)
+    )
+    provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
+    assert captured["body"]["response_format"] == {"type": "json_object"}
+
+
 def test_reasoning_payload_none_when_config_is_default() -> None:
     """An all-default ReasoningConfig (enabled=True, nothing else set) must
     not force anything -- omit the field entirely so the model's own
@@ -216,6 +243,29 @@ def test_redact_raw_scope_summary_only_touches_free_text_fields() -> None:
     assert redacted["entry_points"] == raw["entry_points"]
 
 
+def test_redact_raw_scope_summary_redacts_dependencies_as_free_text() -> None:
+    """Regression test: `dependencies` may be a scope_id or an external
+    package name (DATA_MODEL.md §2.4) -- unlike entry_points/
+    important_symbols, nothing validates it against known files/symbols,
+    so a secret-shaped string there had no protection at all before this
+    fix (it isn't stripped like an unknown reference would be, since
+    there's no "known dependencies" set to check against).
+    """
+    raw = {"purpose": "p", "dependencies": ["sk-abcdefghijklmnopqrstuvwx1234"]}
+    redacted = redact_raw_scope_summary(raw)
+    assert redacted["dependencies"] == ["[REDACTED]"]
+
+
+def test_redact_raw_scope_summary_enabled_false_bypasses_everything() -> None:
+    """Wires up config.security.redact_secrets, which existed since
+    Milestone 1 but nothing ever read -- redaction ran unconditionally
+    regardless of the config value until this fix.
+    """
+    raw = {"purpose": "sk-abcdefghijklmnopqrstuvwx1234"}
+    assert redact_raw_scope_summary(raw, enabled=False) == raw
+    assert redact_raw_scope_summary(raw, enabled=True) != raw
+
+
 # --------------------------------------------------------------------------
 # validation.py
 # --------------------------------------------------------------------------
@@ -229,6 +279,23 @@ def test_validation_rejects_empty_purpose() -> None:
     )
     assert outcome.summary is None
     assert outcome.reject_reason == "purpose is empty"
+
+
+def test_validation_rejects_non_string_purpose_instead_of_coercing() -> None:
+    """Regression test: `purpose` used to go through `str(raw.get(...))`,
+    which happily stringifies anything -- a dict became the literal text
+    "{'nested': 'dict'}" and was accepted as a valid `fresh` summary.
+    IMPLEMENTATION_PLAN.md's schema-reject rule names `purpose` as the
+    field whose failure must reject the whole generation; silently
+    coercing a wrong type isn't the same as validating it.
+    """
+    outcome = validate_and_build_scope_summary(
+        {"purpose": {"nested": "dict, not a string"}},
+        scope_id="s", revision=1, model="m", generated_at="2026-01-01T00:00:00Z",
+        source_hash="sha256:x", source_files={}, known_files=set(), known_symbol_ids=set(),
+    )
+    assert outcome.summary is None
+    assert "purpose must be a string" in (outcome.reject_reason or "")
 
 
 def test_validation_strips_unknown_entries_without_rejecting() -> None:
@@ -349,6 +416,7 @@ def _good_json(purpose: str = "does the app thing") -> str:
 def test_refresh_succeeds_on_first_attempt() -> None:
     provider = FakeProvider("primary-model", [_good_json()])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=provider, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -377,6 +445,7 @@ def test_refresh_reference_total_metric_ignores_malformed_non_list_field() -> No
         [json.dumps({"purpose": "p", "entry_points": "not-a-list-just-a-string"})],
     )
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=provider, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -389,6 +458,7 @@ def test_refresh_reference_total_metric_ignores_malformed_non_list_field() -> No
 def test_refresh_succeeds_on_repair_retry() -> None:
     provider = FakeProvider("primary-model", ["not json at all", _good_json("fixed purpose")])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=provider, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -410,6 +480,7 @@ def test_refresh_invalid_json_response_does_not_count_as_provider_error_metric()
     """
     provider = FakeProvider("primary-model", ["not json at all", _good_json("fixed purpose")])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=provider, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -433,6 +504,7 @@ def test_refresh_after_provider_error_retries_with_unmodified_prompt_not_repair_
         "primary-model", [ProviderError("HTTP 429: rate limited"), _good_json("recovered")]
     )
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=provider, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -448,6 +520,7 @@ def test_refresh_falls_back_to_fallback_model_after_repair_retry_fails() -> None
     primary = FakeProvider("primary-model", ["nope", "still nope"])
     fallback = FakeProvider("fallback-model", [_good_json("fallback saved it")])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=primary, fallback_provider=fallback,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -457,12 +530,17 @@ def test_refresh_falls_back_to_fallback_model_after_repair_retry_fails() -> None
     assert outcome.metrics.used_fallback is True
     assert len(primary.prompts_seen) == 2
     assert len(fallback.prompts_seen) == 1
+    # Regression: a summary the fallback model actually produced used to
+    # still get tagged with the primary model's name, making provider/
+    # model audit data (e.g. "which model wrote this?") silently wrong.
+    assert outcome.summary.model == "fallback-model"
 
 
 def test_refresh_all_attempts_fail_with_no_prior_summary_yields_unavailable() -> None:
     primary = FakeProvider("primary-model", ["nope", "still nope"])
     fallback = FakeProvider("fallback-model", [ProviderError("provider is down")])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=primary, fallback_provider=fallback,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -491,6 +569,7 @@ def test_refresh_all_attempts_fail_with_prior_summary_copies_content_forward() -
     )
     primary = FakeProvider("primary-model", [ProviderError("timeout"), ProviderError("timeout again")])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=primary, fallback_provider=None,
         source_files={"app/main.py": "sha256:new"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=current,
@@ -524,6 +603,7 @@ def test_refresh_falls_back_to_pricing_estimate_when_provider_reports_no_cost() 
 
     pricing = PricingConfig(input_per_million=2.0, output_per_million=8.0)
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=_NoCostProvider(), fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None, pricing=pricing,
@@ -535,6 +615,7 @@ def test_refresh_falls_back_to_pricing_estimate_when_provider_reports_no_cost() 
 def test_refresh_no_fallback_configured_stops_after_repair_retry() -> None:
     primary = FakeProvider("primary-model", ["nope", "still nope"])
     outcome = refresh_scope_summary(
+        repo_root=_TEST_REPO_ROOT,
         scope=_scope(), primary_provider=primary, fallback_provider=None,
         source_files={"app/main.py": "sha256:x"}, known_files={"app/main.py"},
         known_symbol_ids=set(), symbols=[], current=None,
@@ -565,6 +646,7 @@ def test_run_semantic_refresh_skips_fresh_unchanged_scopes() -> None:
     )
     provider = FakeProvider("m", [_good_json()])
     result = run_semantic_refresh(
+        repo_root=_TEST_REPO_ROOT,
         scopes=[scope], current_summaries={"app": current},
         file_hashes={"app/main.py": "sha256:x"}, symbols=[],
         primary_provider=provider, fallback_provider=None, max_input_tokens_per_run=100_000,
@@ -577,6 +659,7 @@ def test_run_semantic_refresh_skips_fresh_unchanged_scopes() -> None:
 def test_run_semantic_refresh_attempts_scope_with_no_prior_summary() -> None:
     provider = FakeProvider("m", [_good_json()])
     result = run_semantic_refresh(
+        repo_root=_TEST_REPO_ROOT,
         scopes=[_scope()], current_summaries={},
         file_hashes={"app/main.py": "sha256:x"}, symbols=[],
         primary_provider=provider, fallback_provider=None, max_input_tokens_per_run=100_000,
@@ -598,6 +681,7 @@ def test_run_semantic_refresh_defers_scopes_once_token_budget_is_spent() -> None
     )
     provider = FakeProvider("m", [_good_json(), _good_json()])
     result = run_semantic_refresh(
+        repo_root=_TEST_REPO_ROOT,
         scopes=[scope_a, scope_b], current_summaries={},
         file_hashes={"a.py": "sha256:a", "b.py": "sha256:b"}, symbols=[],
         primary_provider=provider, fallback_provider=None,
@@ -620,9 +704,92 @@ def test_run_semantic_refresh_includes_member_file_symbols_in_prompt() -> None:
     symbol = _symbol("sym-1", "app/main.py", "run")
     provider = FakeProvider("m", [_good_json()])
     run_semantic_refresh(
+        repo_root=_TEST_REPO_ROOT,
         scopes=[scope], current_summaries={}, file_hashes={"app/main.py": "sha256:x"},
         symbols=[symbol], primary_provider=provider, fallback_provider=None,
         max_input_tokens_per_run=100_000,
     )
     assert "sym-1" in provider.prompts_seen[0]
     assert "run" in provider.prompts_seen[0]
+
+
+def test_run_semantic_refresh_prompt_includes_symbol_source_code(tmp_path) -> None:
+    """Regression test: the prompt used to contain only symbol metadata
+    (name/kind/signature), never the member files' actual implementation
+    -- a model has very little to work with for `purpose`/`data_flow`/
+    `invariants` without seeing the real code. Uses a real file on disk
+    (not the sentinel _TEST_REPO_ROOT) so this exercises the actual
+    line-range read, not just that the code path doesn't crash.
+    """
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "main.py").write_text(
+        "def run():\n"
+        "    unmistakable_marker_xyz = 42\n"
+        "    return unmistakable_marker_xyz\n",
+        encoding="utf-8",
+    )
+    scope = Scope(
+        id="app", name="App", locked=False, source=ScopeSource.human,
+        members=ScopeMembers(files=["app/main.py"], symbols=[]),
+    )
+    symbol = Symbol(
+        symbol_id="sym-1", file="app/main.py", name="run", qualified_name="run",
+        kind=SymbolKind.function, signature="def run()", start_line=1, end_line=3,
+    )
+    provider = FakeProvider("m", [_good_json()])
+    run_semantic_refresh(
+        repo_root=tmp_path,
+        scopes=[scope], current_summaries={}, file_hashes={"app/main.py": "sha256:x"},
+        symbols=[symbol], primary_provider=provider, fallback_provider=None,
+        max_input_tokens_per_run=100_000,
+    )
+    assert "unmistakable_marker_xyz" in provider.prompts_seen[0]
+
+
+def test_run_semantic_refresh_prompt_survives_unreadable_member_file(tmp_path) -> None:
+    """A missing/unreadable file must degrade that one symbol's snippet to
+    nothing, not crash the whole refresh -- same failure-isolation
+    principle as everywhere else in this project. The file is listed in
+    `members.files` but deliberately never created.
+    """
+    scope = Scope(
+        id="app", name="App", locked=False, source=ScopeSource.human,
+        members=ScopeMembers(files=["app/missing.py"], symbols=[]),
+    )
+    symbol = Symbol(
+        symbol_id="sym-1", file="app/missing.py", name="ghost", qualified_name="ghost",
+        kind=SymbolKind.function, signature=None, start_line=1, end_line=2,
+    )
+    provider = FakeProvider("m", [_good_json()])
+    result = run_semantic_refresh(
+        repo_root=tmp_path,
+        scopes=[scope], current_summaries={}, file_hashes={"app/missing.py": "sha256:x"},
+        symbols=[symbol], primary_provider=provider, fallback_provider=None,
+        max_input_tokens_per_run=100_000,
+    )
+    assert result.new_revisions[0].status == SemanticStatus.fresh  # did not crash
+    assert "sym-1" in provider.prompts_seen[0]  # metadata still present
+
+
+def test_run_semantic_refresh_prompt_truncates_oversized_symbol_snippet(tmp_path) -> None:
+    (tmp_path / "app").mkdir()
+    huge_body = "\n".join(f"    line_{i} = {i}" for i in range(500))
+    (tmp_path / "app" / "big.py").write_text(f"def run():\n{huge_body}\n", encoding="utf-8")
+    scope = Scope(
+        id="app", name="App", locked=False, source=ScopeSource.human,
+        members=ScopeMembers(files=["app/big.py"], symbols=[]),
+    )
+    symbol = Symbol(
+        symbol_id="sym-1", file="app/big.py", name="run", qualified_name="run",
+        kind=SymbolKind.function, signature="def run()", start_line=1, end_line=501,
+    )
+    provider = FakeProvider("m", [_good_json()])
+    run_semantic_refresh(
+        repo_root=tmp_path,
+        scopes=[scope], current_summaries={}, file_hashes={"app/big.py": "sha256:x"},
+        symbols=[symbol], primary_provider=provider, fallback_provider=None,
+        max_input_tokens_per_run=100_000,
+    )
+    prompt = provider.prompts_seen[0]
+    assert "(truncated)" in prompt
+    assert "line_499" not in prompt  # past the cap, never included

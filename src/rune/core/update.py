@@ -35,9 +35,13 @@ from rune.core.scopes.model import (
     save_scopes,
 )
 from rune.core.semantic.provider import ModelProvider, ProviderError, build_provider
-from rune.core.semantic.worker import aggregate_metrics, run_semantic_refresh
+from rune.core.semantic.worker import (
+    aggregate_metrics,
+    detect_orphaned_scopes,
+    run_semantic_refresh,
+)
 from rune.core.storage.canonical import (
-    append_jsonl,
+    append_jsonl_many,
     read_json_model,
     read_jsonl,
     write_json_model,
@@ -54,6 +58,7 @@ from rune.core.storage.models import (
 )
 from rune.core.storage.sqlite.materialize import (
     CodeIndexData,
+    SemanticRunMetricsRecord,
     current_scope_summaries,
     read_current_code_index,
     rebuild_cache,
@@ -343,39 +348,83 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float]
     semantic_local_log: list[str] = []
     semantic_metrics_summary: dict[str, float] = {}
     semantic_override: list[ScopeSummary] | None = None
-    existing_semantic: list[ScopeSummary] = []
-    primary_provider, fallback_provider = _build_semantic_providers(config)
-    if primary_provider is not None:
-        scopes_for_semantic = (updated_scopes_file or load_scopes(layout)).scopes
-        existing_semantic = read_jsonl(layout.semantic_jsonl, ScopeSummary)
-        current_summaries = current_scope_summaries(existing_semantic)
-        refresh_result = run_semantic_refresh(
-            scopes=scopes_for_semantic,
-            current_summaries=current_summaries,
-            file_hashes={f.path: f.content_hash for f in new_files},
-            symbols=new_symbols,
-            primary_provider=primary_provider,
-            fallback_provider=fallback_provider,
-            max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
-            max_tokens_per_call=config.semantic.max_tokens,
-            pricing=config.pricing,
+    semantic_run_metrics_record: SemanticRunMetricsRecord | None = None
+
+    scopes_for_semantic = (updated_scopes_file or load_scopes(layout)).scopes
+    existing_semantic = read_jsonl(layout.semantic_jsonl, ScopeSummary)
+    current_summaries = current_scope_summaries(existing_semantic)
+    # Orphan detection is a pure structural check (no LLM call), so unlike
+    # the refresh below it always runs — including on `rune rebuild-cache`
+    # (full=True) and when no provider is configured at all.
+    new_semantic_revisions.extend(
+        detect_orphaned_scopes(
+            current_summaries, {scope.id for scope in scopes_for_semantic}, now
         )
-        new_semantic_revisions = refresh_result.new_revisions
-        semantic_local_log = refresh_result.local_log_lines
-        semantic_metrics_summary = aggregate_metrics(refresh_result.metrics)
-        if new_semantic_revisions:
-            semantic_override = [*existing_semantic, *new_semantic_revisions]
+    )
+
+    # The refresh itself is the one part of `rune update` that calls an
+    # LLM, so it must never run for `rune rebuild-cache` (full=True) —
+    # that command's whole contract, in its own --help text and this
+    # module's docstring, is "zero LLM calls, zero network, local parsing
+    # only". Confirmed by hand this was being violated: rebuild-cache with
+    # a configured provider was silently making real API calls.
+    if not full:
+        primary_provider, fallback_provider = _build_semantic_providers(config)
+        if primary_provider is not None:
+            refresh_result = run_semantic_refresh(
+                repo_root=repo_root,
+                scopes=scopes_for_semantic,
+                current_summaries=current_summaries,
+                file_hashes={f.path: f.content_hash for f in new_files},
+                symbols=new_symbols,
+                primary_provider=primary_provider,
+                fallback_provider=fallback_provider,
+                max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
+                max_tokens_per_call=config.semantic.max_tokens,
+                pricing=config.pricing,
+                redact_secrets=config.security.redact_secrets,
+            )
+            new_semantic_revisions.extend(refresh_result.new_revisions)
+            semantic_local_log = refresh_result.local_log_lines
+            semantic_metrics_summary = aggregate_metrics(refresh_result.metrics)
+            if refresh_result.attempted_scope_ids:
+                # Only recorded when at least one scope was actually
+                # attempted this run — an all-fresh run with nothing to
+                # refresh has no meaningful "success rate" to report and
+                # would otherwise flood this history table with empty rows
+                # on every single `rune update`.
+                semantic_run_metrics_record = SemanticRunMetricsRecord(
+                    run_at=now,
+                    provider=config.semantic.provider,
+                    model=config.semantic.model,
+                    scopes_attempted=len(refresh_result.attempted_scope_ids),
+                    schema_success_rate=semantic_metrics_summary["schema_success_rate"],
+                    reference_strip_rate=semantic_metrics_summary["reference_strip_rate"],
+                    fallback_rate=semantic_metrics_summary["fallback_rate"],
+                    provider_error_rate=semantic_metrics_summary["provider_error_rate"],
+                    total_cost=semantic_metrics_summary["cost"],
+                    total_latency_seconds=semantic_metrics_summary["latency_seconds"],
+                )
+
+    if new_semantic_revisions:
+        semantic_override = [*existing_semantic, *new_semantic_revisions]
 
     stats = rebuild_cache(
         layout,
         code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges),
         scopes_override=updated_scopes_file,
         semantic_override=semantic_override,
+        semantic_run_metrics=semantic_run_metrics_record,
     )
     if updated_scopes_file is not None:
         save_scopes(layout, updated_scopes_file)
-    for summary in new_semantic_revisions:
-        append_jsonl(layout.semantic_jsonl, summary)
+    # A single atomic write for every new semantic revision this run
+    # (orphan markers plus any real refreshes) instead of N separate
+    # append_jsonl calls — see append_jsonl_many's docstring for why N
+    # separate atomic writes isn't good enough here: a failure partway
+    # through would leave canonical behind what the already-committed
+    # SQLite transaction above reflects for some scopes but not others.
+    append_jsonl_many(layout.semantic_jsonl, new_semantic_revisions)
     _append_semantic_log(layout, semantic_local_log)
 
     # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not

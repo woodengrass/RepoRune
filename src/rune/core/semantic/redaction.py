@@ -54,14 +54,20 @@ def redact_strings(values: list[str]) -> list[str]:
 
 
 # Free-text fields of a raw (not-yet-validated) ScopeSummary payload — the
-# fields a model writes prose into, as opposed to entry_points/
-# important_symbols/dependencies, which are supposed to be literal file
-# paths/symbol_ids/scope_ids/package names and would be corrupted rather
-# than protected by text redaction (a real symbol_id could coincidentally
-# look like a "key = value" pattern and get mangled, which would then just
-# make it fail reference validation for the wrong reason).
+# fields a model writes prose into. `entry_points`/`important_symbols` are
+# deliberately excluded: they're supposed to be literal file paths/
+# symbol_ids, validation.py strips any entry that doesn't exactly match a
+# real known file/symbol, and a secret-shaped string can't coincidentally
+# equal one — so redacting them would only risk corrupting a real
+# reference for no safety benefit. `dependencies` has no such protection
+# (it may legitimately be a scope_id *or* an external package name, so
+# there's nothing to validate it against) and was missing from this list
+# — a hallucinated or prompt-injected secret-looking string there would
+# have gone straight into canonical `semantic.jsonl` unredacted. Included
+# here now, since as free text it's no more "structural" than `data_flow`.
 _FREE_TEXT_LIST_FIELDS = (
     "responsibilities",
+    "dependencies",
     "data_flow",
     "invariants",
     "known_risks",
@@ -69,13 +75,22 @@ _FREE_TEXT_LIST_FIELDS = (
 )
 
 
-def redact_raw_scope_summary(raw: dict) -> dict:
+def redact_raw_scope_summary(raw: dict, *, enabled: bool = True) -> dict:
     """Applied to the freshly-parsed-JSON provider response, before schema/
     reference validation (IMPLEMENTATION_PLAN.md Milestone 5: "Redaction
     pass ... 在驗證之前執行"). Only touches free-text fields; reference-list
     fields pass through untouched.
+
+    `enabled` wires up `config.security.redact_secrets` — that toggle
+    existed in `SecurityConfig` since Milestone 1 but nothing ever actually
+    read it, so redaction always ran unconditionally regardless of the
+    config value. `enabled=False` returns `raw` completely untouched
+    (still a shallow copy, so callers can't accidentally mutate the
+    original either way).
     """
     redacted = dict(raw)
+    if not enabled:
+        return redacted
     purpose = redacted.get("purpose")
     if isinstance(purpose, str):
         redacted["purpose"] = redact_text(purpose)

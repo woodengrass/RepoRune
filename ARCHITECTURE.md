@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第七輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第八輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -20,9 +20,14 @@ high-confidence 訊號）。**第七輪在 Milestone 5（Semantic worker）開�
 `ScopeSummary` 新增 `revision` 欄位（比照 Decision/Constraint/Note），讓生成失敗的狀態能真正跨
 session 持久化，而不是先前版本宣稱的「只在 SQLite 投影中維持，不寫 JSONL」（這句話與「SQLite 投影
 每次都是從 canonical 重新算出來」互相矛盾）；`last_error` 收斂為清洗過的分類字串，原始錯誤改寫進
-不進 git 的 `.rune/logs/semantic.log`。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成
-Milestone 1 的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、staleness 語意或
-agent-injection 語意的後續變更，仍必須重新提案並取得確認後才能實作。
+不進 git 的 `.rune/logs/semantic.log`。**第八輪是 Milestone 5 完成後的品質複查**：修正 9 個問題
+（`rune rebuild-cache` 誤觸發 LLM 呼叫、scope 刪除造成 materialize crash、多 scope 刷新時 canonical
+非原子寫入、redaction 未尊重設定開關且遺漏 `dependencies` 欄位、schema 驗證誤將不合法型別默默轉換、
+fallback model 產生內容被誤標為 primary、provider request 缺少 structured output 提示、prompt 缺少
+實際程式碼內容、六項 metrics 未持久化），細節見第 4.5 節與文末「第十三輪修訂」；`possibly_stale` 的
+觸發邏輯經使用者要求刻意不在本輪修，留待後續討論。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md`
+共同構成 Milestone 1 的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、
+staleness 語意或 agent-injection 語意的後續變更，仍必須重新提案並取得確認後才能實作。
 
 ## 1. 目的與非目標
 
@@ -285,6 +290,57 @@ call primary model
 
 Semantic staleness 判斷完全基於 **member 檔案的 content hash**（見 DATA_MODEL §2.4 的 `source_hash` /
 `source_files`），與下方 4.6 節 Decision/Constraint 的 staleness 規則是兩套完全獨立的機制，不可合併。
+
+**Milestone 5 完成後的品質複查修正的問題（本輪新增）**：
+
+1. **`rune rebuild-cache` 絕不觸發 semantic refresh**：`rebuild-cache`（`core.update.run_update(...,
+   full=True)`）在自己的 `--help` 文字與模組 docstring 裡都明講「zero LLM calls, zero network,
+   local parsing only」，但實際上 semantic refresh 的呼叫完全沒有檢查 `full` 旗標，只要
+   `config.semantic` 設定了 provider 就會照跑——已實測重現這個違反（配置好 provider 後執行
+   `rebuild-cache`，provider 真的被呼叫了）。修法：semantic refresh 比照既有的 scope
+   auto-assignment（`if not full and ...`），只在 `full=False`（一般 `rune update`）時執行。
+2. **Scope 被刪除時，既有的 semantic history 必須 orphan，而非讓 materialize crash**：
+   `semantic_objects.scope_id` 對 `scopes(id)` 有真正的 FK，刪除一個曾經有 summary 的 scope 後，
+   後續每一次 `rune update`/`rebuild-cache` 都會因為試圖插入一列指向不存在 scope 的 row 而丟出
+   `IntegrityError`——已實測重現。修法完全比照 Decision/Constraint 既有的 orphaned 語意（DATA_MODEL
+   §6）：`ScopeSummary` 新增 `status=orphaned`，`core.update` 偵測到「semantic.jsonl 現有 current
+   revision 的 scope_id 不在目前 scopes.json 裡」時附加一筆內容複製、只改 status 的新 revision；
+   materialize 時這類 summary（以及任何 scope_id 已不存在的 summary）一律被過濾，不寫入
+   `semantic_objects`。
+3. **多個 scope 在同一次 run 裡刷新時，canonical 的 append 必須是單一原子操作**：先前是逐一呼叫
+   `append_jsonl`，若第二個 scope 的 append 失敗，SQLite（已經在同一個 transaction 裡反映了全部新
+   revision）就會領先 canonical，且是「部分 canonical 已發佈」的不一致狀態（兩個 scope 都刷新成功，
+   但只有第一個真的寫進 semantic.jsonl）——已實測重現。修法：新增 `append_jsonl_many`，把整次 run
+   所有新 revision 合併成一次 atomic write。
+4. **Redaction 必須尊重 `config.security.redact_secrets`，且涵蓋 `dependencies` 欄位**：
+   `redact_secrets` 這個設定自 Milestone 1 就存在，但從未被任何程式碼讀取，redaction 永遠強制執行；
+   `dependencies`（可能是 scope_id 或外部套件名稱，無法比對 known_files/known_symbol_ids）先前完全
+   沒有經過 redaction，是唯一沒有被 strip 邏輯間接保護、也沒有被文字 redaction 保護的欄位。兩者都已
+   修正。
+5. **Schema 驗證不得把不合法型別默默轉換成合法值**：`purpose` 若不是字串（例如模型回傳一個
+   dict），先前會被 `str(...)` 轉成字面文字接受為有效 summary，違反「核心欄位 schema 不成立即拒絕
+   整份 generation」的既有規則。已改為型別不符時直接拒絕。
+6. **Fallback model 產生的內容不得被標成 primary model 產生**：`ScopeSummary.model` 先前無論實際是
+   哪個 provider 產生的內容都寫死 `primary_provider.model`，讓 provider/model audit 資料失真。已改為
+   記錄實際產生內容的那個 provider 的 model 名稱。
+7. **Provider request 加上 best-effort 的 `response_format: {"type": "json_object"}`**：確認過對
+   OpenRouter 的真實 API 有效（qwen/qwen3.8-flash 回傳合法 JSON），worker.py 原有的文字 slicing
+   解析仍保留作為安全網——一個不支援這個欄位的 provider 會直接忽略它，不會報錯，行為退化回今天的
+   樣子而非變差。
+8. **Prompt 加入 symbol 的實際程式碼片段，不再只有 metadata**：先前 prompt 只有 symbol
+   名稱/kind/signature，模型幾乎沒有實際實作內容可以參考。已利用既有的 `Symbol.start_line`/
+   `end_line` 只截取每個 member symbol 的程式碼範圍（而非整檔，避免不必要的 token 成本），單一
+   symbol 超過 200 行時截斷並標記，讀檔失敗時該 symbol 的片段留空但不中止整次 refresh。
+9. **六項 run-level metrics 新增 SQLite 持久化**：先前只存在 `rune update` 回傳的 stats dict，無法
+   跨 run／provider 比較。新增 `semantic_run_metrics` 表（DATA_MODEL §5），純操作性歷史資料，不受
+   `rebuild_cache` 「清空重建」影響（只在真的嘗試過 refresh 時 append 一行），但會隨 `memory.db`
+   整個被刪除重建而消失（接受，因為沒有 canonical 背書可以重建它）。
+
+**另一項複查中確認但刻意不在本輪修的問題**：provider 不可用（沒有 API key／`semantic.enabled=false`／
+預算用完）時，一個已經變 stale 的 scope 目前完全跳過，不會有任何狀態轉換——`possibly_stale` 這個
+enum 值從 Milestone 5 一開始就沒有任何觸發邏輯。使用者要求先記錄這個缺口、留到後續討論怎麼設計
+（例如「無 provider 時要不要附加一筆不需要呼叫 LLM 的 possibly_stale revision」），不要自己選一個
+方案動手。
 
 ### 4.6 Memory（`core.memory`）— Decision / Constraint / Note 的生命週期
 

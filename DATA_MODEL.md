@@ -1,6 +1,6 @@
 # RepoRune（rune）— 資料模型
 
-狀態：**已確認（第六輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
+狀態：**已確認（第七輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
 必須分離）、補上 `source_bound`/`scope_bound`/`temporary` Constraint 實際可實作所需的 snapshot 欄位、
 補上 Note 的 revision 機制、以及 ScopeSummary `source_files` 的推導 invariant。第三輪修正
 `created_by` 的型別（改為 `RevisionAuthor` enum，解決與「系統自動附加 revision」的矛盾）、補上
@@ -18,7 +18,11 @@ JSONL 行，只在 SQLite 投影中維持 `status=stale`」，但 SQLite 投影�
 Decision/Constraint/Note 既有的 revision 機制（current = `max(revision)`），失敗時複製上一筆
 current revision 的完整內容、只改動 status/last_error（首次生成就失敗則附加 `status=unavailable`
 且內容欄位留空，不虛構）；`last_error` 收斂為只允許清洗過的簡短分類字串，原始例外/provider 回應內容
-改寫進不進 git 的本機 `.rune/logs/semantic.log`。詳見 §2.4。這是 Milestone 1–6/7 實作時遵循的契約。
+改寫進不進 git 的本機 `.rune/logs/semantic.log`。詳見 §2.4。**第七輪是 Milestone 5 完成後的品質複查**：
+`SemanticStatus` 新增 `orphaned`（scope 被刪除時的既有 summary 處理，完全比照 Decision/Constraint
+既有的 orphaned 語意，修正刪除 scope 會讓後續 materialize 直接因 FK violation crash 的 bug）；SQLite
+新增不受「清空重建」影響的 `semantic_run_metrics` 表，持久化 ARCHITECTURE.md §4.5 的六項 run-level
+指標。詳見 §2.4、§5。這是 Milestone 1–6/7 實作時遵循的契約。
 
 ## 1. 慣例
 
@@ -156,6 +160,18 @@ class SemanticStatus(str, Enum):
     # 真實資料」，此時 purpose/responsibilities/... 等內容欄位一律是空值佔位
     # （purpose=""、其餘 list 為 []），不得被當作真實描述顯示給 agent，只有
     # revision/status/last_error/generated_at/model 帶有意義。
+    orphaned = "orphaned"
+    # 本輪新增（品質複查發現的 bug 修正）：這個 summary 所屬的 scope 已經從
+    # scopes.json 消失（被人類刪除）。完全比照 Decision/Constraint 既有的
+    # orphaned 語意（§6：「引用的整個 scope 消失 -> status=orphaned」），不是
+    # 另外發明一套。`core.update` 偵測到「semantic.jsonl 現有 current revision
+    # 的 scope_id 不在目前 scopes.json 裡」時附加這筆 revision，內容原樣複製自
+    # 上一筆 current revision（比照 §2.5 的「完整 snapshot」規則），只改動
+    # status/generated_at。排除於 SQLite `semantic_objects` 之外——該表的
+    # scope_id 對 scopes(id) 有真正的 FK，一個已消失的 scope 不論 status 為何
+    # 都不可能有對應的 scopes 列可以參照（修正前：刪除一個曾經有 summary 的
+    # scope 會讓後續所有 rune update/rebuild-cache 直接因 FK violation crash，
+    # 已實測重現並確認修好）。
 
 class ScopeSummary(BaseModel):
     scope_id: str
@@ -209,6 +225,7 @@ symbol 的 owning file（透過 SQLite `symbols.file`）並納入，例如：
 | 產生成功（schema 通過，`purpose` 等核心欄位有效） | 新內容、`status=fresh`、`last_error=None` |
 | 產生失敗／被拒絕，**且該 scope 之前已有成功產生過的 revision** | **複製上一個 current revision 的完整內容**（`purpose`/`responsibilities`/.../`source_files` 全部原樣帶過去，比照 §2.5 系統自動附加 revision 的「完整 snapshot」規則），只改動 `status=stale`、`last_error=<清洗後的分類字串>`、`generated_at`、`source_hash`/`source_files` 更新為**目前**的（不是舊的）——因為即使沒有新內容，staleness 判斷仍要對照現在的原始碼狀態，下次 hash 若又變了才知道要不要再試一次 |
 | 產生失敗，**且該 scope 從未成功產生過任何 revision**（`revision=1` 就失敗） | 附加 `revision=1`，`status=unavailable`，內容欄位一律留空（`purpose=""`、其餘 list 為 `[]`），不得虛構內容 |
+| scope 被刪除（scopes.json 不再有這個 scope_id，但 semantic.jsonl 有既有 current revision） | 附加新 revision，複製上一筆 current revision 的完整內容，只改動 `status=orphaned`、`generated_at`；排除於 SQLite `semantic_objects` 之外 |
 
 Append-only JSONL：每次 `rune update` 對某 scope 附加新的一行（不論成功或失敗，見上表），`current
 = max(revision)`（per `scope_id`），與 Decision/Constraint/Note 共用同一套「current」定義。SQLite
@@ -550,6 +567,12 @@ materialize）——一個 typo 或指向已刪除檔案的 scope membership 只
 -- semantic summary（只存每個 scope_id 的 current revision＝MAX(revision)；
 -- 完整歷史留在 semantic.jsonl。本輪（Milestone 5 開工前）新增 current_revision
 -- 欄位，比照 decision_records/constraint_records/note_records 的既有模式）
+--
+-- scope_id 對 scopes(id) 有真正的 FK：materialize.py 在插入前會過濾掉
+-- scope_id 已不在目前 scopes 表裡的 summary（品質複查發現的 bug 修正——
+-- 刪除一個曾經有 summary 的 scope，先前會讓後續每一次 rune update/
+-- rebuild-cache 都因 FK violation 直接 crash，已實測重現並修好；status=
+-- orphaned 的 revision 也一律被這個過濾排除，不會出現在這張表）。
 CREATE TABLE semantic_objects (
     scope_id         TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
     current_revision INTEGER NOT NULL,
@@ -560,6 +583,26 @@ CREATE TABLE semantic_objects (
     source_hash      TEXT NOT NULL,
     status           TEXT NOT NULL,
     last_error       TEXT
+);
+
+-- Semantic worker 每次 run 的 metrics（ARCHITECTURE.md §4.5 的六項
+-- run-level 指標，品質複查新增）。純操作性歷史資料，沒有任何 canonical
+-- JSONL 背書，因此**不在**每次 materialize 清空重建的六張根表之列——只在
+-- 這次 run 真的嘗試過 semantic refresh（scopes_attempted > 0）時 INSERT
+-- 一行，累積在同一個 memory.db 裡；memory.db 整個被刪除重建時歷史一併消失
+-- （接受，因為本來就沒有可以重建它的 canonical 來源）。
+CREATE TABLE semantic_run_metrics (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at                TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    scopes_attempted      INTEGER NOT NULL,
+    schema_success_rate   REAL NOT NULL,
+    reference_strip_rate  REAL NOT NULL,
+    fallback_rate         REAL NOT NULL,
+    provider_error_rate   REAL NOT NULL,
+    total_cost            REAL NOT NULL,
+    total_latency_seconds REAL NOT NULL
 );
 
 -- decision（current_revision = max(revision)，與 status 無關，見第 3 節）

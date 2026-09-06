@@ -81,6 +81,28 @@ def append_jsonl(path: Path, model: BaseModel) -> None:
     atomic_write_text(path, existing + new_line)
 
 
+def append_jsonl_many(path: Path, models: list[BaseModel]) -> None:
+    """Appends multiple records as a single atomic write. Callers that need
+    to append N records from one logical operation (e.g. `core.update`
+    appending every scope's new `ScopeSummary` revision after one
+    `rebuild_cache` transaction) must use this instead of calling
+    `append_jsonl` N times — N separate atomic writes are each individually
+    crash-safe, but a failure partway through the Nth call would leave
+    canonical with only some of the records a single already-committed
+    SQLite transaction expects, which is worse than any one write failing
+    outright (confirmed by hand: two scopes refreshed in one run, the
+    second's canonical append simulated to fail, left `semantic_objects`
+    reporting both as current while `semantic.jsonl` only had one).
+    """
+    if not models:
+        return
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    new_lines = "".join(m.model_dump_json() + "\n" for m in models)
+    atomic_write_text(path, existing + new_lines)
+
+
 def rewrite_jsonl(path: Path, models: list[BaseModel]) -> None:
     """Rewrites the whole JSONL file from scratch. Used for --force repair
     paths and tests; not used for normal append flows.

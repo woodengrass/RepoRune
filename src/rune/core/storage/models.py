@@ -187,6 +187,18 @@ class SemanticStatus(str, Enum):
     # when `unavailable`, every content field below is an empty placeholder
     # (`purpose=""`, list fields `[]`) and must never be shown to an agent
     # as if it were a real description (DATA_MODEL.md §2.4).
+    orphaned = "orphaned"
+    # The scope this summary belonged to no longer exists in scopes.json
+    # (deleted). Mirrors Decision/Constraint's existing orphaned status
+    # (DATA_MODEL.md §6: "引用的整個 scope 消失 -> status=orphaned") for
+    # parity rather than inventing separate semantics for ScopeSummary.
+    # `core.update` appends this revision (full content copied forward,
+    # only status/generated_at changed, same completeness rule as every
+    # other system-triggered revision) whenever a scope_id present in
+    # semantic.jsonl's current revisions is absent from the current
+    # scopes.json. Excluded from SQLite materialization — semantic_objects.
+    # scope_id has a real FK to scopes(id), so a vanished scope can never
+    # get a row there regardless of status.
 
 
 class ScopeSummary(BaseModel):
