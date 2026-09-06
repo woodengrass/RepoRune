@@ -1549,3 +1549,41 @@ IMPLEMENTATION_PLAN 第 410 行起、DATA_MODEL.md §2.5/§2.5a/§2.6/§6、ARCH
 
 尚未完成：CLI 子命令（`decision`/`constraint`/`note`/`proposal`/`search`/`check`）——Milestone 6
 交付項目目前只剩這一塊，做完就是完整的 Milestone 6。
+
+### 第二十一輪修訂（CLI 子命令，Milestone 6 收尾；手動 smoke test 揪出一個 staleness 無限重複附加的 bug）
+
+105. **CLI 子命令**：`rune decision {propose,list,deactivate}`、`rune constraint {propose,list,
+    deactivate}`、`rune note {add,update,list}`、`rune proposal {list,approve,reject,edit}`、
+    `rune search QUERY [--history] [--json]`、`rune check [--json]`。比照既有 `scope` 子命令的模式
+    （薄的參數解析層，呼叫恰好一個 `core` 進入點，`ARCHITECTURE.md §5`）。`--created-by`/`--source`
+    自訂驗證只接受 `agent`/`human`（`Proposal.created_by`/`Note.source` 底層是 `Literal`，執行期
+    不會自動擋，CLI 層要自己擋，否則打錯字會被靜默當成 human 處理）。`proposal edit` 直接把使用者給
+    的覆蓋欄位 merge 進 `proposal.payload`（`model_copy(update=...)`）再呼叫
+    `approve(edited_payload=...)`，一次完成 DATA_MODEL §2.5a 的 `[E]dit` 流程。
+106. **手動 smoke test（在暫存 repo 跑過真實 CLI 指令，不只是自動化測試）發現一個 staleness
+    無限重複附加的 bug**：`detect_constraint_transitions` 的 `source_bound`／`temporary` 分支、
+    `detect_note_transitions` 的 source-bound 分支，附加 `status=stale` 新 revision 時只改了
+    status/created_by/created_at，**沒有把比對用的 snapshot（`source_hashes`／`expires_at` 相關判斷）
+    更新為目前的值**——`stale` 本身不在終止狀態集合裡（刻意的，因為 `source_bound` 內容之後可能再變、
+    需要能再次觸發），所以每一次後續 `rune update` 都會拿同一份「已經過期」的舊 snapshot 重新比對，
+    永遠比對不符，於是每次都多附加一筆一模一樣的 `stale` revision，長期下來會讓 `constraints.jsonl`/
+    `notes.jsonl` 無限膨脹。修法比照 Milestone 5 `core.semantic.worker` 失敗 revision 的既有規則
+    （`source_hash`/`source_files` 更新為目前值，即使沒有新內容，理由完全相同）：
+    - `source_bound` constraint／Note：附加 `stale` revision 時把 `source_hashes` 更新為**現在**
+      算出來的值，下次比對才有正確的新基準，只有內容**再次**變動才會再觸發。
+    - `temporary` constraint：`expires_at` 本身不會變，用另一種方式做冪等——只在目前 status **還不是**
+      `stale` 時才觸發，避免同一個已過期的 `expires_at` 每次都被判定為「還沒處理過」。
+    - `scope_bound` constraint 附加的是 `review_required`（本來就在終止狀態集合裡，不會重複觸發），
+      但仍順手把 `scope_hashes` 更新為目前值，維持三種 snapshot 欄位處理方式一致，避免之後有人只
+      看 `source_bound` 分支就照抄卻漏掉 `scope_bound`。
+    這個 bug 沒有被純函式單元測試抓到，因為原本的測試只驗證「觸發一次」，沒有驗證「觸發後不會再重複
+    觸發」——已補上 3 個新的 idempotency regression test（`test_constraint_source_bound_stale_
+    transition_is_idempotent`、`test_constraint_temporary_expiry_transition_is_idempotent`、
+    `test_note_source_hash_stale_transition_is_idempotent`），每個都用「連續呼叫兩次，第二次結果
+    必須是空 list」的方式驗證，且用 `git stash` 只還原 `staleness.py` 確認修法前這三個測試真的會
+    失敗。這是本輪唯一的功能性 bug；`rune.core.retrieval.search`/`check` 兩個模組先前的手動驗證
+    沒有再發現其他問題。
+
+新增 3 個 regression test（idempotency）。261 個測試全綠，`ruff check` 全綠。**Milestone 6
+（Policies & Memory）的六項交付項目至此全部完成**：current/visible 分離、proposal 流程、Note
+CRUD、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`，以及對應的 CLI 子命令。

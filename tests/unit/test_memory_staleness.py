@@ -156,7 +156,53 @@ def test_constraint_source_bound_hash_mismatch_is_stale() -> None:
     )
     assert len(result) == 1
     assert result[0].status is RecordStatus.stale
-    assert result[0].source_hashes == {"a.py": "sha256:old"}  # snapshot itself is untouched
+    # The snapshot itself is refreshed to the current hash, not left
+    # pointing at the old one -- otherwise every subsequent `rune update`
+    # would keep comparing against the same now-stale baseline and
+    # re-append an identical `stale` revision forever (same rationale as
+    # core.semantic.worker's failure-revision rule updating source_hash).
+    assert result[0].source_hashes == {"a.py": "sha256:new"}
+
+
+def test_constraint_source_bound_stale_transition_is_idempotent() -> None:
+    """Regression test for the infinite-reappend bug: running the check
+    twice in a row with the same (still-mismatched-from-the-original)
+    content must only produce one transition on the first run and zero on
+    the second, because the first run's appended revision already
+    refreshed the snapshot to match.
+    """
+    rev = _constraint(
+        persistence_mode=PersistenceMode.source_bound, files=["a.py"],
+        source_hashes={"a.py": "sha256:old"},
+    )
+    first = detect_constraint_transitions(
+        {"c1": rev}, known_scope_ids=set(), known_files={"a.py"}, known_symbol_ids=set(),
+        file_hashes={"a.py": "sha256:new"}, symbol_owning_file={}, scope_by_id={}, now=_NOW,
+    )
+    assert len(first) == 1
+    second = detect_constraint_transitions(
+        {"c1": first[0]}, known_scope_ids=set(), known_files={"a.py"}, known_symbol_ids=set(),
+        file_hashes={"a.py": "sha256:new"}, symbol_owning_file={}, scope_by_id={}, now=_NOW,
+    )
+    assert second == []
+
+
+def test_constraint_temporary_expiry_transition_is_idempotent() -> None:
+    """Same infinite-reappend risk as source_bound, but for a different
+    reason: `expires_at` never changes once set, so without an explicit
+    "already stale" guard, "now >= expires_at" stays true forever.
+    """
+    rev = _constraint(persistence_mode=PersistenceMode.temporary, expires_at="2026-01-01T00:00:00Z")
+    first = detect_constraint_transitions(
+        {"c1": rev}, known_scope_ids=set(), known_files=set(), known_symbol_ids=set(),
+        file_hashes={}, symbol_owning_file={}, scope_by_id={}, now=_NOW,
+    )
+    assert len(first) == 1
+    second = detect_constraint_transitions(
+        {"c1": first[0]}, known_scope_ids=set(), known_files=set(), known_symbol_ids=set(),
+        file_hashes={}, symbol_owning_file={}, scope_by_id={}, now=_NOW,
+    )
+    assert second == []
 
 
 def test_constraint_source_bound_hash_match_is_unchanged() -> None:
@@ -275,6 +321,21 @@ def test_note_source_hash_mismatch_is_stale_and_shown() -> None:
     )
     assert len(result) == 1
     assert result[0].status is NoteStatus.stale
+    assert result[0].source_hashes == {"a.py": "sha256:new"}  # snapshot refreshed, not left stale
+
+
+def test_note_source_hash_stale_transition_is_idempotent() -> None:
+    note = _note(files=["a.py"], source_hashes={"a.py": "sha256:old"})
+    first = detect_note_transitions(
+        {"n1": note}, known_scope_ids=set(), file_hashes={"a.py": "sha256:new"},
+        symbol_owning_file={}, now=_NOW,
+    )
+    assert len(first) == 1
+    second = detect_note_transitions(
+        {"n1": first[0]}, known_scope_ids=set(), file_hashes={"a.py": "sha256:new"},
+        symbol_owning_file={}, now=_NOW,
+    )
+    assert second == []
 
 
 def test_note_without_source_hashes_is_persistent_regardless_of_deleted_files() -> None:

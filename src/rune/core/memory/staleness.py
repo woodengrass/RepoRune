@@ -47,23 +47,36 @@ def _parse(ts: str) -> datetime:
 
 
 def _system_revision(
-    current: MemoryRevision, new_status: RecordStatus, now: str, author: RevisionAuthor
+    current: MemoryRevision,
+    new_status: RecordStatus,
+    now: str,
+    author: RevisionAuthor,
+    extra: dict | None = None,
 ) -> MemoryRevision:
     """DATA_MODEL.md §2.5's completeness rule: a system-appended revision
     is a full snapshot of the previous current revision, only status/
     lifecycle metadata changed -- never a partial `{record_id, revision,
     status}` row, or the next staleness check would lose its comparison
     baseline (e.g. a source_bound constraint's `source_hashes`).
+
+    `extra`, when given, is merged into the same update -- used by the
+    source_bound/scope_bound branches to also refresh the snapshot itself
+    to the *current* value (same rationale as `core.semantic.worker`'s
+    failure-revision rule: without this, a constraint that just went
+    `stale` would keep comparing against the same now-stale snapshot on
+    every subsequent `rune update`, re-appending an identical `stale`
+    revision forever instead of only once per actual change).
     """
-    return current.model_copy(
-        update={
-            "revision": current.revision + 1,
-            "status": new_status,
-            "created_by": author,
-            "approved_by": None,
-            "created_at": now,
-        }
-    )
+    updates = {
+        "revision": current.revision + 1,
+        "status": new_status,
+        "created_by": author,
+        "approved_by": None,
+        "created_at": now,
+    }
+    if extra:
+        updates.update(extra)
+    return current.model_copy(update=updates)
 
 
 def _existence_status(
@@ -142,7 +155,10 @@ def detect_constraint_transitions(
             current_hashes = compute_source_hashes(rev.files, rev.symbols, file_hashes, symbol_owning_file)
             if current_hashes != rev.source_hashes:
                 new_revisions.append(
-                    _system_revision(rev, RecordStatus.stale, now, RevisionAuthor.system_staleness)
+                    _system_revision(
+                        rev, RecordStatus.stale, now, RevisionAuthor.system_staleness,
+                        extra={"source_hashes": current_hashes},
+                    )
                 )
         elif rev.persistence_mode is PersistenceMode.scope_bound:
             current_scope_hashes = {
@@ -152,26 +168,41 @@ def detect_constraint_transitions(
             }
             if current_scope_hashes != rev.scope_hashes:
                 new_revisions.append(
-                    _system_revision(rev, RecordStatus.review_required, now, RevisionAuthor.system_staleness)
+                    _system_revision(
+                        rev, RecordStatus.review_required, now, RevisionAuthor.system_staleness,
+                        extra={"scope_hashes": current_scope_hashes},
+                    )
                 )
         elif rev.persistence_mode is PersistenceMode.temporary:
-            if rev.expires_at is not None and now_dt >= _parse(rev.expires_at):
+            # `rev.status is not stale` guards idempotency here specifically
+            # (unlike source_bound above, `expires_at` never changes once
+            # set, so without this check "now >= expires_at" would stay
+            # true forever and re-append an identical stale revision on
+            # every subsequent `rune update`).
+            if (
+                rev.status is not RecordStatus.stale
+                and rev.expires_at is not None
+                and now_dt >= _parse(rev.expires_at)
+            ):
                 new_revisions.append(
                     _system_revision(rev, RecordStatus.stale, now, RevisionAuthor.system_lifecycle)
                 )
     return new_revisions
 
 
-def _note_system_revision(current: Note, new_status: NoteStatus, now: str, author: RevisionAuthor) -> Note:
-    return current.model_copy(
-        update={
-            "revision": current.revision + 1,
-            "status": new_status,
-            "source": author,
-            "last_verified_at": now,
-            "created_at": now,
-        }
-    )
+def _note_system_revision(
+    current: Note, new_status: NoteStatus, now: str, author: RevisionAuthor, extra: dict | None = None
+) -> Note:
+    updates = {
+        "revision": current.revision + 1,
+        "status": new_status,
+        "source": author,
+        "last_verified_at": now,
+        "created_at": now,
+    }
+    if extra:
+        updates.update(extra)
+    return current.model_copy(update=updates)
 
 
 def detect_note_transitions(
@@ -208,6 +239,9 @@ def detect_note_transitions(
             current_hashes = compute_source_hashes(note.files, note.symbols, file_hashes, symbol_owning_file)
             if current_hashes != note.source_hashes:
                 new_revisions.append(
-                    _note_system_revision(note, NoteStatus.stale, now, RevisionAuthor.system_staleness)
+                    _note_system_revision(
+                        note, NoteStatus.stale, now, RevisionAuthor.system_staleness,
+                        extra={"source_hashes": current_hashes},
+                    )
                 )
     return new_revisions

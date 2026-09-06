@@ -17,6 +17,28 @@ import typer
 from rune.core.config import load_config
 from rune.core.hashing import working_tree_fingerprint
 from rune.core.index.scanner import diff_against_previous, scan_files
+from rune.core.memory.notes import NoteNotFoundError
+from rune.core.memory.notes import note_add as core_note_add
+from rune.core.memory.notes import note_update as core_note_update
+from rune.core.memory.proposals import (
+    ProposalAlreadyResolvedError,
+    ProposalNotFoundError,
+    RecordNotFoundError,
+    get_current_proposal,
+    list_pending_proposals,
+)
+from rune.core.memory.proposals import (
+    ProposalValidationError as _ProposalValidationError,
+)
+from rune.core.memory.proposals import approve as core_approve
+from rune.core.memory.proposals import deactivate as core_deactivate
+from rune.core.memory.proposals import propose as core_propose
+from rune.core.memory.proposals import reject as core_reject
+from rune.core.memory.records import (
+    load_current_constraints,
+    load_current_decisions,
+    load_current_notes,
+)
 from rune.core.project import (
     AlreadyInitializedError,
     NotAGitRepoError,
@@ -24,6 +46,8 @@ from rune.core.project import (
     find_repo_root,
     init_project,
 )
+from rune.core.retrieval.check import check as core_check
+from rune.core.retrieval.search import search as core_search
 from rune.core.scopes.clustering import suggest_from_graph
 from rune.core.scopes.heuristics import ScopeCandidate, suggest_from_paths
 from rune.core.scopes.model import (
@@ -37,13 +61,30 @@ from rune.core.scopes.model import (
     update_scope,
 )
 from rune.core.storage.canonical import read_json_model
-from rune.core.storage.models import ProjectFile, Scope, ScopeSource
+from rune.core.storage.models import (
+    NoteCategory,
+    NoteStatus,
+    PersistenceMode,
+    ProjectFile,
+    RecordType,
+    Scope,
+    ScopeSource,
+    Severity,
+)
 from rune.core.storage.sqlite.materialize import CanonicalConflictError
 from rune.core.update import run_update
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 scope_app = typer.Typer(help="Create, maintain, and review scope suggestions.")
 app.add_typer(scope_app, name="scope")
+decision_app = typer.Typer(help="Propose, list, and deactivate Decisions.")
+app.add_typer(decision_app, name="decision")
+constraint_app = typer.Typer(help="Propose, list, and deactivate Constraints.")
+app.add_typer(constraint_app, name="constraint")
+note_app = typer.Typer(help="Add, update, and list Notes.")
+app.add_typer(note_app, name="note")
+proposal_app = typer.Typer(help="Review pending Decision/Constraint proposals.")
+app.add_typer(proposal_app, name="proposal")
 
 
 def _err(message: str) -> None:
@@ -419,6 +460,418 @@ def scope_suggest(
     if accepted:
         save_scopes(layout, scopes_file)
     typer.echo(f"Accepted {accepted} scope suggestion(s).")
+
+
+# --------------------------------------------------------------------------
+# Milestone 6: decision / constraint / note / proposal / search / check
+# --------------------------------------------------------------------------
+
+_DECISION_VISIBLE = {"active", "review_required"}
+_CONSTRAINT_VISIBLE = {"active", "review_required", "stale"}
+_NOTE_VISIBLE = {"active", "stale"}
+
+
+def _validate_actor(value: str, option: str) -> None:
+    if value not in ("agent", "human"):
+        _err(f"{option} must be 'agent' or 'human', got {value!r}")
+        raise typer.Exit(code=1)
+
+
+@decision_app.command("propose")
+def decision_propose(
+    record_id: str = typer.Argument(..., help="Stable id, e.g. 'use-postgres-for-primary-store'."),
+    content: str = typer.Option(..., "--content"),
+    rationale: str = typer.Option("", "--rationale"),
+    scopes: list[str] = typer.Option([], "--scope"),
+    files: list[str] = typer.Option([], "--file"),
+    symbols: list[str] = typer.Option([], "--symbol"),
+    critical: bool = typer.Option(False, "--critical", help="Eligible for hard bootstrap (Milestone 7)."),
+    source_document: str | None = typer.Option(None, "--source-document"),
+    source_section: str | None = typer.Option(None, "--source-section"),
+    created_by: str = typer.Option("agent", "--created-by", help="'agent' or 'human'."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Propose a new Decision. Sits pending until `rune proposal approve`."""
+    _validate_actor(created_by, "--created-by")
+    try:
+        layout = _scope_layout(path)
+        proposal = core_propose(
+            layout, type=RecordType.decision, record_id=record_id, content=content,
+            rationale=rationale, scopes=scopes, files=files, symbols=symbols,
+            critical=critical, source_document=source_document, source_section=source_section,
+            created_by=created_by,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
+
+
+@decision_app.command("list")
+def decision_list(
+    show_all: bool = typer.Option(False, "--all", help="Include inactive/orphaned, not just current+visible."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """List current Decisions."""
+    try:
+        current = load_current_decisions(_scope_layout(path))
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    rows = [r for r in current.values() if show_all or r.status.value in _DECISION_VISIBLE]
+    if not rows:
+        typer.echo("No decisions.")
+        return
+    for rev in sorted(rows, key=lambda r: r.record_id):
+        typer.echo(f"{rev.record_id} [{rev.status.value}] rev{rev.revision}: {rev.content}")
+
+
+@decision_app.command("deactivate")
+def decision_deactivate(
+    record_id: str = typer.Argument(...),
+    by: str = typer.Option(..., "--by", help="Human identity/handle."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    try:
+        updated = core_deactivate(_scope_layout(path), RecordType.decision, record_id, by=by)
+    except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"{record_id} deactivated (rev{updated.revision})")
+
+
+@constraint_app.command("propose")
+def constraint_propose(
+    record_id: str = typer.Argument(...),
+    content: str = typer.Option(..., "--content"),
+    severity: Severity = typer.Option(..., "--severity"),
+    persistence_mode: PersistenceMode = typer.Option(..., "--persistence-mode"),
+    rationale: str = typer.Option("", "--rationale"),
+    scopes: list[str] = typer.Option([], "--scope"),
+    files: list[str] = typer.Option([], "--file"),
+    symbols: list[str] = typer.Option([], "--symbol"),
+    expires_at: str | None = typer.Option(
+        None, "--expires-at", help="ISO-8601 UTC; required for --persistence-mode=temporary."
+    ),
+    source_document: str | None = typer.Option(None, "--source-document"),
+    source_section: str | None = typer.Option(None, "--source-section"),
+    machine_check_hint: str | None = typer.Option(None, "--machine-check-hint"),
+    created_by: str = typer.Option("agent", "--created-by", help="'agent' or 'human'."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Propose a new Constraint. Sits pending until `rune proposal approve` --
+    source_hashes/scope_hashes are computed automatically at approval time,
+    never entered by hand."""
+    _validate_actor(created_by, "--created-by")
+    try:
+        layout = _scope_layout(path)
+        proposal = core_propose(
+            layout, type=RecordType.constraint, record_id=record_id, content=content,
+            rationale=rationale, scopes=scopes, files=files, symbols=symbols,
+            severity=severity, persistence_mode=persistence_mode, expires_at=expires_at,
+            source_document=source_document, source_section=source_section,
+            machine_check_hint=machine_check_hint, created_by=created_by,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
+
+
+@constraint_app.command("list")
+def constraint_list(
+    show_all: bool = typer.Option(False, "--all", help="Include inactive/orphaned, not just current+visible."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """List current Constraints."""
+    try:
+        current = load_current_constraints(_scope_layout(path))
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    rows = [r for r in current.values() if show_all or r.status.value in _CONSTRAINT_VISIBLE]
+    if not rows:
+        typer.echo("No constraints.")
+        return
+    for rev in sorted(rows, key=lambda r: (r.severity.value if r.severity else "", r.record_id)):
+        severity = rev.severity.value if rev.severity else "?"
+        typer.echo(f"{rev.record_id} [{severity}/{rev.status.value}] rev{rev.revision}: {rev.content}")
+
+
+@constraint_app.command("deactivate")
+def constraint_deactivate(
+    record_id: str = typer.Argument(...),
+    by: str = typer.Option(..., "--by", help="Human identity/handle."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    try:
+        updated = core_deactivate(_scope_layout(path), RecordType.constraint, record_id, by=by)
+    except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"{record_id} deactivated (rev{updated.revision})")
+
+
+@note_app.command("add")
+def note_add_cmd(
+    category: NoteCategory = typer.Option(..., "--category"),
+    content: str = typer.Option(..., "--content"),
+    why_persist: str = typer.Option(..., "--why-persist"),
+    scopes: list[str] = typer.Option([], "--scope"),
+    files: list[str] = typer.Option([], "--file"),
+    symbols: list[str] = typer.Option([], "--symbol"),
+    importance: float = typer.Option(0.5, "--importance"),
+    confidence: float = typer.Option(0.5, "--confidence"),
+    evidence: list[str] = typer.Option([], "--evidence"),
+    expires_at: str | None = typer.Option(None, "--expires-at"),
+    source: str = typer.Option("agent", "--source", help="'agent' or 'human'."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Add a new Note. No approval gate -- writes immediately."""
+    _validate_actor(source, "--source")
+    try:
+        layout = _scope_layout(path)
+        config = load_config(layout.config_path)
+        note = core_note_add(
+            layout, category=category, content=content, why_persist=why_persist,
+            scopes=scopes, files=files, symbols=symbols, importance=importance,
+            confidence=confidence, evidence=evidence, expires_at=expires_at, source=source,
+            redact_secrets=config.security.redact_secrets,
+        )
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Added note {note.id} ({note.category.value})")
+
+
+@note_app.command("update")
+def note_update_cmd(
+    note_id: str = typer.Argument(...),
+    content: str | None = typer.Option(None, "--content"),
+    why_persist: str | None = typer.Option(None, "--why-persist"),
+    status: NoteStatus | None = typer.Option(None, "--status"),
+    evidence: list[str] = typer.Option([], "--evidence", help="Replaces the full evidence list if given."),
+    source: str = typer.Option("agent", "--source", help="'agent' or 'human'."),
+    recompute_source_hashes: bool = typer.Option(
+        False, "--recompute-source-hashes",
+        help="Re-snapshot files/symbols against the current index (e.g. after verifying a fix).",
+    ),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Update a Note -- appends a new revision, carrying forward every
+    field not explicitly overridden."""
+    _validate_actor(source, "--source")
+    try:
+        layout = _scope_layout(path)
+        config = load_config(layout.config_path)
+        updated = core_note_update(
+            layout, note_id, content=content, why_persist=why_persist, status=status,
+            evidence=evidence or None, source=source,
+            redact_secrets=config.security.redact_secrets,
+            recompute_source_hashes=recompute_source_hashes,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, NoteNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"{note_id} updated to rev{updated.revision} [{updated.status.value}]")
+
+
+@note_app.command("list")
+def note_list(
+    show_all: bool = typer.Option(False, "--all", help="Include expired/orphaned/archived, not just current+visible."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    try:
+        current = load_current_notes(_scope_layout(path))
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    rows = [n for n in current.values() if show_all or n.status.value in _NOTE_VISIBLE]
+    if not rows:
+        typer.echo("No notes.")
+        return
+    for note in sorted(rows, key=lambda n: n.id):
+        warn = " [STALE]" if note.status is NoteStatus.stale else ""
+        typer.echo(f"{note.id} [{note.category.value}/{note.status.value}] rev{note.revision}{warn}: {note.content}")
+
+
+@proposal_app.command("list")
+def proposal_list(
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """List pending proposals -- what's waiting for `[A]pprove`/`[R]eject`/`[E]dit`."""
+    try:
+        proposals = list_pending_proposals(_scope_layout(path))
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    if not proposals:
+        typer.echo("No pending proposals.")
+        return
+    for p in proposals:
+        typer.echo(f"{p.proposal_id} [{p.type.value}] record_id={p.record_id} created_by={p.created_by}")
+        typer.echo(f"  {p.payload.content}")
+
+
+@proposal_app.command("approve")
+def proposal_approve(
+    proposal_id: str = typer.Argument(...),
+    by: str = typer.Option(..., "--by", help="Human identity/handle."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    try:
+        _, memory_rev = core_approve(_scope_layout(path), proposal_id, resolved_by=by)
+    except (
+        NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
+        ProposalAlreadyResolvedError, _ProposalValidationError,
+    ) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"Approved {proposal_id}: {memory_rev.record_id} rev{memory_rev.revision} [{memory_rev.status.value}]"
+    )
+
+
+@proposal_app.command("reject")
+def proposal_reject(
+    proposal_id: str = typer.Argument(...),
+    by: str = typer.Option(..., "--by", help="Human identity/handle."),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    try:
+        core_reject(_scope_layout(path), proposal_id, resolved_by=by)
+    except (NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError, ProposalAlreadyResolvedError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Rejected {proposal_id}")
+
+
+@proposal_app.command("edit")
+def proposal_edit(
+    proposal_id: str = typer.Argument(...),
+    by: str = typer.Option(..., "--by", help="Human identity/handle."),
+    content: str | None = typer.Option(None, "--content"),
+    rationale: str | None = typer.Option(None, "--rationale"),
+    scopes: list[str] = typer.Option([], "--scope"),
+    files: list[str] = typer.Option([], "--file"),
+    symbols: list[str] = typer.Option([], "--symbol"),
+    severity: Severity | None = typer.Option(None, "--severity"),
+    persistence_mode: PersistenceMode | None = typer.Option(None, "--persistence-mode"),
+    expires_at: str | None = typer.Option(None, "--expires-at"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Edit a pending proposal's content, then approve the edited version
+    in one step (DATA_MODEL.md §2.5a's `[E]dit` flow -- proposal status
+    becomes `edited`, not `approved`)."""
+    try:
+        layout = _scope_layout(path)
+        proposal = get_current_proposal(layout, proposal_id)
+        updates: dict = {}
+        if content is not None:
+            updates["content"] = content
+        if rationale is not None:
+            updates["rationale"] = rationale
+        if scopes:
+            updates["scopes"] = scopes
+        if files:
+            updates["files"] = files
+        if symbols:
+            updates["symbols"] = symbols
+        if severity is not None:
+            updates["severity"] = severity
+        if persistence_mode is not None:
+            updates["persistence_mode"] = persistence_mode
+        if expires_at is not None:
+            updates["expires_at"] = expires_at
+        edited_payload = proposal.payload.model_copy(update=updates)
+        _, memory_rev = core_approve(
+            layout, proposal_id, resolved_by=by, edited_payload=edited_payload
+        )
+    except (
+        NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
+        ProposalAlreadyResolvedError, _ProposalValidationError,
+    ) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    typer.echo(
+        f"Edited+approved {proposal_id}: {memory_rev.record_id} rev{memory_rev.revision} [{memory_rev.status.value}]"
+    )
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(...),
+    history: bool = typer.Option(False, "--history", help="Also include non-visible current revisions."),
+    limit: int = typer.Option(50, "--limit"),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Ranked search across scope summaries, Decisions, Constraints, and
+    Notes (ARCHITECTURE.md §4.8's eight-layer priority order)."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    results = core_search(layout, query, history=history, limit=limit)
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                [
+                    {"kind": r.kind, "rank": r.rank, "id": r.id, "text": r.text,
+                     "status": r.status, "warning": r.warning}
+                    for r in results
+                ],
+                indent=2,
+            )
+        )
+        return
+    if not results:
+        typer.echo("No results.")
+        return
+    for r in results:
+        warn = f" ({r.warning})" if r.warning else ""
+        typer.echo(f"[{r.rank}] {r.kind} {r.id} [{r.status}]{warn}: {r.text}")
+
+
+@app.command()
+def check(
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Working-tree changes -> affected scopes -> relevant Constraints. No model calls."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    result = core_check(layout)
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                {
+                    "changed_files": result.changed_files,
+                    "affected_scope_ids": result.affected_scope_ids,
+                    "constraints": [
+                        {"record_id": c.record_id, "content": c.content, "severity": c.severity,
+                         "status": c.status, "scope_ids": c.scope_ids}
+                        for c in result.constraints
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    if not result.changed_files:
+        typer.echo("No changes detected.")
+        return
+    typer.echo(f"Changed files: {', '.join(result.changed_files)}")
+    typer.echo(f"Affected scopes: {', '.join(result.affected_scope_ids) or '(none)'}")
+    if not result.constraints:
+        typer.echo("No relevant constraints.")
+        return
+    for c in result.constraints:
+        typer.echo(f"[{c.severity}] {c.record_id} (scopes: {', '.join(c.scope_ids)}): {c.content}")
 
 
 def main() -> None:

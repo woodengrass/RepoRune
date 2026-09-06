@@ -117,7 +117,7 @@ DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但
 192 個測試維持全綠，`ruff check` 全綠。細節見 IMPLEMENTATION_PLAN.md 第十七輪修訂。
 
 retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、改指向 `source_files`」的規則（第十五輪決議
-第 2 點）尚未實作，屬於 Milestone 6 範圍，留到那時再做——見下方「立刻可以做的下一步」。
+第 2 點）已在 Milestone 6 第二十輪實作（`core.retrieval.search._search_semantic`），細節見下方。
 
 **第十八輪修訂（Milestone 6 開工，第一塊基礎：current/visible 分離）**：Milestone 6 的設計已在
 文件裡確認完畢，沒有卡著的開放問題，但範圍很大，跟使用者確認後決定先做一個小 spike，其餘部分
@@ -129,6 +129,31 @@ retrieval 端「`possibly_stale`/`stale` 不顯示舊摘要、改指向 `source_
 重新驗證這個測試真的會抓到這個錯誤，才視為測試有效。細節見 IMPLEMENTATION_PLAN.md 第 93-94 條。
 199 個測試全綠，`ruff check` 全綠。
 
+**第十九～二十一輪修訂：使用者要求「一路做到 Milestone 6 完成」，一次做完剩下的全部交付項目**
+（不再逐項確認範圍，因為設計本來就已經在文件裡確認完畢，沒有新的開放問題）：
+
+- **第十九輪**：`core.memory.hashes`（`source_hashes`/`scope_hashes` snapshot 計算）、
+  `core.memory.proposals`（propose/approve/reject/deactivate，核准時自動算 hash，不需人類手動輸入）、
+  `core.memory.notes`（note_add/note_update，無需核准關卡，重用 Milestone 5 的 redaction 模組）、
+  `core.memory.staleness`（存在性檢查 + snapshot 比對，純結構/hash，不呼叫 LLM，接進 `core.update`
+  永遠執行）、FTS5 補上實際寫入邏輯（`fts_decisions`/`fts_constraints`/`fts_notes`/`fts_semantic`/
+  `fts_symbols` 從 Milestone 1 起宣告卻從未有程式碼寫入，已用 regression test 確認並修好）。
+- **第二十輪**：`core.retrieval.search`（ARCHITECTURE §4.8 的八層排序，落實了 Milestone 5 第十五輪
+  「`possibly_stale`/`stale` 摘要不顯示舊文字、改指向 `source_files`」的決議——這個決議記錄下來後
+  一直沒有程式碼消費它，這輪終於真正接上）、`core.retrieval.check`（git diff -> 受影響 scope ->
+  相關 constraint，重用 `rune status` 既有的 diff 機制，不重複造一套）。
+- **第二十一輪**：CLI 子命令（`decision`/`constraint`/`note`/`proposal`/`search`/`check`），並且
+  **手動在暫存 repo 跑真實 CLI 指令做 smoke test 時抓到一個自動化測試沒抓到的 bug**：
+  `source_bound`/`temporary` 的 staleness 判斷附加 `stale` revision 時沒有把比對用的 snapshot
+  更新為目前值，導致每次 `rune update` 都重複附加一模一樣的 revision（無限膨脹 canonical
+  檔案）——修法比照 Milestone 5 `core.semantic.worker` 失敗 revision 更新 `source_hash` 的既有
+  規則，並補上 3 個「連續呼叫兩次，第二次必須是空結果」的 idempotency regression test，用
+  `git stash` 確認修法前這三個測試真的會失敗。
+
+**Milestone 6（Policies & Memory）至此全部完成**：current/visible 分離、proposal 流程、Note
+CRUD、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令，六項交付項目
+一項不缺。261 個測試全綠，`ruff check` 全綠。細節見 IMPLEMENTATION_PLAN.md 第 95-106 條。
+
 ## 專案是什麼
 
 RepoRune（CLI/套件名：`rune`）= *Repository Understanding & Navigation Engine*。
@@ -138,8 +163,8 @@ reference）、持久化的語意理解、持久化的治理紀錄（Decision/Co
 （Note），以及一套「不需要 agent 自己想到要查」的主動投遞機制（Global MUST Constraint hard
 bootstrap）。
 
-**GitHub**：https://github.com/woodengrass/RepoRune（`main` branch，目前只有一條線性歷史，8 個
-commit，全部已 push，沒有未提交的變更）。
+**GitHub**：https://github.com/woodengrass/RepoRune（`main` branch，目前只有一條線性歷史，全部已
+push，沒有未提交的變更）。
 
 ## 必看的三份設計文件（優先順序：先讀這三份，再看程式碼）
 
@@ -204,11 +229,11 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 3. References / graph | ✅ 完成 | best-effort calls/extends/implements 解析 |
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
-| 6. Policies & Memory | 🚧 開工中 | Decision/Constraint/Note 生命週期、search（第一塊 current/visible 基礎已完成，見 IMPLEMENTATION_PLAN.md 第 93-94 條） |
+| 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**199 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**261 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）
@@ -226,10 +251,17 @@ src/rune/
 │  │  ├─ model.py            # Scope CRUD、import-only incremental membership assignment
 │  │  ├─ heuristics.py       # 路徑候選（一次性、非 canonical）
 │  │  └─ clustering.py       # SQLite edges -> NetworkX graph 候選（一次性、非 canonical）
-│  ├─ memory/                # Milestone 6，開工中
-│  │  └─ revisions.py        # current_revision()、is_decision_constraint_visible()、
-│  │                         # is_note_visible()——Decision/Constraint/Note 共用的
-│  │                         # current/visible 分離邏輯，其餘 M6 模組尚未實作
+│  ├─ memory/                 # Milestone 6，完成
+│  │  ├─ revisions.py         # current_revision()、is_decision_constraint_visible()、
+│  │  │                       # is_note_visible()——current/visible 分離邏輯
+│  │  ├─ hashes.py            # compute_source_hashes()/compute_scope_membership_hash()
+│  │  ├─ records.py           # 讀取 canonical 並依 id 取出 current revision 的共用邏輯
+│  │  ├─ proposals.py         # propose/approve/reject/deactivate（Decision/Constraint）
+│  │  ├─ notes.py             # note_add/note_update（無需核准）
+│  │  └─ staleness.py         # 存在性檢查 + snapshot 比對，純結構/hash，不呼叫 LLM
+│  ├─ retrieval/               # Milestone 6，完成
+│  │  ├─ search.py            # 八層排序 search，FTS5 查詢
+│  │  └─ check.py             # 變更檔案 -> 受影響 scope -> 相關 constraint
 │  ├─ semantic/
 │  │  ├─ provider.py         # ModelProvider protocol、OpenRouter/OpenAI/通用 httpx 實作
 │  │  ├─ redaction.py        # free-text 欄位 secret 遮蔽（結構化參照欄位不碰）
@@ -354,21 +386,21 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-**第十五輪確認的三層 provider 健康檢查 + `possibly_stale` 觸發邏輯已在第十六輪實作完成**
-（`check_semantic_health`、`ModelProvider.probe()`、`mark_possibly_stale`，見上方「第十六輪修訂」
-段落與 IMPLEMENTATION_PLAN.md 第 85-90 條）。**唯一還沒做的部分**：retrieval 端「`possibly_stale`/
-`stale` 不顯示舊摘要文字、改指向 `source_files`」的規則（第十五輪決議第 2 點）——這個屬於
-Milestone 6 的 retrieval 範圍，`mark_possibly_stale` 已經確保 `source_files` 欄位在每次觸發時都
-正確更新，Milestone 6 可以直接使用，不需要回頭修 Milestone 5 的程式碼。
+**Milestone 6（Policies & Memory）已全部完成**（見上方「第十九～二十一輪修訂」與
+IMPLEMENTATION_PLAN.md 第 95-106 條）：`core.memory.{revisions,hashes,proposals,notes,
+staleness}`、`core.retrieval.{search,check}`、FTS5 索引、CLI 子命令
+（`decision`/`constraint`/`note`/`proposal`/`search`/`check`）全部到位，包括第十五輪決議的
+「`possibly_stale`/`stale` 摘要不顯示舊文字」也已落地到 `rune search`。261 個測試全綠。
 
-**Milestone 6（Policies & Memory）已開工**：`rune.core.memory.revisions`（`current_revision()`、
-`is_decision_constraint_visible()`、`is_note_visible()`）已完成並鎖死關鍵回歸案例，見上方
-「第十八輪修訂」與 IMPLEMENTATION_PLAN.md 第 93-94 條。**下一塊**（跟使用者確認範圍/順序後再動手，
-不要自己選）：`rune.core.memory.{decisions,constraints,notes}` 的 CRUD/append 邏輯，接上
-`current_revision`/`is_*_visible` 做 SQLite materialize 投影；然後才是 proposal 流程
-（`decision_propose`/`constraint_propose`，核准 constraint 時依 `persistence_mode` 自動算好
-`source_hashes`/`scope_hashes`/`expires_at` snapshot，不是人類手動填）、staleness（`core.memory.
-staleness`，與 Milestone 5 的 semantic hash 規則分離，見 DATA_MODEL §6）、orphan 偵測、單一寫入者
-衝突偵測、FTS5、`rune search` 八層排序、`rune check`。retrieval 對 `possibly_stale`/`stale` 摘要的
-「不顯示舊內容、改指向 source_files」規則（第十五輪決議）也要在這個 milestone 落地。開工前重讀
-IMPLEMENTATION_PLAN.md 的 Milestone 6 整段（含驗收標準）與 DATA_MODEL.md §1、§2.5、§2.6、§3、§6。
+**Milestone 7（OpenCode Adapter）是下一步**：`adapters/opencode`（TypeScript）加上支援它的少量
+`rune.cli` 新增子命令（`--json` 輸出）。開工前重讀 IMPLEMENTATION_PLAN.md 的 Milestone 7 整段與
+ARCHITECTURE.md §6-7。**先做規格明講的小 spike，不要一次全量開發**：只驗證
+「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條最關鍵路徑能跑
+通，確認 tool context 能正確取得 `directory`/`worktree` 定位到正確的 `.rune/`。之後才是完整交付項目：
+`rune bootstrap --mode hard|soft --json`（`core.retrieval.context` 新增
+`build_hard_bootstrap_context()`/`build_soft_bootstrap_context()`，hard 輸出超出 budget 時
+`overflow=true`、絕不靜默丟棄 MUST 規則）、session-start/session-compaction hook、`tool.execute.
+before` 掛 constraint delivery（`bash` 指令的特殊處理：V1 不嘗試解析 shell 語意，改在
+`tool.execute.after` 用 git diff 事後偵測）、custom tool 註冊
+（`decision_propose`/`constraint_propose`/`note_add`，這些底層 core 函式 Milestone 6 已經做好，
+Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。
