@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第八輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第九輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -25,9 +25,14 @@ session 持久化，而不是先前版本宣稱的「只在 SQLite 投影中維�
 非原子寫入、redaction 未尊重設定開關且遺漏 `dependencies` 欄位、schema 驗證誤將不合法型別默默轉換、
 fallback model 產生內容被誤標為 primary、provider request 缺少 structured output 提示、prompt 缺少
 實際程式碼內容、六項 metrics 未持久化），細節見第 4.5 節與文末「第十三輪修訂」；`possibly_stale` 的
-觸發邏輯經使用者要求刻意不在本輪修，留待後續討論。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md`
-共同構成 Milestone 1 的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、
-staleness 語意或 agent-injection 語意的後續變更，仍必須重新提案並取得確認後才能實作。
+觸發邏輯經使用者要求刻意不在本輪修，留待後續討論。**第九輪是使用者轉述的第二份 Milestone 5 code
+review，5 條 finding 全部確認為真並修正**：SQLite cache 沒有 schema migration（舊版 memory.db
+會讓 materialize 持續 crash）、scope 刪除後重建同名 scope 永遠卡在 orphaned、`rune update` 的 CLI
+說明文字仍宣稱 zero LLM calls、`needs_refresh` 的 docstring 用詞不精確、`compute_source_files`
+的邊界案例澄清（不改變行為，只精確化文件措辭），細節見第 4.5 節與文末「第十四輪修訂」。本文件與
+`DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
+schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
+仍必須重新提案並取得確認後才能實作。
 
 ## 1. 目的與非目標
 
@@ -341,6 +346,45 @@ Semantic staleness 判斷完全基於 **member 檔案的 content hash**（見 DA
 enum 值從 Milestone 5 一開始就沒有任何觸發邏輯。使用者要求先記錄這個缺口、留到後續討論怎麼設計
 （例如「無 provider 時要不要附加一筆不需要呼叫 LLM 的 possibly_stale revision」），不要自己選一個
 方案動手。
+
+**第二輪品質複查（外部 review 轉述，本輪新增）修正的 5 個問題**：
+
+1. **SQLite cache 沒有 schema migration，舊版 memory.db 會讓 materialize crash**：`schema.sql`
+   全用 `CREATE TABLE IF NOT EXISTS`，任何既有表格新增欄位（例如本 milestone 的
+   `semantic_objects.current_revision`）都不會被套用到已存在的舊 memory.db——實測重現：手工造一個
+   缺 `current_revision` 欄位的舊 shape memory.db，只要 canonical 有真的 semantic 內容需要
+   materialize，`rune update`/`rebuild-cache` 就會丟出未攔截的
+   `OperationalError: no such column: current_revision`，且會**持續**發生，先前唯一解法是手動刪除
+   `.rune/cache/`。修法：新增 `CACHE_SCHEMA_VERSION` 常數（與 `schema_versions.
+   CURRENT_SCHEMA_VERSION` 是兩個獨立概念——後者管的是 canonical JSONL/JSON 每筆紀錄自己的
+   `schema_version` 欄位，前者管的是 SQLite 衍生 cache 本身的表格形狀），`rebuild_cache` 開始時比對
+   `schema_meta.schema_version` 是否等於這個常數，不符（含全新／古老到連 `schema_meta` 表都沒有的
+   檔案）就直接關閉連線、砍掉 `memory.db`（含 `-wal`/`-shm` 側車檔）再重開——這正是
+   `rune rebuild-cache` 本來就承諾「隨時可安全丟棄重建」的同一套動作，只是自動觸發，不需要人類自己
+   知道要去刪檔案。
+2. **Scope 被刪除後重建同名 scope，會永遠卡在 orphaned 出不來**：`orphaned` revision 完整複製前一筆
+   的 `source_hash`；scope 被刪除又用完全相同的 member 檔案重建時，`needs_refresh` 拿新算出來的
+   hash 跟 orphaned revision 裡的舊 hash 比對，兩者相等就回傳 `False`——即使這時候 provider 完全
+   可用，也永遠不會再嘗試刷新，`current` 停在 `orphaned`（依 Decision/Constraint 既有的可見性規則，
+   `orphaned` 預設不可見）——已實測重現 `needs_refresh` 回傳 `False`。修法：`needs_refresh` 的
+   「無條件視為需要刷新」判斷從只看 `unavailable` 擴大為 `unavailable` 或 `orphaned`——scope
+   重新出現這件事本身就是觸發條件，不該還要等 hash 不一致。
+3. **`rune update` 的 CLI 說明文字仍寫「Zero LLM calls」**：Milestone 5 之後，`rune update`
+   正是會呼叫 LLM 的指令（`rebuild-cache` 才是零 LLM），這句話已經失真。已更新說明文字，明確區分
+   兩個指令：`update` 在有設定 `semantic` 時會呼叫 LLM，`rebuild-cache` 永遠不會。
+4. **`needs_refresh` 的 docstring 用詞不精確**：原本寫「repeating that bounded attempt on the next
+   rune update is intentional」，容易讀成「失敗的 scope 下次一定會重試」，但實際上失敗 revision會把
+   `source_hash` 更新為**目前**的值，只要內容沒有再變，下次比對 hash 相等就不會重試，要等內容再變
+   才會觸發——這是符合 DATA_MODEL §2.4 revision 表的既有行為，不是 bug，只是文件說法不夠精確。已
+   重寫 docstring，明確說明「重試由 source_hash 比對驅動，不是狀態本身」，並點出 `orphaned`
+   （見上第 2 點）是唯一「重新出現本身就是觸發條件、不看 hash」的例外。
+5. **`compute_source_files` 對已刪除/無法解析的 member 靜默略過，可能讓非空 scope 產出空
+   `source_files`**：DATA_MODEL §2.4 原本的措辭「`source_files={}` 只有在 scope 完全沒有 member
+   時才合法」，字面上跟一個「members 非空、但每個 member 現在都指向不存在的檔案」的 scope 矛盾——
+   已實測重現這個情況確實會發生。評估後**不改變行為**：這種情況下確實沒有真實內容可以雜湊，`{}`
+   如實反映現況，且仍正確參與 staleness 判斷（下次真的有 member 存在時會自我修復）；只把
+   DATA_MODEL §2.4 的措辭澄清為「沒有任何 member 貢獻出真實檔案」，不是字面上的「members 列表是
+   空的」，並在 `compute_source_files` 的 docstring 裡明講這個邊界案例與判斷理由，供未來覆查對照。
 
 ### 4.6 Memory（`core.memory`）— Decision / Constraint / Note 的生命週期
 

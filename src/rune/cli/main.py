@@ -179,8 +179,10 @@ def status(
 def update(
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
-    """Incrementally rescan changed files and refresh the cache. Zero LLM
-    calls; only files whose content hash changed are re-parsed."""
+    """Incrementally rescan changed files and refresh the cache; only files
+    whose content hash changed are re-parsed. If `semantic` is configured
+    in config.toml, this is also the command that calls the LLM to refresh
+    stale scope summaries -- unlike `rebuild-cache`, which never does."""
     path = path or Path.cwd()
     try:
         layout = _require_layout(path)

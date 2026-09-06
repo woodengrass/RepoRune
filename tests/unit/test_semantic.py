@@ -358,6 +358,23 @@ def test_needs_refresh_true_when_status_unavailable_even_if_hash_matches() -> No
     assert needs_refresh(current, "sha256:x") is True
 
 
+def test_needs_refresh_true_when_status_orphaned_even_if_hash_matches() -> None:
+    """Regression test: a scope deleted and then recreated with
+    byte-identical member files used to stay stuck `orphaned` forever --
+    the orphaned revision's source_hash equals the freshly recomputed one
+    (nothing about the content changed), and orphaned wasn't in the
+    "always retry" set alongside `unavailable`, so it was invisible to
+    retrieval (Decision/Constraint's existing orphaned semantics) with no
+    way back even with a provider ready to regenerate it. Reproduced by
+    hand before this fix.
+    """
+    current = ScopeSummary(
+        scope_id="s", revision=2, purpose="old purpose", generated_at="2026-01-01T00:00:00Z",
+        model="m", source_hash="sha256:x", status=SemanticStatus.orphaned,
+    )
+    assert needs_refresh(current, "sha256:x") is True
+
+
 def test_needs_refresh_false_when_fresh_and_hash_matches() -> None:
     current = ScopeSummary(
         scope_id="s", revision=1, purpose="p", generated_at="2026-01-01T00:00:00Z",

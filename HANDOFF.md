@@ -63,6 +63,26 @@ DATA_MODEL.md §2.4/§5）**。9 條直接修，1 條依使用者要求記錄但
 「意外觸發」semantic refresh 的路徑被關掉了；8 個全新測試），每個都驗證過修法前確實會失敗。
 173 個測試全綠，`ruff check` 全綠。
 
+**使用者又轉述第二份針對 Milestone 5 的 code review，5 條 finding，逐條重現後全部確認為真並修正
+（第十四輪修訂，見 IMPLEMENTATION_PLAN.md 第 77-81 條）**：
+- **中·SQLite cache 沒有 schema migration，舊版 memory.db 會讓 materialize 持續 crash**：
+  `schema.sql` 全用 `CREATE TABLE IF NOT EXISTS`，新增欄位（例如 M5 的 `current_revision`）不會
+  套用到已存在的舊 memory.db——實測重現一支手工造的舊 shape memory.db 確實讓 `rune update` 丟出
+  `OperationalError: no such column`，且持續發生。新增 `CACHE_SCHEMA_VERSION` 機制，`rebuild_cache`
+  偵測到 `schema_meta` 版本不符就自動丟棄整個 memory.db 重建（跟 `rune rebuild-cache` 本來就承諾的
+  「隨時可安全丟棄重建」是同一套邏輯，只是自動觸發）。
+- **中·Scope 被刪除後重建同名 scope，永遠卡在 orphaned 出不來**：`needs_refresh` 原本只把
+  `unavailable` 視為無條件需要刷新，沒把 `orphaned` 算進去——重建的 scope 若 member 檔案完全沒變，
+  hash 比對會相等，永遠不會再嘗試刷新。已實測重現、已修正（`orphaned` 現在跟 `unavailable` 一樣
+  無條件觸發刷新）。
+- **低（純文件修正，行為本來就正確）**：`rune update` 的 CLI 說明文字仍寫「Zero LLM calls」（M5 後
+  它正是會呼叫 LLM 的指令）；`needs_refresh` 的 docstring 用詞容易誤導成「失敗一定會重試」，實際上
+  由 source_hash 比對驅動；`compute_source_files` 對已刪除 member 靜默略過可能讓非空 scope 產出空
+  `source_files`，評估後判斷這是正確行為（如實反映現況、仍正確參與 staleness 判斷），只澄清
+  DATA_MODEL.md 的措辭。
+
+175 個測試全綠，`ruff check` 全綠。
+
 **Milestone 6（Policies & Memory）是下一步。**
 
 ## 專案是什麼
@@ -144,7 +164,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**173 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**175 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

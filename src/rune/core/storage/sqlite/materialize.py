@@ -80,6 +80,56 @@ def create_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_schema_sql_text())
 
 
+# Bumped whenever schema.sql's table *shapes* change in a way `CREATE
+# TABLE IF NOT EXISTS` can't self-heal on an already-existing memory.db —
+# a new column on an existing table, a changed column type, a new NOT
+# NULL constraint, etc. (adding a brand new table doesn't need a bump:
+# IF NOT EXISTS already handles that fine either way). Distinct from
+# schema_versions.CURRENT_SCHEMA_VERSION, which is about canonical JSONL/
+# JSON records' own `schema_version` field — an orthogonal concern from
+# the derived SQLite cache's table shapes.
+#
+# Confirmed by hand this gap was real: an old memory.db predating
+# Milestone 5 (semantic_objects without the current_revision column this
+# milestone added) crashed every subsequent `rune update`/`rebuild-cache`
+# with an unhandled `OperationalError: no such column: current_revision`
+# — the only "fix" was manually deleting `.rune/cache/`. `_ensure_
+# compatible_cache_schema` below makes that automatic: memory.db is
+# always fully derived from canonical (ARCHITECTURE.md invariant #1), so
+# a version mismatch is handled the exact same safe way `rune
+# rebuild-cache` already promises — discard and rebuild fresh — just
+# triggered without the user needing to know to do it themselves.
+CACHE_SCHEMA_VERSION = 2
+
+
+def _discard_cache_file(db_path: Path) -> None:
+    for suffix in ("", "-wal", "-shm"):
+        (db_path.parent / (db_path.name + suffix)).unlink(missing_ok=True)
+
+
+def _ensure_compatible_cache_schema(
+    layout: RuneLayout, conn: sqlite3.Connection
+) -> sqlite3.Connection:
+    """Returns a connection guaranteed to be on a fresh (or already
+    matching) schema — discarding and recreating memory.db first if the
+    on-disk `schema_meta.schema_version` doesn't match `CACHE_SCHEMA_
+    VERSION` (including a pre-schema_meta-table memory.db, treated the
+    same as any other incompatible shape).
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        stored_version = int(row[0]) if row is not None else None
+    except sqlite3.OperationalError:
+        stored_version = None
+    if stored_version == CACHE_SCHEMA_VERSION:
+        return conn
+    conn.close()
+    _discard_cache_file(layout.memory_db)
+    return connect(layout.memory_db)
+
+
 def _group_current_by_id(
     records: list[MemoryRevision] | list[Note] | list[Proposal] | list[ScopeSummary],
     id_field: str,
@@ -558,6 +608,7 @@ def rebuild_cache(
     """
     code_index = code_index if code_index is not None else CodeIndexData()
     conn = connect(layout.memory_db)
+    conn = _ensure_compatible_cache_schema(layout, conn)
     try:
         create_schema(conn)
 
@@ -587,7 +638,8 @@ def rebuild_cache(
         _materialize_semantic(conn, semantic)
         _materialize_semantic_run_metrics(conn, semantic_run_metrics)
         conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', '1')"
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+            (str(CACHE_SCHEMA_VERSION),),
         )
         conn.commit()
     except BaseException:

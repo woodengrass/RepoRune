@@ -408,3 +408,80 @@ def test_reader_sees_consistent_snapshot_during_rebuild(git_repo: Path) -> None:
     ).fetchall()
     fresh.close()
     assert fresh_read == [("d1",), ("d2",)]
+
+
+def test_rebuild_cache_self_heals_an_old_shape_memory_db(git_repo: Path) -> None:
+    """Regression test: a memory.db built before Milestone 5 added
+    `current_revision` to `semantic_objects` used to crash every
+    subsequent `rebuild_cache` call with `OperationalError: no such
+    column: current_revision` the moment there was any real semantic.jsonl
+    content to materialize -- the only "fix" was manually deleting
+    `.rune/cache/`. Reproduced by hand before this fix by hand-crafting an
+    old-shape memory.db (schema_version=1, semantic_objects without the
+    column) with a matching canonical scope + semantic summary, then
+    calling rebuild_cache. memory.db is always fully derived from
+    canonical (ARCHITECTURE.md invariant #1), so the fix makes
+    rebuild_cache detect the schema_meta version mismatch and discard the
+    incompatible file itself, rather than requiring a human to know to
+    delete it.
+    """
+    from rune.core.storage.models import ScopeSummary
+
+    layout = init_project(git_repo)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app.py"])),
+        ]),
+    )
+    append_jsonl(
+        layout.semantic_jsonl,
+        ScopeSummary(
+            scope_id="app", revision=1, purpose="old purpose",
+            generated_at="2026-01-01T00:00:00Z", model="m", source_hash="sha256:x",
+        ),
+    )
+
+    layout.memory_db.parent.mkdir(parents=True, exist_ok=True)
+    old_conn = sqlite3.connect(str(layout.memory_db))
+    old_conn.execute("PRAGMA foreign_keys=ON")
+    old_conn.executescript(
+        """
+        CREATE TABLE files (path TEXT PRIMARY KEY, language TEXT, content_hash TEXT,
+            size INTEGER, mtime REAL, git_blob_hash TEXT, indexed_at TEXT, status TEXT DEFAULT 'ok');
+        CREATE TABLE symbols (symbol_id TEXT PRIMARY KEY, file TEXT, name TEXT,
+            qualified_name TEXT, kind TEXT, signature TEXT, start_line INTEGER, end_line INTEGER);
+        CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, source_symbol TEXT,
+            source_file TEXT, target_symbol TEXT, target_file TEXT, edge_type TEXT, confidence REAL);
+        CREATE TABLE scopes (id TEXT PRIMARY KEY, name TEXT, description TEXT DEFAULT '',
+            locked INTEGER DEFAULT 0, source TEXT);
+        CREATE TABLE scope_files (scope_id TEXT, file TEXT, PRIMARY KEY (scope_id, file));
+        CREATE TABLE scope_symbols (scope_id TEXT, symbol_id TEXT, PRIMARY KEY (scope_id, symbol_id));
+        CREATE TABLE semantic_objects (scope_id TEXT PRIMARY KEY REFERENCES scopes(id)
+            ON DELETE CASCADE, purpose TEXT NOT NULL, payload_json TEXT NOT NULL,
+            generated_at TEXT NOT NULL, model TEXT NOT NULL, source_hash TEXT NOT NULL,
+            status TEXT NOT NULL, last_error TEXT);
+        CREATE TABLE decision_records (record_id TEXT PRIMARY KEY, current_revision INTEGER);
+        CREATE TABLE constraint_records (record_id TEXT PRIMARY KEY, current_revision INTEGER);
+        CREATE TABLE note_records (id TEXT PRIMARY KEY, current_revision INTEGER);
+        CREATE TABLE pending_proposals (proposal_id TEXT PRIMARY KEY, current_revision INTEGER,
+            type TEXT, record_id TEXT, payload_json TEXT, status TEXT, created_by TEXT,
+            created_at TEXT, resolved_at TEXT, resolved_by TEXT);
+        CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+        """
+    )
+    old_conn.execute("INSERT INTO schema_meta VALUES ('schema_version', '1')")
+    old_conn.commit()
+    old_conn.close()
+
+    stats = rebuild_cache(layout, code_index=CodeIndexData())  # must not raise
+
+    assert stats["semantic_summaries"] == 1
+    conn = sqlite3.connect(str(layout.memory_db))
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(semantic_objects)")]
+    assert "current_revision" in columns
+    row = conn.execute(
+        "SELECT current_revision, purpose FROM semantic_objects WHERE scope_id = 'app'"
+    ).fetchone()
+    assert row == (1, "old purpose")

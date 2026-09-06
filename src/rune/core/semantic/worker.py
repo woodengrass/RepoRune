@@ -65,6 +65,22 @@ def compute_source_files(
     """DATA_MODEL.md §2.4 invariant: `source_files` = `scope.members.files`
     unioned with the owning file of every `scope.members.symbols` entry,
     even when `members.files` itself is empty.
+
+    Silently drops a member path/symbol that no longer resolves to a
+    real, currently-indexed file (deleted file, unparseable symbol) --
+    DATA_MODEL.md §2.4 as written says `source_files == {}` is only valid
+    for a scope with zero members, which is technically not true here: a
+    scope whose *only* member was deleted still ends up with `{}` even
+    though `scope.members` itself is non-empty. Deliberate, not patched:
+    there is no real content left to hash for a vanished member, so an
+    empty `source_files` is an accurate (if edge-case) report of "nothing
+    exists to summarize right now" rather than a bug to paper over, and
+    it still participates correctly in staleness detection (an empty-hash
+    result differs from whatever the last real hash was, so `needs_refresh`
+    still fires once this actually happens, and self-heals if the member
+    reappears later). Flagged in review; DATA_MODEL.md's wording should be
+    read as "no members ever contributed a real file", not literally "the
+    members list is empty".
     """
     paths = set(scope.members.files)
     for symbol_id in scope.members.symbols:
@@ -76,18 +92,34 @@ def compute_source_files(
 
 def needs_refresh(current: ScopeSummary | None, source_hash: str) -> bool:
     """A scope needs a refresh attempt this run when there's no current
-    summary at all, the last attempt never succeeded (`unavailable`), or
-    the member files have changed since the current summary was produced.
-    Deliberately does NOT special-case a `stale` status with an unchanged
-    hash into "skip forever until content changes" -- a `stale` revision
-    can also mean "the last refresh attempt failed transiently", and this
-    project's fallback policy already caps the cost of retrying within one
-    attempt (primary -> repair retry -> fallback -> stop); repeating that
-    bounded attempt on the next `rune update` is intentional, not a bug.
+    summary at all, the last attempt never succeeded (`unavailable`), the
+    scope was previously orphaned and has reappeared (`orphaned`), or the
+    member files have changed since the current summary was produced.
+
+    For every other status (`fresh`/`possibly_stale`/`stale`), retrying is
+    driven *only* by the source_hash comparison, not by status alone --
+    including `stale`, which does NOT get special-cased into "always retry
+    regardless of hash". This matters because a failed refresh's revision
+    (DATA_MODEL.md §2.4's failure-revision rule) updates `source_hash` to
+    the *current* value even though nothing new was actually generated --
+    so a `stale` scope whose content hasn't changed again since that
+    failure will keep comparing equal here and will NOT be retried on the
+    next `rune update`, only once its source_hash changes again. The
+    fallback policy's bounded retry ladder (primary -> repair retry ->
+    fallback -> stop) only bounds the cost of *one* refresh attempt; it
+    does not by itself guarantee every subsequent `rune update` re-attempts
+    a still-failing scope -- that only happens when there's also a new
+    hash to react to. `orphaned` is the one status where reappearing (not
+    a hash change) is exactly the trigger: a scope can be deleted and
+    recreated with byte-identical member files, which would otherwise
+    compare hash-equal to the orphaned revision and stay stuck orphaned
+    (and thus excluded from retrieval, per Decision/Constraint's existing
+    orphaned semantics) forever, even with a provider available and ready
+    to regenerate it.
     """
     if current is None:
         return True
-    if current.status is SemanticStatus.unavailable:
+    if current.status in (SemanticStatus.unavailable, SemanticStatus.orphaned):
         return True
     return current.source_hash != source_hash
 

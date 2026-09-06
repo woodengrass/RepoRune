@@ -1,6 +1,6 @@
 # RepoRune（rune）— 資料模型
 
-狀態：**已確認（第七輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
+狀態：**已確認（第八輪修訂）**。第二輪修正了 revision lifecycle 的一個根本性 bug（current 與 visible
 必須分離）、補上 `source_bound`/`scope_bound`/`temporary` Constraint 實際可實作所需的 snapshot 欄位、
 補上 Note 的 revision 機制、以及 ScopeSummary `source_files` 的推導 invariant。第三輪修正
 `created_by` 的型別（改為 `RevisionAuthor` enum，解決與「系統自動附加 revision」的矛盾）、補上
@@ -22,7 +22,10 @@ current revision 的完整內容、只改動 status/last_error（首次生成就
 `SemanticStatus` 新增 `orphaned`（scope 被刪除時的既有 summary 處理，完全比照 Decision/Constraint
 既有的 orphaned 語意，修正刪除 scope 會讓後續 materialize 直接因 FK violation crash 的 bug）；SQLite
 新增不受「清空重建」影響的 `semantic_run_metrics` 表，持久化 ARCHITECTURE.md §4.5 的六項 run-level
-指標。詳見 §2.4、§5。這是 Milestone 1–6/7 實作時遵循的契約。
+指標。詳見 §2.4、§5。**第八輪是使用者轉述的第二份 Milestone 5 code review**：新增
+`CACHE_SCHEMA_VERSION` 機制讓舊 shape 的 memory.db 自動被丟棄重建（§5）；`needs_refresh` 對
+`orphaned` 的處理修正、§2.4 的 `source_files={}` 措辭澄清（不改變行為，只精確化文件表達）。這是
+Milestone 1–6/7 實作時遵循的契約。
 
 ## 1. 慣例
 
@@ -217,6 +220,15 @@ symbol 的 owning file（透過 SQLite `symbols.file`）並納入，例如：
 ```
 `source_files = {}` 只有在 scope 完全沒有 member 時才合法；`core.semantic.worker` 在組 prompt 與計算
 `source_hash` 前，必須先呼叫這條解析邏輯，不能只看 `scope.members.files`。
+
+**用詞澄清（品質複查發現的措辭歧義，本輪修正）**：上面這句話容易被字面解讀成「`members.files`/
+`members.symbols` 都是空的才合法」，但 `compute_source_files` 的實際行為（也是刻意如此）是：一個
+member 路徑/symbol 如果已經不再解析到目前真的被索引的檔案（檔案被刪除、symbol 解析失敗），會被靜默
+跳過——所以一個 scope 即使 `members` 本身非空，只要**沒有任何一個 member 目前真的對應到存在的檔案**，
+`source_files` 一樣會是 `{}`。正確的讀法是「沒有任何 member 貢獻出真實檔案」，不是字面上的
+「members 列表是空的」。這不是 bug：這種情況下確實沒有真實內容可以雜湊，`{}` 如實反映「目前沒有東西
+可以摘要」，且仍正確參與 staleness 判斷（跟上一次的真實 hash 不同，`needs_refresh` 照樣會觸發，
+member 之後恢復存在時也會自我修復）。
 
 **失敗時的 revision 語意（本輪新增）**：
 
@@ -495,6 +507,16 @@ CREATE TABLE schema_meta (
     value TEXT NOT NULL
 ); -- 例如：('schema_version','1')、('materialized_from_head','<sha>')
    --      ('materialized_from_tree_hash','<hash>')、('materialized_at','<iso>')
+   -- 本輪修正：`schema_version` 這個 key 先前只是寫死的裝飾用途，從未被讀回比對，
+   -- 導致舊 shape 的 memory.db（例如缺少本 milestone 新增的 semantic_objects.
+   -- current_revision 欄位）會讓 materialize 直接因 SQLite OperationalError crash，
+   -- 且會持續發生（已實測重現）。`rebuild_cache` 現在會在開始時比對這個值是否等於
+   -- `materialize.py` 的 `CACHE_SCHEMA_VERSION` 常數，不符（含缺這個 key 的任何舊
+   -- 檔案）就直接丟棄整個 memory.db（含 -wal/-shm）重建——memory.db 本來就是完全
+   -- 衍生的資料，這正是「隨時可安全丟棄重建」原則的自動化版本，不需要人類自己知道
+   -- 要去刪 `.rune/cache/`。`CACHE_SCHEMA_VERSION` 與本節開頭提到的 canonical
+   -- `schema_version`（每筆 JSONL/JSON 紀錄自己的欄位）是兩個獨立概念，不要混淆：
+   -- 前者管 SQLite 衍生 cache 的表格形狀，後者管 canonical 紀錄格式本身。
 
 -- 決定性程式碼索引
 CREATE TABLE files (

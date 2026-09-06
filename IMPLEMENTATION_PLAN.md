@@ -1,6 +1,6 @@
 # RepoRune（rune）— 實作計畫
 
-狀態：**已確認（第十三輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
+狀態：**已確認（第十四輪修訂）**（V1 設計）。第六輪是外部 code review 對已完成的 Milestone 1 程式碼
 做的落差修正（config 驗證、git 驗證、atomic write、model 邊界、FK/併發設計），細節見文末「第六輪
 修訂」。第七輪是 Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節（候選 scope 是否
 持久化、clustering 建議的訊號來源、incremental 自動併入的信心判準）取得確認，細節見文末「第七輪
@@ -22,7 +22,10 @@ validation,redaction}` 完整實作、接線進 `rune update`（`rebuild_cache` 
 刷新時 canonical 非原子寫入、redaction 未尊重設定且遺漏 `dependencies`、schema 驗證誤將不合法型別
 默默轉換、fallback model 產生內容被誤標、provider request 缺 structured output 提示、prompt 缺
 實際程式碼、六項 metrics 未持久化），記錄 1 個待討論（provider 不可用時 `possibly_stale` 的觸發
-邏輯），細節見文末「第十三輪修訂」與 ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4、§5。將規格
+邏輯），細節見文末「第十三輪修訂」與 ARCHITECTURE.md §4.5、DATA_MODEL.md §2.4、§5。**第十四輪是
+使用者轉述的第二份 Milestone 5 code review，5 條 finding 全部修正**（SQLite cache 沒有 schema
+migration、scope 刪除重建卡在 orphaned、CLI 說明文字過時、docstring 用詞不精確、`compute_
+source_files` 邊界案例文件澄清），細節見文末「第十四輪修訂」。將規格
 §70-77 展開為具體交付項目、模組目標與各 Milestone
 的驗收標準。本文件末尾的「設計決策記錄」列出各輪討論中對開放問題與 bug 的最終決定，供後續實作與
 audit 對照。第四輪已對照 OpenCode 官方 plugin 文件確認 Milestone 7 的核心假設成立（`tool.execute.
@@ -348,10 +351,11 @@ edge；incremental 自動併入只認 import edge 且僅限單一候選，其餘
 
 ## Milestone 5 — Semantic worker
 
-**目前狀態：已實作並通過測試，並經兩輪品質複查修正共 12 個問題**（`src/rune/core/semantic/
-{provider,worker,validation,redaction}.py`，173 個測試全綠，`ruff check` 全綠）。細節、真實 API
+**目前狀態：已實作並通過測試，並經三輪品質複查共修正 17 個問題**（`src/rune/core/semantic/
+{provider,worker,validation,redaction}.py`，175 個測試全綠，`ruff check` 全綠）。細節、真實 API
 驗證結果與已知未完成項見文末「第十一輪實作記錄」（初版實作）、「第十二輪修訂」（自我複查修正 3 個
-metrics/prompt 邏輯問題）、「第十三輪修訂」（使用者轉述 10 條 finding，修正 9 個、記錄 1 個待討論）。
+metrics/prompt 邏輯問題）、「第十三輪修訂」（使用者轉述 10 條 finding，修正 9 個、記錄 1 個待討論）、
+「第十四輪修訂」（使用者轉述第二份 code review，5 條 finding 全部修正）。
 
 **模組**：`rune.core.semantic.{provider,worker,validation,redaction}`。
 
@@ -1237,3 +1241,54 @@ finding 先重現，不能看描述就信」逐條寫最小重現腳本驗證後
 新增 12 個回歸測試（4 個既有測試從 `full=True` 改為 `full=False`、8 個全新測試，橫跨
 `tests/integration/test_update_flow.py` 與 `tests/unit/test_semantic.py`），每個都用 `git stash`
 （或直接對照修法前後行為）驗證過修法前確實會失敗。173 個測試全綠，`ruff check` 全綠。
+
+### 第十四輪修訂（使用者轉述第二份 Milestone 5 code review，5 條 finding 全部修正）
+
+同一批 Milestone 5 又收到一份新的 code review，5 條全部先重現再修，全部確認為真，沒有誤報。
+
+77. **中：SQLite cache 沒有 schema migration，舊版 memory.db 會讓 materialize 持續 crash**：
+    `schema.sql` 全用 `CREATE TABLE IF NOT EXISTS`，任何既有表格新增欄位（例如第 59-76 條剛加的
+    `semantic_objects.current_revision`）都不會套用到已存在的舊 memory.db 上。實測重現：手工建一個
+    缺 `current_revision` 欄位、`schema_meta.schema_version='1'` 的舊 shape memory.db，配上真的
+    canonical 內容（一個 scope + 一筆 semantic summary），跑 `rune update`/`rebuild-cache` 直接丟出
+    未攔截的 `OperationalError: no such column: current_revision`，且會**持續**發生在往後每一次
+    呼叫，先前唯一解法是手動刪除 `.rune/cache/`。修法：`materialize.py` 新增 `CACHE_SCHEMA_VERSION`
+    常數（跟 `schema_versions.CURRENT_SCHEMA_VERSION` 是兩個獨立概念，後者管 canonical 紀錄的
+    `schema_version` 欄位，前者管 SQLite 衍生 cache 的表格形狀）；`rebuild_cache` 一開始比對
+    `schema_meta.schema_version` 是否等於這個常數，不符（含連 `schema_meta` 表都沒有的任何舊檔案）
+    就關閉連線、砍掉 `memory.db`（含 `-wal`/`-shm` 側車檔）重開——這正是 `rune rebuild-cache` 本來就
+    承諾「隨時可安全丟棄重建」的同一套動作，自動觸發、不需要人類自己知道要去刪檔案。新增
+    `test_rebuild_cache_self_heals_an_old_shape_memory_db`（`tests/unit/test_materialize.py`），
+    修法前確認會失敗（同樣的 `OperationalError`）。
+78. **中：Scope 被刪除後重建同名 scope，永遠卡在 orphaned 出不來**：`orphaned` revision 完整複製
+    前一筆的 `source_hash`；scope 被刪除又用完全相同的 member 檔案重建時，`needs_refresh` 拿新算
+    出來的 hash 跟 orphaned revision 裡的舊 hash 比對，兩者相等就回傳 `False`——即使這時候 provider
+    完全可用，也永遠不會再嘗試刷新，`current` 停在 `orphaned`（依 Decision/Constraint 既有的可見性
+    規則，`orphaned` 預設不可見）。實測重現：`needs_refresh(orphaned_revision, 相同的
+    source_hash)` 確實回傳 `False`。修法：`needs_refresh` 的「無條件視為需要刷新」判斷從只看
+    `unavailable` 擴大為 `unavailable` 或 `orphaned`——scope 重新出現這件事本身就是觸發條件，不該
+    還要等 hash 不一致。新增 `test_needs_refresh_true_when_status_orphaned_even_if_hash_matches`，
+    修法前確認會失敗。
+79. **低：`rune update` 的 CLI 說明文字仍寫「Zero LLM calls」**：Milestone 5 之後，`rune update`
+    正是會呼叫 LLM 的指令（`rebuild-cache` 才是零 LLM），這句話已經失真，容易誤導使用者以為
+    `rune update` 也不花錢/不連網路。已更新說明文字，明確區分兩個指令：`update` 在有設定
+    `semantic` 時會呼叫 LLM，`rebuild-cache` 永遠不會。純文件修正，不影響行為，不需要新測試。
+80. **低：`needs_refresh` 的 docstring 用詞不精確**：原本寫「repeating that bounded attempt on the
+    next rune update is intentional」，容易被讀成「失敗的 scope 下次一定會重試」，但實際上失敗
+    revision 會把 `source_hash` 更新為**目前**的值（DATA_MODEL §2.4 的既有 revision 表就是這樣定義
+    的），只要內容沒有再變，下次比對 hash 相等就不會重試，要等內容再變才會觸發——這是符合既有規則的
+    行為，不是 bug，只是文件說法不夠精確，會誤導未來的人以為系統會無條件重試。已重寫 docstring，
+    明確說明「重試由 source_hash 比對驅動，不是狀態本身」，並點出 `orphaned`（見第 78 條）是唯一
+    「重新出現本身就是觸發條件、不看 hash」的例外。純文件修正。
+81. **低：`compute_source_files` 對已刪除/無法解析的 member 靜默略過，可能讓非空 scope 產出空
+    `source_files`**：DATA_MODEL §2.4 原本的措辭「`source_files={}` 只有在 scope 完全沒有 member
+    時才合法」，字面上跟「members 非空、但每個 member 現在都指向不存在的檔案」這種情況矛盾——實測
+    重現這個情況確實會發生（`compute_source_files` 對一個有 member 但檔案已刪除的 scope 回傳
+    `{}`）。評估後**不改變行為**：這種情況下確實沒有真實內容可以雜湊，`{}` 如實反映現況，且仍正確
+    參與 staleness 判斷（下次真的有 member 存在時會自我修復，不會卡住）；只把 DATA_MODEL §2.4 的
+    措辭澄清為「沒有任何 member 貢獻出真實檔案」，不是字面上的「members 列表是空的」，並在
+    `compute_source_files` 的 docstring 裡明講這個邊界案例與判斷理由。純文件修正，不需要新測試
+    （行為本來就正確，只是文件講得不夠精確）。
+
+新增 2 個回歸測試（第 77、78 條），皆用 `git stash` 驗證過修法前確實會失敗；其餘 3 條純屬文件精確化，
+不涉及行為變更。175 個測試全綠，`ruff check` 全綠。
