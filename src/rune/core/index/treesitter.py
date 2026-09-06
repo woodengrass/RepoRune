@@ -90,26 +90,42 @@ class PythonParserAdapter:
         symbols: list[Symbol],
     ) -> None:
         for child in node.children:
-            if child.type == "class_definition":
-                name = child.child_by_field_name("name").text.decode("utf-8")
+            # `@decorator\ndef foo(): ...` / `@decorator\nclass Foo: ...`
+            # wraps the real function_definition/class_definition inside a
+            # decorated_definition node — unwrap it so decorated symbols
+            # (very common: @staticmethod, @property, @dataclass, route
+            # decorators, pytest fixtures, ...) aren't silently skipped.
+            # The decorator line(s) count as part of the symbol's range.
+            range_node = child
+            target = child
+            if child.type == "decorated_definition":
+                inner = child.child_by_field_name("definition")
+                if inner is None:
+                    continue
+                target = inner
+
+            if target.type == "class_definition":
+                name = target.child_by_field_name("name").text.decode("utf-8")
                 qualified_name = ".".join([*scope, name])
                 symbols.append(
-                    self._make_symbol(path, name, qualified_name, SymbolKind.class_, child, source)
+                    self._make_symbol(
+                        path, name, qualified_name, SymbolKind.class_, target, source, range_node
+                    )
                 )
-                body = child.child_by_field_name("body")
+                body = target.child_by_field_name("body")
                 if body is not None:
                     self._walk(body, path, source, [*scope, name], symbols)
-            elif child.type == "function_definition":
-                name = child.child_by_field_name("name").text.decode("utf-8")
+            elif target.type == "function_definition":
+                name = target.child_by_field_name("name").text.decode("utf-8")
                 qualified_name = ".".join([*scope, name])
                 kind = SymbolKind.method if scope else SymbolKind.function
                 symbols.append(
-                    self._make_symbol(path, name, qualified_name, kind, child, source)
+                    self._make_symbol(path, name, qualified_name, kind, target, source, range_node)
                 )
                 # V1 does not descend into function bodies: nested defs/
                 # classes local to a function are out of scope.
-            elif not scope and child.type == "expression_statement":
-                self._maybe_module_variable(child, path, symbols)
+            elif not scope and target.type == "expression_statement":
+                self._maybe_module_variable(target, path, symbols)
 
     def _make_symbol(
         self,
@@ -119,7 +135,9 @@ class PythonParserAdapter:
         kind: SymbolKind,
         node: Node,
         source: bytes,
+        range_node: Node | None = None,
     ) -> Symbol:
+        range_node = range_node or node
         return Symbol(
             symbol_id=symbol_id(path, qualified_name, kind),
             file=path,
@@ -127,8 +145,8 @@ class PythonParserAdapter:
             qualified_name=qualified_name,
             kind=kind,
             signature=_header_text(node, source),
-            start_line=node.start_point[0] + 1,
-            end_line=node.end_point[0] + 1,
+            start_line=range_node.start_point[0] + 1,
+            end_line=range_node.end_point[0] + 1,
         )
 
     def _maybe_module_variable(
@@ -263,7 +281,10 @@ class _JsFamilyParserAdapter:
                         end_line=child.end_point[0] + 1,
                     )
                 )
-            elif child.type == "lexical_declaration" and not scope:
+            elif child.type in ("lexical_declaration", "variable_declaration") and not scope:
+                # `variable_declaration` is `var ...` (its own node type,
+                # distinct from `let`/`const`'s `lexical_declaration`) —
+                # both need the same variable/constant extraction.
                 self._maybe_module_variable(child, path, symbols)
             else:
                 self._walk(child, path, source, scope, symbols)

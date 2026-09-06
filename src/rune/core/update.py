@@ -79,6 +79,15 @@ def _parse_file(
     """Parses one file. A parse failure marks that file `parse_error` and
     yields no symbols/edges for it — it must never abort the whole update
     (spec §62's failure-isolation principle, applied here to indexing).
+
+    Catches `Exception` broadly and deliberately: tree-sitter's grammars
+    are error-tolerant for genuinely malformed source (they produce ERROR/
+    partial nodes rather than raising), but a file that is unreadable in
+    some unexpected way, or an AST shape our walkers don't defensively
+    guard against (e.g. a `MISSING` node tree-sitter synthesizes during
+    error recovery, which can leave an expected field `None`), must still
+    degrade to "this one file didn't index" rather than take the whole
+    `rune update` down.
     """
     try:
         source = scanned.absolute_path.read_bytes()
@@ -86,7 +95,7 @@ def _parse_file(
         symbols = adapter.extract_symbols(scanned.path, source)
         raw_imports = adapter.extract_imports(scanned.path, source)
         edges = build_import_edges(repo_root, scanned.path, scanned.language, raw_imports)
-    except (OSError, ValueError, UnicodeDecodeError):
+    except Exception:  # noqa: BLE001 - intentional: isolate one file's parse failure
         return [], [], IndexedFileStatus.parse_error
     return symbols, edges, IndexedFileStatus.ok
 

@@ -26,6 +26,40 @@ variable_x = compute()
 """
 
 
+def test_python_extracts_decorated_methods_and_classes() -> None:
+    """Regression test: @staticmethod/@property/@dataclass etc. wrap the
+    real function_definition/class_definition inside a decorated_definition
+    node in tree-sitter-python. An earlier version of the walker only
+    matched bare function_definition/class_definition children, silently
+    skipping every decorated symbol -- which in real Python code (routes,
+    properties, dataclasses, fixtures) is most of them.
+    """
+    source = b"""
+class Foo:
+    @staticmethod
+    def bar():
+        pass
+
+    @property
+    def baz(self):
+        return 1
+
+@dataclass
+class Config:
+    pass
+"""
+    adapter = PythonParserAdapter()
+    symbols = adapter.extract_symbols("a.py", source)
+    by_qname = {s.qualified_name: s for s in symbols}
+
+    assert by_qname["Foo.bar"].kind == SymbolKind.method
+    assert by_qname["Foo.baz"].kind == SymbolKind.method
+    assert by_qname["Config"].kind == SymbolKind.class_
+    # the decorator line counts as part of the symbol's range
+    assert by_qname["Foo.bar"].start_line == 3  # the @staticmethod line
+    assert by_qname["Config"].start_line == 11  # the @dataclass line
+
+
 def test_python_extracts_module_class_method_function_and_variables() -> None:
     adapter = PythonParserAdapter()
     symbols = adapter.extract_symbols("app/service.py", PY_SOURCE)
@@ -92,6 +126,32 @@ let mutableVal = 1;
     assert by_qname["helper"].kind == SymbolKind.function  # arrow fn, not a plain variable
     assert by_qname["CONST_VAL"].kind == SymbolKind.constant
     assert by_qname["mutableVal"].kind == SymbolKind.variable
+
+
+def test_javascript_extracts_var_declarations_too() -> None:
+    """Regression test: `var x = 1` parses as a `variable_declaration`
+    node, a different type than `let`/`const`'s `lexical_declaration` --
+    an earlier version only matched `lexical_declaration` and silently
+    dropped every `var` at module level.
+    """
+    adapter = JavaScriptParserAdapter()
+    symbols = adapter.extract_symbols("a.js", b"var oldStyle = 1;\n")
+    by_qname = {s.qualified_name: s for s in symbols}
+    assert by_qname["oldStyle"].kind == SymbolKind.variable
+
+
+def test_javascript_extracts_export_default_class_and_function() -> None:
+    source = b"""
+export default class DefaultExport {
+  render() {}
+}
+export default function defaultFn() {}
+"""
+    adapter = JavaScriptParserAdapter()
+    symbols = adapter.extract_symbols("a.js", source)
+    by_qname = {s.qualified_name: s for s in symbols}
+    assert by_qname["DefaultExport"].kind == SymbolKind.class_
+    assert by_qname["defaultFn"].kind == SymbolKind.function
 
 
 def test_javascript_extracts_import_and_require_specifiers() -> None:

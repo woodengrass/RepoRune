@@ -18,9 +18,15 @@ from rune.core.hashing import content_hash_of_file, git_blob_hash
 from rune.core.storage.models import IndexConfig
 
 # Directories never worth descending into regardless of config — walking
-# them is either pointless (VCS internals) or pathologically expensive
-# (dependency trees). Configurable excludes still apply on top of this.
-_ALWAYS_PRUNED_DIR_NAMES = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv"})
+# them is either pointless (VCS internals, rune's own state) or
+# pathologically expensive (dependency trees). Configurable excludes still
+# apply on top of this. `.rune` covers more than the default config's
+# `.rune/cache/**` exclude (which a user could edit away) — nothing under
+# rune's own directory should ever be treated as project source, at any
+# depth, regardless of config.
+_ALWAYS_PRUNED_DIR_NAMES = frozenset(
+    {".git", ".rune", "node_modules", "__pycache__", ".venv", "venv"}
+)
 
 LANGUAGE_BY_EXTENSION = {
     ".py": "python",

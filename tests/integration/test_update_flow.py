@@ -163,3 +163,58 @@ def test_rebuild_cache_full_rescan_matches_incremental_state(python_simple_repo:
     conn = sqlite3.connect(str(layout.memory_db))
     qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
     assert "UserService.get_user" in qnames
+
+
+def test_one_file_parse_failure_does_not_abort_the_whole_update(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """spec §62's failure-isolation principle applied to indexing: a
+    single file that can't be parsed must not take down the rest of the
+    update. Simulated here by making the parser adapter raise for exactly
+    one file, since tree-sitter's own error tolerance makes a *naturally*
+    crash-inducing source hard to construct reliably.
+
+    Patches at the `get_parser_adapter` layer (not `_parse_file` itself)
+    so the real `_parse_file`'s try/except -- the actual isolation logic
+    under test -- stays in the call path. An earlier draft of this test
+    replaced `_parse_file` wholesale, which silently discarded the very
+    guard it was meant to verify and would have passed even if that guard
+    were deleted.
+    """
+    import rune.core.update as update_module
+    from rune.core.index.treesitter import PythonParserAdapter
+
+    layout = init_project(python_simple_repo)
+    real_adapter = PythonParserAdapter()
+
+    class FlakyAdapter:
+        def extract_symbols(self, path: str, source: bytes) -> list:
+            if path.endswith("services.py"):
+                raise RuntimeError("simulated parser crash")
+            return real_adapter.extract_symbols(path, source)
+
+        def extract_imports(self, path: str, source: bytes) -> list:
+            if path.endswith("services.py"):
+                raise RuntimeError("simulated parser crash")
+            return real_adapter.extract_imports(path, source)
+
+    monkeypatch.setattr(
+        update_module, "get_parser_adapter", lambda language, path="": FlakyAdapter()
+    )
+
+    stats = run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    status = conn.execute(
+        "SELECT status FROM files WHERE path = ?", ("app/services.py",)
+    ).fetchone()[0]
+    assert status == "parse_error"
+    # the other two files were still indexed normally
+    other_statuses = {
+        row[0]
+        for row in conn.execute(
+            "SELECT status FROM files WHERE path != ?", ("app/services.py",)
+        )
+    }
+    assert other_statuses == {"ok"}
+    assert stats["files"] == 3

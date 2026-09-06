@@ -105,7 +105,7 @@ Global Code Standards 支援欄位）。經過兩輪實測（第一輪自測、�
 
 ## Milestone 2 — Code index
 
-**目前狀態：已實作並通過測試**（`src/rune/core/index/`、`src/rune/core/update.py`，74 個測試全綠，
+**目前狀態：已實作並通過測試**（`src/rune/core/index/`、`src/rune/core/update.py`，78 個測試全綠，
 `ruff check` 全綠，含兩個 fixture repo：`tests/integration/fixtures/{python-simple,ts-simple}`）。
 `rune rebuild-cache` 這次也改為真的做全量重新掃描＋解析（而不再只是「code index 保持空」的
 Milestone 1 占位行為）——因為 files/symbols/edges 完全從原始碼推導、沒有 canonical 檔案背書，
@@ -114,6 +114,28 @@ Milestone 1 占位行為）——因為 files/symbols/edges 完全從原始碼�
 改變的檔案會被重新丟進 tree-sitter，其餘檔案直接沿用 SQLite 裡既有的 symbols/edges。兩者共用同一個
 `core.update.run_update(layout, full=...)` 進入點與同一個 `materialize.rebuild_cache` 交易邏輯，只
 差在 `code_index` 的算法（全量 vs. diff-and-reuse）。
+
+**完成後自我複查發現並修正 4 個問題**（實際跑 tree-sitter AST dump 找出來的，不是紙上推演）：
+1. **Python 裝飾器被完全漏掉**：`@staticmethod`/`@property`/`@dataclass` 等會把真正的
+   `function_definition`/`class_definition` 包在一層 `decorated_definition` 節點裡，原本的
+   walker 只匹配裸的 `function_definition`/`class_definition`，導致任何有裝飾器的函式/類別（真實
+   Python 程式碼裡佔絕大多數：route handler、property、dataclass、pytest fixture 等）完全沒被索引
+   到。已修正為在 walker 裡先偵測並解開 `decorated_definition`，並讓 symbol 的行號範圍包含裝飾器行。
+2. **`var` 宣告被漏掉**：`var x = 1` 的 node type 是 `variable_declaration`，跟 `let`/`const` 的
+   `lexical_declaration` 是不同的 node type，原本只檢查後者。已修正為兩者都處理。
+3. **單一檔案解析失敗的隔離有漏洞**：原本的 `except (OSError, ValueError, UnicodeDecodeError)` 涵蓋
+   不到 tree-sitter 在 error-recovery 情境下可能產生的 `MISSING` 節點（預期欄位被合成為 `None`，
+   接著呼叫 `.text` 會丟 `AttributeError`），這種例外不在原本捕捉範圍內，理論上會讓整次
+   `rune update` 崩潰——直接違反規格 §62「單一檔案解析失敗不應讓整次 update 失敗」的要求。已改為
+   有意識地捕捉廣義 `Exception`（並加註解說明為何這裡的寬鬆捕捉是刻意的，不是隨手 catch-all）。
+4. **`.rune/` 目錄沒有完整排除在掃描之外**：預設 exclude 只有 `.rune/cache/**`，`.rune/` 底下其他
+   位置若意外放了 `.py`/`.ts`/`.js` 檔案會被當成專案原始碼索引。已把 `.rune` 加進掃描器的
+   `_ALWAYS_PRUNED_DIR_NAMES`（與 `.git` 同等級的強制排除，不受使用者 config 影響）。
+
+補上對應的 4 個回歸測試（含一個「測試本身寫錯層級、驗證了不存在的東西」而修正的案例——第一版
+parse-failure-isolation 測試直接替換整個 `_parse_file`，結果連同它想驗證的 try/except 保護一起替換
+掉了，測試在保護邏輯被刪除的情況下也會通過；修正後改成只替換 `get_parser_adapter`，讓真正的
+`_parse_file` try/except 留在呼叫路徑上）。
 
 **模組**：`rune.core.index.scanner`、`rune.core.index.treesitter`、`rune.core.index.imports`、
 `rune.core.update`。
