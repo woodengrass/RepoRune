@@ -4,17 +4,21 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第五輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第六輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
-clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。**第五輪新增
-Global Code Standards / Hard Policy Injection 語意（新第 7 節）**：Global MUST Constraint 的定義、
+clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
+Global Code Standards / Hard Policy Injection 語意（新第 7 節）：Global MUST Constraint 的定義、
 Hard/Soft Bootstrap 的區分與各自的注入時機（`session.created`/`session.compacted`）、token
 budget 的 overflow-not-truncate 規則——這是 agent-injection semantics 的正式組成部分，不是附加
-功能，所有後續章節編號因此從第 7 節起整體後移一位（原第 7-12 節現為第 8-13 節）。本文件與
-`DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
-schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
-仍必須重新提案並取得確認後才能實作。
+功能，所有後續章節編號因此從第 7 節起整體後移一位（原第 7-12 節現為第 8-13 節）。**第六輪在
+Milestone 4（Scopes）開工前，針對規格中未鎖死的三個實作細節取得確認並補上第 4.4 節對應段落**：
+scope 候選（heuristic/clustering）不持久化、純一次性 CLI 互動；clustering 候選建議可同時使用
+import 與 best-effort reference edge（因為一定經人類確認，不牴觸 §4.3 的治理層信任原則）；新檔案
+incremental 自動併入既有 scope 只認 import edge 且僅限單一候選（無人把關的寫入路徑，必須用
+high-confidence 訊號）。本文件與 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1
+的實作基準。任何會改變 canonical schema、scope model、Decision/Constraint 語意、staleness 語意或
+agent-injection 語意的後續變更，仍必須重新提案並取得確認後才能實作。
 
 ## 1. 目的與非目標
 
@@ -205,6 +209,33 @@ case）。所有 edge 都帶 confidence 分數（規格 §7）。**Scope／Const
 detection）的參數不在架構/設計階段鎖死，而是留到 Milestone 4 用真實中型 repo 實測、觀察 candidate
 scope 是否「像人會畫的架構邊界」，再調整——這是刻意不在設計文件中過度規格化的部分，因為它本質上是
 經驗性問題，不是邏輯正確性問題。
+
+**Milestone 4 開工前確認的三個設計決策（本輪新增，2026-09-06 討論確認）**：
+
+1. **候選 scope（heuristic + clustering）不持久化，純粹是一次性 CLI 互動**：`rune scope suggest`
+   當場重新計算候選、當場印出、當場人類 y/n，不落地成任何新的 canonical 檔案（不新增
+   `scope_candidates.jsonl` 之類的東西）。這與 Decision/Constraint 的 `proposals.jsonl`
+   刻意不同——後者需要撐過重開機／cache 刪除，因為「已核准內容尚待確認」本身就是需要持久化的治理狀態；
+   而 scope 候選在人類確認前只是「一次可低成本重算的建議」，跟 code index（files/symbols/edges）沒有
+   canonical 背書、每次重新從原始碼推導的精神一致——關掉終端候選就消失，下次跑 `rune scope suggest`
+   重新算一次即可，不需要為此另外設計一套持久化格式與 CLI 子命令。
+2. **Clustering 候選建議可以同時使用 import 與 best-effort reference edge 做圖聚類**：這**不違反**
+   §4.3「Scope/Constraint 系統不得把 reference graph 當唯一依據」的原則——那條原則管的是**治理系統**
+   （Decision/Constraint 的 membership 判斷、無人把關的自動寫入），而 clustering 候選建議本身**一定**
+   要經人類確認才會寫進 `scopes.json`（見下方 CLI 流程），human review 本身就是對 reference 解析
+   不完美的天然防線。只用 import edge 會讓 clustering 建議少掉「同檔案沒有 import 但透過繼承/呼叫
+   高度耦合」這種真實存在的架構邊界訊號，reference 解析不完美的代價是「建議品質變差」，不是「系統做出
+   未經確認的錯誤決策」，可接受。
+3. **新檔案的 incremental 自動併入只認 import edge，且只在單一候選時才自動寫入**：`rune update` 對
+   一個新檔案，若透過 `edge_type=imports`（`confidence=1.0`）**恰好**命中一個現有、非 `locked` 的
+   scope 成員，直接把該檔案自動加進該 scope 的 `members.files`，不需要人類確認——這被視為「維護既有
+   scope 的完整性」而非「建立新的治理判斷」。以下情況一律落回人類確認的 CLI 流程，不自動寫入：
+   零個候選 scope、多個候選 scope（模糊）、只有 best-effort reference edge 命中（沒有 import edge）、
+   目標 scope 是 `locked`、任何會移除既有 membership 的動作、任何會建立新 scope 的動作。這個判準刻意
+   比 clustering 建議嚴格：clustering 建議永遠有人類把關，但 incremental 自動併入是**無人把關的寫入
+   路徑**，因此只能用 §4.3 明定的 high-confidence 訊號（import edge），不能讓 best-effort reference
+   的不確定性滲透進一個沒有人類審查的自動寫入動作。`locked` scope 永遠不受任何形式（clustering
+   建議或 incremental 自動併入）影響，這是既有規則的延伸適用，不是新規則。
 
 ### 4.5 Semantic Worker（`core.semantic`）
 針對過期／缺漏的 scope summary，用該 scope 的成員檔案／symbol 組 prompt，呼叫設定的 `ModelProvider` 取得
