@@ -59,6 +59,19 @@ def test_load_config_bad_field_type_raises(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_load_config_rejects_non_positive_note_ttl(tmp_path: Path) -> None:
+    """A relayed review confirmed by hand: `temporary_context_ttl_days =
+    -1` was silently accepted -- a Note in that category would expire at
+    (or before) the moment it's created.
+    """
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "[notes]\ntemporary_context_ttl_days = -1\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_load_config_rejects_unknown_top_level_field(tmp_path: Path) -> None:
     """A typo'd or stray top-level key must be a loud error, not silently
     ignored — otherwise a misspelled config section (e.g. `[rune]` instead

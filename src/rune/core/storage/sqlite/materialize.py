@@ -92,23 +92,44 @@ def connect(db_path: Path) -> sqlite3.Connection:
 def connect_for_read(layout: RuneLayout) -> sqlite3.Connection:
     """Read-only-in-spirit connection for `rune search`/`rune check`
     (readers never write to `memory.db`): opens the file and confirms
-    it's actually a usable rune cache before handing it back, rather than
-    letting a 0-byte or truncated file surface a raw `sqlite3.
-    OperationalError` traceback the first time a query touches a missing
-    table. Raises `CacheUnusableError` (not the underlying sqlite3
-    exception) so callers can give the user an actionable message instead
-    of a stack trace.
+    it's actually a usable, **current-shape** rune cache before handing
+    it back, rather than letting a 0-byte/truncated file, or an
+    old-shape one, surface a raw `sqlite3.OperationalError` traceback the
+    first time a query touches a missing table/column. Raises
+    `CacheUnusableError` (not the underlying sqlite3 exception) so
+    callers can give the user an actionable message instead of a stack
+    trace.
+
+    Checking `schema_meta.schema_version` merely being *queryable* isn't
+    enough on its own -- confirmed by hand: an old-shape cache (its
+    `schema_version` row still says the *previous* `CACHE_SCHEMA_VERSION`,
+    e.g. right after upgrading `rune` itself, before the next write
+    triggers `rebuild_cache`'s own self-heal via `_ensure_compatible_
+    cache_schema`) passes that check fine and then crashes on the first
+    query touching a column/table that only exists in the newer shape
+    (e.g. `fts_decisions.revision`, added when this round's `--history`
+    fix bumped 2->3). This function is read-only, so it can't self-heal
+    by discarding the file the way the writer path does -- it just
+    reports the mismatch clearly instead of crashing on a raw sqlite3
+    error, and points at `rune rebuild-cache` to fix it.
     """
     conn = sqlite3.connect(str(layout.memory_db))
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+        stored_version = int(row[0]) if row is not None else None
     except sqlite3.DatabaseError as exc:
         conn.close()
         raise CacheUnusableError(
             f"{layout.memory_db} exists but isn't a usable cache ({exc}). "
             "Run `rune rebuild-cache` to regenerate it."
         ) from exc
+    if stored_version != CACHE_SCHEMA_VERSION:
+        conn.close()
+        raise CacheUnusableError(
+            f"{layout.memory_db} is an old-shape cache (schema_version={stored_version!r}, "
+            f"expected {CACHE_SCHEMA_VERSION}). Run `rune rebuild-cache` to regenerate it."
+        )
     return conn
 
 

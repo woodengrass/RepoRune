@@ -178,7 +178,22 @@ binding/TTL/metadata（中，補上對應可選參數）、`note_add()` 對不�
 原子性、`rune check` 顯示已知 status 而非預測值、`--history` 名稱與行為並無不符、FTS 索引不含
 結構化 metadata 欄位）評估後判定為既有設計邊界，向使用者說明理由而非直接動手，細節見
 IMPLEMENTATION_PLAN.md。新增 8 個 regression test，每條都用 `git stash` 確認修法前真的會失敗。
-**286 個測試全綠，`ruff check` 全綠。**
+286 個測試全綠，`ruff check` 全綠。
+
+**第二十四輪修訂：使用者第三次轉述外部 review，8 條 finding，全部重現後確認為真並修正**（見
+IMPLEMENTATION_PLAN.md 第 121-128 條，這輪沒有需要另外確認設計的項目）。`refresh_cache()` 在
+`memory.db` 不存在時會用空 code index 建出一個具誤導性的「存在但是空」的 cache，讓 `rune check`
+把完全沒改動的檔案誤報為變更（中，改成直接 no-op）；舊版 schema 的 cache 通過
+`connect_for_read()` 後，`search`/`check` 仍會原始 crash——`connect_for_read` 先前只確認
+`schema_meta` 可查詢，沒有比對 `CACHE_SCHEMA_VERSION`（中，補上版本比對）；`_refresh_cache()`
+失敗時 canonical 已寫成功但 CLI 印出原始 traceback（中低，六個相關指令都補上明確錯誤訊息）；
+崩潰復原後重跑 `approve()` 不冪等會附加重複內容（低，比對即將寫入的內容與現有 current revision
+是否完全相符，相符就視為同一次重試不重複寫入）；`search --json` 缺 `revision` 欄位、
+`NotesConfig` TTL 沒有正值驗證、`proposal edit --critical` 用在 constraint 被靜默接受（
+`constraint_revisions` 表根本沒有這欄位）、CLI `note update` 沒暴露 core 新增的
+scopes/files/symbols/importance/confidence/expires_at 參數（以上四條皆低，都已修正）。新增 12
+個 regression test，每條都先寫重現腳本、實際看到問題發生才動手修。**295 個測試全綠，
+`ruff check` 全綠。**
 
 ## 專案是什麼
 
@@ -259,7 +274,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 7. OpenCode Adapter | ❌ 未開始 | hard/soft bootstrap 注入 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
-**286 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
+**295 個測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的失敗
 測試或已知會崩潰的路徑殘留。
 
 ## 程式碼結構（`src/rune/`）

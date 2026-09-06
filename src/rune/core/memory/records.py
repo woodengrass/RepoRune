@@ -105,5 +105,19 @@ def refresh_cache(layout: RuneLayout) -> None:
     next successful `rune update`/`rebuild-cache` -- consistent with
     every other place in this project where the derived cache is allowed
     to lag behind canonical without corrupting anything.
+
+    A no-op when `memory.db` doesn't exist yet at all: `read_current_
+    code_index` returns an empty `CodeIndexData` in that case, and
+    calling `rebuild_cache` with that would *create* a cache whose
+    `files` table is empty -- confirmed by hand this actively misleads
+    `rune check`/`rune status`, which read "the files table is empty" as
+    "nothing has ever been indexed" and so treat every file as newly
+    added/changed, not as "cache absent, nothing to compare against". A
+    project that hasn't run `rune init`/`rune update` yet has no code
+    index to preserve, so there's nothing for this "lightweight" refresh
+    to safely do -- the canonical write already succeeded regardless, and
+    the first real `rune update` will materialize everything properly.
     """
+    if not layout.memory_db.exists():
+        return
     rebuild_cache(layout, code_index=read_current_code_index(layout))

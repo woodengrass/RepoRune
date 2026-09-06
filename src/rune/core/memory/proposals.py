@@ -58,7 +58,21 @@ def _validate_payload_shape(
     severity: Severity | None,
     persistence_mode: PersistenceMode | None,
     expires_at: str | None,
+    critical: bool = False,
+    machine_check_hint: str | None = None,
 ) -> None:
+    """`critical` (DATA_MODEL.md §2.5: "Decision-only convention... marks
+    this Decision as eligible for hard bootstrap") and `machine_check_hint`
+    ("Constraint-only convention") are each meaningful for exactly one
+    `type` -- `decision_revisions`/`constraint_revisions` only project the
+    column each one actually needs (confirmed by hand: setting
+    `critical=True` on a constraint payload used to be accepted silently,
+    written into `constraints.jsonl`, and then simply had nowhere to go
+    once materialized, since `constraint_revisions` has no `critical`
+    column at all -- a canonical/derived-cache mismatch with no error at
+    any point). Rejected outright now, same as the existing severity/
+    persistence_mode/expires_at type-mismatch checks below.
+    """
     if record_type is RecordType.decision:
         if severity is not None or persistence_mode is not None:
             raise ProposalValidationError(
@@ -66,6 +80,8 @@ def _validate_payload_shape(
             )
         if expires_at is not None:
             raise ProposalValidationError("a decision must not set expires_at")
+        if machine_check_hint is not None:
+            raise ProposalValidationError("a decision must not set machine_check_hint -- constraint-only")
         return
     if severity is None or persistence_mode is None:
         raise ProposalValidationError(
@@ -79,6 +95,8 @@ def _validate_payload_shape(
             "expires_at is only valid for persistence_mode=temporary "
             f"(got persistence_mode={persistence_mode.value})"
         )
+    if critical:
+        raise ProposalValidationError("a constraint must not set critical -- decision-only")
 
 
 def propose(
@@ -106,7 +124,7 @@ def propose(
     instead of silently sitting in the pending queue until someone tries
     (and fails) to approve it.
     """
-    _validate_payload_shape(type, severity, persistence_mode, expires_at)
+    _validate_payload_shape(type, severity, persistence_mode, expires_at, critical, machine_check_hint)
     now = utc_now_iso()
     payload = MemoryRevision(
         record_id=record_id,
@@ -166,11 +184,29 @@ def get_current_proposal(layout: RuneLayout, proposal_id: str) -> Proposal:
     return proposal
 
 
-def _next_record_revision(layout: RuneLayout, record_type: RecordType, record_id: str) -> int:
+def _current_record_revision(
+    layout: RuneLayout, record_type: RecordType, record_id: str
+) -> MemoryRevision | None:
     path = layout.decisions_jsonl if record_type is RecordType.decision else layout.constraints_jsonl
     existing = [r for r in read_jsonl(path, MemoryRevision) if r.record_id == record_id]
-    current = current_by_record_id(existing)
-    return current[record_id].revision + 1 if record_id in current else 1
+    return current_by_record_id(existing).get(record_id)
+
+
+def _next_record_revision(layout: RuneLayout, record_type: RecordType, record_id: str) -> int:
+    current = _current_record_revision(layout, record_type, record_id)
+    return current.revision + 1 if current is not None else 1
+
+
+# Fields that fully determine "the content this approval would write",
+# excluding `revision`/`created_at` (which differ on every attempt by
+# construction) -- used by `approve()`'s retry-after-crash idempotency
+# check below.
+_APPROVAL_CONTENT_FIELDS = (
+    "content", "rationale", "scopes", "files", "symbols", "severity",
+    "persistence_mode", "expires_at", "critical", "source_document",
+    "source_section", "machine_check_hint", "source_hashes", "scope_hashes",
+    "created_by", "approved_by", "status",
+)
 
 
 def approve(
@@ -220,7 +256,10 @@ def approve(
                 f"edited_payload.type ({edited_payload.type.value!r}) must match "
                 f"the proposal's own type ({proposal.type.value!r})"
             )
-    _validate_payload_shape(payload.type, payload.severity, payload.persistence_mode, payload.expires_at)
+    _validate_payload_shape(
+        payload.type, payload.severity, payload.persistence_mode, payload.expires_at,
+        payload.critical, payload.machine_check_hint,
+    )
 
     now = utc_now_iso()
     source_hashes: dict[str, str] = {}
@@ -269,7 +308,8 @@ def approve(
                 sid: compute_scope_membership_hash(scope_by_id[sid]) for sid in payload.scopes
             }
 
-    next_revision = _next_record_revision(layout, payload.type, payload.record_id)
+    current_before = _current_record_revision(layout, payload.type, payload.record_id)
+    next_revision = (current_before.revision + 1) if current_before is not None else 1
     created_by = (
         RevisionAuthor.human
         if edited_payload is not None
@@ -287,6 +327,49 @@ def approve(
         }
     )
 
+    # Retry-after-crash idempotency: if the memory revision write already
+    # succeeded on a previous attempt at approving *this exact proposal*
+    # (the proposal itself is still `pending` here, which is only
+    # possible if the process died between the two writes below -- see
+    # the write-order comment), re-approving would otherwise append a
+    # second, duplicate revision with identical content. Confirmed by
+    # hand: simulating that crash and then re-running `approve()` on the
+    # still-pending proposal produced two revisions with the same
+    # content, one right after the other. Detected here by comparing
+    # every approval-derived field of the revision this call *would*
+    # write against the record's actual current revision (excluding
+    # `revision`/`created_at`, which legitimately differ by construction
+    # on every attempt) -- an exact match on all of them is essentially
+    # only possible when this is that same retry, not two independent
+    # approvals that coincidentally produced byte-identical content
+    # across every field including `approved_by`.
+    if current_before is not None and all(
+        getattr(current_before, field) == getattr(new_memory_revision, field)
+        for field in _APPROVAL_CONTENT_FIELDS
+    ):
+        new_memory_revision = current_before
+    else:
+        target_path = (
+            layout.decisions_jsonl if payload.type is RecordType.decision else layout.constraints_jsonl
+        )
+        # Write the authoritative content first, the proposal's
+        # resolution second. These are two separate canonical files --
+        # each individual append is atomic (canonical.append_jsonl's
+        # temp-file+rename), but nothing makes the *pair* atomic, so a
+        # crash between them is possible. This order picks the less-bad
+        # failure mode: if the process dies after this line but before
+        # the next, decisions.jsonl/constraints.jsonl already has the
+        # real content and the proposal merely still shows `pending` --
+        # visible and recoverable (re-running `rune proposal approve`
+        # finds it still pending and, per the idempotency check above,
+        # won't duplicate the content; a human still sees the stuck
+        # proposal in the meantime). The reverse order risks the
+        # opposite: a proposal that says `approved` while the content it
+        # supposedly approved was never actually written anywhere -- a
+        # silent loss that looks resolved and gives no signal anything
+        # is wrong.
+        append_jsonl(target_path, new_memory_revision)
+
     resolved_proposal = proposal.model_copy(
         update={
             "revision": proposal.revision + 1,
@@ -296,23 +379,6 @@ def approve(
             "resolved_by": resolved_by,
         }
     )
-    # Write the authoritative content first, the proposal's resolution
-    # second. These are two separate canonical files -- each individual
-    # append is atomic (canonical.append_jsonl's temp-file+rename), but
-    # nothing makes the *pair* atomic, so a crash between them is
-    # possible. This order picks the less-bad failure mode: if the
-    # process dies after this line but before the next, decisions.jsonl/
-    # constraints.jsonl already has the real content and the proposal
-    # merely still shows `pending` -- visible and recoverable (re-running
-    # `rune proposal approve` finds it still pending; a human notices the
-    # stuck proposal). The reverse order risks the opposite: a proposal
-    # that says `approved` while the content it supposedly approved was
-    # never actually written anywhere -- a silent loss that looks
-    # resolved and gives no signal anything is wrong.
-    target_path = (
-        layout.decisions_jsonl if payload.type is RecordType.decision else layout.constraints_jsonl
-    )
-    append_jsonl(target_path, new_memory_revision)
     append_jsonl(layout.proposals_jsonl, resolved_proposal)
     _refresh_cache(layout)
     return resolved_proposal, new_memory_revision

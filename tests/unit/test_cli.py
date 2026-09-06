@@ -188,3 +188,46 @@ def test_scope_suggest_before_cache_exists_fails_cleanly(git_repo: Path) -> None
     assert not layout.memory_db.exists()  # no stray file left behind
     assert RuneLayout(git_repo).rune_dir.exists()  # sanity: didn't touch anything else
     assert load_scopes(RuneLayout(git_repo)).scopes == []
+
+
+def test_search_json_output_includes_revision_field(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: `rune search --json` omitted
+    the `revision` field SearchResult gained for the --history fix,
+    leaving a machine consumer with no way to tell which revision a
+    `superseded` hit came from.
+    """
+    import json as json_module
+
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    runner.invoke(
+        app, ["decision", "propose", "d1", "--content", "use postgresql", "--path", str(git_repo)]
+    )
+    proposals = runner.invoke(app, ["proposal", "list", "--path", str(git_repo)]).output
+    proposal_id = proposals.split()[0]
+    runner.invoke(app, ["proposal", "approve", proposal_id, "--by", "alice", "--path", str(git_repo)])
+
+    result = runner.invoke(app, ["search", "postgresql", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert len(payload) == 1
+    assert payload[0]["revision"] == 1
+
+
+def test_note_update_cli_exposes_scopes_files_symbols_and_expiry(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: `rune note update` didn't expose
+    the scopes/files/symbols/importance/confidence/expires_at options
+    core.memory.notes.note_update() already supported.
+    """
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    add_output = runner.invoke(
+        app, ["note", "add", "--category", "pitfall", "--content", "c", "--why-persist", "w",
+              "--path", str(git_repo)]
+    ).output
+    note_id = add_output.split()[2]
+
+    result = runner.invoke(
+        app, ["note", "update", note_id, "--importance", "0.9", "--expires-at",
+              "2099-01-01T00:00:00Z", "--path", str(git_repo)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "rev2" in result.output

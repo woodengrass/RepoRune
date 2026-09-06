@@ -1723,3 +1723,70 @@ snapshot（107）、Note TTL 死代碼（108）、`--history` 找不到舊 revis
 `test_memory_notes.py` +5，其中 `note_update` 相關 3 個）。每條都先用 `git stash` 只還原
 `check.py`/`proposals.py`/`records.py`/`notes.py` 這四個檔案，確認新測試在修法前真的會失敗
 （`ImportError`、`DID NOT RAISE`、找不到結果），才視為有效。286 個測試全綠，`ruff check` 全綠。
+
+### 第二十四輪修訂（使用者第三次轉述外部 code review，8 條 finding，逐條重現後全部確認為真並修正）
+
+這輪 8 條全部先寫重現腳本確認問題存在，沒有標記「設計確認」的項目——都是直接違反已確認設計/文件或
+明顯的實作缺陷，不需要重新討論設計本身。
+
+121. **中·`refresh_cache()` 在 `memory.db` 不存在時用空 code index 重建，製造出一個具誤導性的
+    「存在但是空的」cache**：從未跑過 `rune init`/`rune update` 的專案直接呼叫 `note_add()`，
+    `refresh_cache()` 會用空的 `CodeIndexData` 呼叫 `rebuild_cache`，建出一個 `files` 表是空的
+    `memory.db`——`rune check`/`rune status` 讀到「`files` 表是空的」時，解讀成「所有檔案都是新增
+    /變更」而非「根本沒有 cache，沒東西可以比對」。實測重現：`check()` 對完全沒改動過的 `a.py`
+    誤報為 `changed_files`。修法：`refresh_cache()` 在 `memory.db` 不存在時直接跳過（no-op）——
+    專案還沒有任何 code index 可以保留，這個「輕量」refresh 沒有安全的事可做，canonical 寫入本身
+    已經成功，第一次真正的 `rune update` 會正確地把一切都材質化好。
+122. **中·舊版 schema 的 cache 通過 `connect_for_read()` 後，`rune search`/`rune check` 仍會原始
+    crash**：`connect_for_read()` 先前只確認 `schema_meta.schema_version` 這個欄位「可以查詢」，
+    沒有拿它去跟 `CACHE_SCHEMA_VERSION` 比對——這個比對只有寫入路徑的 `_ensure_compatible_cache_
+    schema` 在做。實測重現：手動把 `schema_meta` 的版本改回舊值、把 `fts_decisions` 改回舊的
+    2-欄位形狀（模擬工具升級後、下次寫入觸發 self-heal 之前的窗口），`search()` 直接丟出
+    `OperationalError: no such column: f.revision`，沒有被 `connect_for_read` 攔下來。修法：
+    `connect_for_read()` 額外比對 `stored_version != CACHE_SCHEMA_VERSION`，不符就拋
+    `CacheUnusableError`（讀取路徑沒辦法像寫入路徑一樣自動丟棄重建，只能明確告訴使用者跑
+    `rune rebuild-cache`）。
+123. **中低·`_refresh_cache()` 失敗時，canonical 已寫成功但 CLI 拋原始 traceback**：
+    `note_add_cmd`/`note_update_cmd`/`decision_deactivate`/`constraint_deactivate`/
+    `proposal_approve`/`proposal_edit` 這六個 CLI 指令的 `except` 子句都沒有涵蓋
+    `CanonicalConflictError`（`_refresh_cache()` 內部 `rebuild_cache()` 在偵測到*其他*canonical
+    檔案有衝突時會拋出）。實測重現：先核准一個正常的 decision，再手動在 `decisions.jsonl` 塞入一組
+    無關的重複 revision 製造衝突，接著跑 `constraint deactivate`——這次要寫入的內容本身已經成功寫進
+    canonical，CLI 卻印出完整 Python traceback，使用者看不出「這次操作到底成功了沒」。修法：新增
+    `_handle_cache_refresh_failure()`，六個指令都在 `except CanonicalConflictError` 印出明確訊息
+    （「這次寫入本身成功了，但 cache 沒能刷新」）並指向 `rune rebuild-cache`，不是原始 traceback。
+124. **低·崩潰復原後重跑 `approve()` 不冪等，會附加重複內容**：第二十二輪的寫入順序調整（先寫
+    `decisions.jsonl`/`constraints.jsonl`、再寫 `proposals.jsonl`）解決了「靜默遺失」，但沒解決
+    「重跑會不會重複」——實測重現：模擬 `proposals.jsonl` 那次寫入失敗，proposal 仍是 `pending`
+    但 decision 內容已經寫入；重新呼叫 `approve()` 卻又附加了一筆內容完全相同的 rev2。修法：
+    `approve()` 寫入新 revision 之前，先比對「即將寫入的內容」與該 record_id 現有 current
+    revision 的每一個核准相關欄位（`content`/`rationale`/`scopes`/`files`/`symbols`/`severity`/
+    `persistence_mode`/`expires_at`/`critical`/`source_document`/`source_section`/
+    `machine_check_hint`/`source_hashes`/`scope_hashes`/`created_by`/`approved_by`/`status`，
+    刻意排除天生每次都會變的 `revision`/`created_at`）——全部相符時視為這就是同一次重試，直接沿用
+    現有 revision，不重複附加；只要有任何一個欄位不同，就正常附加新 revision（兩次「獨立」核准
+    在所有這些欄位上都恰好逐字相同，機率上幾乎等於就是同一次重試）。
+125. **低·`search --json` 未輸出 `revision` 欄位**：`SearchResult` 為了第二十二輪的 `--history` 修法
+    新增了 `revision` 欄位，但 CLI 的 JSON 輸出字典沒有跟著補上，機器消費者拿不到「這筆 superseded
+    命中來自哪個 revision」這個關鍵資訊。修法：`--json` 輸出補上 `revision`。
+126. **低·`NotesConfig` 的 TTL 沒有正值驗證**：`temporary_context_ttl_days = -1` 先前會被直接接受，
+    實測重現：一個 `temporary_context` 類別的 Note 一建立就已經過期。修法：兩個 TTL 欄位都加上
+    `Field(gt=0)`。
+127. **低·`proposal edit --critical` 用在 constraint proposal 被靜默接受**：`critical` 是
+    DATA_MODEL §2.5 明講的「Decision-only convention」，但 `_validate_payload_shape` 先前完全沒
+    檢查這個欄位，`constraint_revisions` 表本來就沒有 `critical` 欄位——實測重現：把
+    `critical=True` 塞進一個 constraint 的 edited payload，核准照樣成功，canonical 存下
+    `critical: true`，材質化進 SQLite 時這個值就直接沒地方放，canonical 跟衍生資料從此不一致，
+    沒有任何錯誤訊息。修法：`_validate_payload_shape` 新增檢查，constraint 不得設 `critical`，
+    decision 不得設 `machine_check_hint`（同樣道理，`decision_revisions` 沒有這個欄位）；
+    `source_document`/`source_section` 兩張表都有對應欄位，不受限制。
+128. **低·CLI `note update` 沒有暴露 core 在第二十三輪新增的 `scopes`/`files`/`symbols`/
+    `importance`/`confidence`/`expires_at` 參數**：core 層已經支援，CLI 沒有對應選項，造成
+    core/CLI 行為漂移。修法：補上 `--scope`/`--file`/`--symbol`/`--importance`/`--confidence`/
+    `--expires-at`/`--clear-expires-at`。
+
+新增 12 個 regression test（`test_memory_notes.py` +1、`test_materialize.py` +1、
+`test_memory_proposals.py` +3、`test_config.py` +1、`test_cli.py` +2，其餘散落在既有檔案內的
+斷言強化）。每一條都先寫重現腳本、實際看到問題發生，才動手修——包括用 monkeypatch 模擬崩潰重現
+finding 124、手動竄改 `schema_meta`/`fts_decisions` 表形狀重現 finding 122。295 個測試全綠，
+`ruff check` 全綠。

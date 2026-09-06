@@ -424,8 +424,12 @@ class SemanticConfig(StrictModel):
 
 
 class NotesConfig(StrictModel):
-    temporary_context_ttl_days: int = 7
-    investigation_result_ttl_days: int = 30
+    # `gt=0`: a zero or negative TTL would make a temporary_context/
+    # investigation_result Note expire at (or before) the moment it's
+    # created -- confirmed by hand that -1 was silently accepted with no
+    # validation error before this fix.
+    temporary_context_ttl_days: int = Field(default=7, gt=0)
+    investigation_result_ttl_days: int = Field(default=30, gt=0)
 
 
 class SecurityConfig(StrictModel):

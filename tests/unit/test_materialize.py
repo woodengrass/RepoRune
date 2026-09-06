@@ -550,3 +550,28 @@ def test_rebuild_cache_populates_fts5_indexes(git_repo: Path) -> None:
         )
     }
     assert revisions_indexed == {1, 2}
+
+
+def test_connect_for_read_rejects_old_schema_version_cache(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: connect_for_read() only checked
+    that schema_meta.schema_version was *queryable*, not that it actually
+    matched CACHE_SCHEMA_VERSION -- an old-shape cache (e.g. right after
+    upgrading rune, before the next write triggers rebuild_cache's own
+    self-heal) passed that check fine and then crashed with a raw
+    sqlite3.OperationalError on the first query touching a column/table
+    only the newer shape has.
+    """
+    from rune.core.storage.sqlite.materialize import (
+        CacheUnusableError,
+        connect_for_read,
+    )
+
+    layout = init_project(git_repo)
+    rebuild_cache(layout, code_index=CodeIndexData())
+    conn = sqlite3.connect(str(layout.memory_db))
+    conn.execute("UPDATE schema_meta SET value = '1' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(CacheUnusableError):
+        connect_for_read(layout)

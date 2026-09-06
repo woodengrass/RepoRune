@@ -17,7 +17,7 @@ import typer
 from rune.core.config import load_config
 from rune.core.hashing import working_tree_fingerprint
 from rune.core.index.scanner import diff_against_previous, scan_files
-from rune.core.memory.notes import NoteNotFoundError
+from rune.core.memory.notes import NoteNotFoundError, NoteValidationError
 from rune.core.memory.notes import note_add as core_note_add
 from rune.core.memory.notes import note_update as core_note_update
 from rune.core.memory.proposals import (
@@ -480,6 +480,24 @@ def _validate_actor(value: str, option: str) -> None:
         raise typer.Exit(code=1)
 
 
+def _handle_cache_refresh_failure(exc: CanonicalConflictError) -> None:
+    """`core.memory.records.refresh_cache()` (called after every propose-
+    approve/note write) can raise `CanonicalConflictError` if some
+    *other* canonical file already has a conflict -- confirmed by hand:
+    the write this command was actually asked to do (a Decision/
+    Constraint/Note revision) had already succeeded by the time this
+    fires, so a caller that only prints a raw traceback and exits leaves
+    the user thinking the whole command failed, when what actually
+    happened is "your data is safely written, but the search/check cache
+    is now stale until you fix the *other* conflict and rebuild it".
+    """
+    _err(
+        f"the write itself succeeded, but the search/check cache could not be refreshed: {exc}\n"
+        "Fix the conflict and run `rune rebuild-cache` to bring the cache back in sync."
+    )
+    raise typer.Exit(code=1) from exc
+
+
 @decision_app.command("propose")
 def decision_propose(
     record_id: str = typer.Argument(..., help="Stable id, e.g. 'use-postgres-for-primary-store'."),
@@ -537,6 +555,8 @@ def decision_deactivate(
 ) -> None:
     try:
         updated = core_deactivate(_scope_layout(path), RecordType.decision, record_id, by=by)
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
     except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -609,6 +629,8 @@ def constraint_deactivate(
 ) -> None:
     try:
         updated = core_deactivate(_scope_layout(path), RecordType.constraint, record_id, by=by)
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
     except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -641,7 +663,9 @@ def note_add_cmd(
             confidence=confidence, evidence=evidence, expires_at=expires_at, source=source,
             redact_secrets=config.security.redact_secrets,
         )
-    except (NotAGitRepoError, _MissingLayoutError) as exc:
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
+    except (NotAGitRepoError, _MissingLayoutError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     typer.echo(f"Added note {note.id} ({note.category.value})")
@@ -654,6 +678,13 @@ def note_update_cmd(
     why_persist: str | None = typer.Option(None, "--why-persist"),
     status: NoteStatus | None = typer.Option(None, "--status"),
     evidence: list[str] = typer.Option([], "--evidence", help="Replaces the full evidence list if given."),
+    scopes: list[str] = typer.Option([], "--scope", help="Replaces the full scopes list if given."),
+    files: list[str] = typer.Option([], "--file", help="Replaces the full files list if given."),
+    symbols: list[str] = typer.Option([], "--symbol", help="Replaces the full symbols list if given."),
+    importance: float | None = typer.Option(None, "--importance"),
+    confidence: float | None = typer.Option(None, "--confidence"),
+    expires_at: str | None = typer.Option(None, "--expires-at"),
+    clear_expires_at: bool = typer.Option(False, "--clear-expires-at"),
     source: str = typer.Option("agent", "--source", help="'agent' or 'human'."),
     recompute_source_hashes: bool = typer.Option(
         False, "--recompute-source-hashes",
@@ -669,11 +700,15 @@ def note_update_cmd(
         config = load_config(layout.config_path)
         updated = core_note_update(
             layout, note_id, content=content, why_persist=why_persist, status=status,
-            evidence=evidence or None, source=source,
+            evidence=evidence or None, scopes=scopes or None, files=files or None,
+            symbols=symbols or None, importance=importance, confidence=confidence,
+            expires_at=expires_at, clear_expires_at=clear_expires_at, source=source,
             redact_secrets=config.security.redact_secrets,
             recompute_source_hashes=recompute_source_hashes,
         )
-    except (NotAGitRepoError, _MissingLayoutError, NoteNotFoundError) as exc:
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
+    except (NotAGitRepoError, _MissingLayoutError, NoteNotFoundError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     typer.echo(f"{note_id} updated to rev{updated.revision} [{updated.status.value}]")
@@ -724,6 +759,8 @@ def proposal_approve(
 ) -> None:
     try:
         _, memory_rev = core_approve(_scope_layout(path), proposal_id, resolved_by=by)
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
         ProposalAlreadyResolvedError, _ProposalValidationError,
@@ -836,7 +873,7 @@ def search(
             json_module.dumps(
                 [
                     {"kind": r.kind, "rank": r.rank, "id": r.id, "text": r.text,
-                     "status": r.status, "warning": r.warning}
+                     "status": r.status, "warning": r.warning, "revision": r.revision}
                     for r in results
                 ],
                 indent=2,

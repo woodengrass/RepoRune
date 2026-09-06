@@ -217,3 +217,22 @@ def test_note_update_can_change_importance_and_confidence(git_repo: Path) -> Non
     updated = note_update(layout, note.id, importance=0.9, confidence=0.2)
     assert updated.importance == 0.9
     assert updated.confidence == 0.2
+
+
+def test_note_add_before_any_rune_update_does_not_create_a_misleading_empty_cache(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: refresh_cache() used to call
+    rebuild_cache() with an empty CodeIndexData whenever memory.db didn't
+    exist yet (nothing had ever been indexed), which *created* a cache
+    whose files table was empty -- rune check/status then read "files
+    table is empty" as "everything looks changed" instead of "no cache
+    exists yet, nothing to compare against".
+    """
+    from rune.core.retrieval.check import check
+
+    layout = init_project(git_repo)
+    assert not layout.memory_db.exists()
+    note_add(layout, category=NoteCategory.observation, content="c", why_persist="w")
+    assert not layout.memory_db.exists()  # still no cache -- nothing to safely refresh
+
+    result = check(layout)
+    assert result.changed_files == []

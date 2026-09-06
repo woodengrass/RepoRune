@@ -389,3 +389,118 @@ def test_current_by_rejects_duplicate_revision(git_repo: Path) -> None:
 
     with pytest.raises(CanonicalConflictError):
         load_current_decisions(layout)
+
+
+def test_deactivate_cache_refresh_failure_gives_written_content_not_raw_traceback(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: when refresh_cache() (called
+    after every propose-approve/note write) fails because some *other*
+    canonical file already has a conflict, the CLI printed a raw
+    traceback -- even though the write this command was actually asked to
+    do had already succeeded. This tests the core-level building block:
+    the canonical write survives a refresh_cache failure.
+    """
+    from rune.core.storage.canonical import read_jsonl
+    from rune.core.storage.sqlite.materialize import CanonicalConflictError
+    from rune.core.update import run_update
+
+    layout = init_project(git_repo)
+    run_update(layout, full=True)  # memory.db must actually exist for refresh_cache to do anything
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="c")
+    approve(layout, proposal.proposal_id, resolved_by="alice")
+
+    # corrupt decisions.jsonl with a duplicate revision so the next
+    # refresh_cache() call (inside deactivate()) raises
+    from rune.core.storage.canonical import append_jsonl as raw_append
+
+    raw_append(
+        layout.decisions_jsonl,
+        MemoryRevision(
+            record_id="other", revision=1, type=RecordType.decision, status=RecordStatus.active,
+            content="A", created_by=RevisionAuthor.human, created_at="2026-01-01T00:00:00Z",
+        ),
+    )
+    raw_append(
+        layout.decisions_jsonl,
+        MemoryRevision(
+            record_id="other", revision=1, type=RecordType.decision, status=RecordStatus.active,
+            content="B", created_by=RevisionAuthor.human, created_at="2026-01-01T00:00:00Z",
+        ),
+    )
+
+    with pytest.raises(CanonicalConflictError):
+        deactivate(layout, RecordType.decision, "d1", by="bob")
+
+    # the deactivation itself was written despite the cache refresh failure
+    decisions = [r for r in read_jsonl(layout.decisions_jsonl, MemoryRevision) if r.record_id == "d1"]
+    assert len(decisions) == 2
+    assert decisions[-1].status is RecordStatus.inactive
+
+
+def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: approve() writes the memory
+    revision before resolving the proposal (so a crash between the two
+    leaves the content safely written and the proposal still `pending`,
+    rather than the reverse silent-loss risk). But re-running approve()
+    on that still-pending proposal used to just append a second, fully
+    duplicate revision. Simulates the crash, then re-approves, and checks
+    only one revision exists.
+    """
+    import rune.core.memory.proposals as proposals_module
+
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="c")
+
+    real_append = proposals_module.append_jsonl
+    call_count = {"n": 0}
+
+    def flaky_append(path, model):
+        call_count["n"] += 1
+        if call_count["n"] == 2:  # the proposals.jsonl resolution write
+            raise OSError("simulated crash between the two canonical writes")
+        return real_append(path, model)
+
+    proposals_module.append_jsonl = flaky_append
+    try:
+        with pytest.raises(OSError):
+            approve(layout, proposal.proposal_id, resolved_by="alice")
+    finally:
+        proposals_module.append_jsonl = real_append
+
+    # recovery: re-approve the still-pending proposal
+    resolved, _memory_rev = approve(layout, proposal.proposal_id, resolved_by="alice")
+    assert resolved.status is ProposalStatus.approved
+
+    from rune.core.storage.canonical import read_jsonl
+
+    decisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
+    assert len(decisions) == 1
+    assert decisions[0].revision == 1
+
+
+def test_edited_payload_critical_true_on_constraint_is_rejected(git_repo: Path) -> None:
+    """A relayed review confirmed by hand: `critical` is a decision-only
+    convention (constraint_revisions has no `critical` column at all), but
+    approve()/propose() never checked this -- critical=True on a
+    constraint payload used to be accepted, written to constraints.jsonl,
+    and then had nowhere to go once materialized (a canonical/derived-
+    cache mismatch with no error anywhere).
+    """
+    layout = init_project(git_repo)
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="c",
+        severity=Severity.must, persistence_mode=PersistenceMode.persistent,
+    )
+    edited = proposal.payload.model_copy(update={"critical": True})
+    with pytest.raises(ProposalValidationError):
+        approve(layout, proposal.proposal_id, resolved_by="alice", edited_payload=edited)
+
+
+def test_machine_check_hint_on_decision_proposal_is_rejected() -> None:
+    class _FakeLayout:
+        proposals_jsonl = None
+
+    with pytest.raises(ProposalValidationError):
+        propose(
+            _FakeLayout(), type=RecordType.decision, record_id="d1", content="c",
+            machine_check_hint="ruff",
+        )
