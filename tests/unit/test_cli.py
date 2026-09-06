@@ -252,3 +252,30 @@ def test_scope_for_cli_json_round_trip(git_repo: Path) -> None:
     payload = json_module.loads(result.output)
     assert payload["path"] == "a.py"
     assert [s["scope_id"] for s in payload["scopes"]] == ["core"]
+
+
+def test_bootstrap_cli_hard_and_soft_json_round_trip(git_repo: Path) -> None:
+    """`rune bootstrap --mode hard|soft --json` (ARCHITECTURE.md §7.6) --
+    the two payloads an OpenCode adapter calls on session.created /
+    session.compacted."""
+    import json as json_module
+
+    (git_repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+    result = runner.invoke(app, ["init", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(app, ["bootstrap", "--mode", "hard", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["mode"] == "hard"
+    assert payload["constraints"] == []
+    assert payload["overflow"] is False
+
+    result = runner.invoke(app, ["bootstrap", "--mode", "soft", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["mode"] == "soft"
+    assert payload["project_name"] is not None
+
+    result = runner.invoke(app, ["bootstrap", "--mode", "bogus", "--path", str(git_repo)])
+    assert result.exit_code == 1

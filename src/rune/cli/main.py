@@ -15,8 +15,6 @@ from pathlib import Path
 import typer
 
 from rune.core.config import load_config
-from rune.core.hashing import working_tree_fingerprint
-from rune.core.index.scanner import diff_against_previous, scan_files
 from rune.core.memory.notes import NoteNotFoundError, NoteValidationError
 from rune.core.memory.notes import note_add as core_note_add
 from rune.core.memory.notes import note_update as core_note_update
@@ -47,6 +45,7 @@ from rune.core.project import (
     init_project,
 )
 from rune.core.retrieval.check import check as core_check
+from rune.core.retrieval.context import build_hard_bootstrap, build_soft_bootstrap
 from rune.core.retrieval.scope_for import scope_for as core_scope_for
 from rune.core.retrieval.search import search as core_search
 from rune.core.scopes.clustering import suggest_from_graph
@@ -61,12 +60,11 @@ from rune.core.scopes.model import (
     set_scope_locked,
     update_scope,
 )
-from rune.core.storage.canonical import read_json_model
+from rune.core.status import compute_status
 from rune.core.storage.models import (
     NoteCategory,
     NoteStatus,
     PersistenceMode,
-    ProjectFile,
     RecordType,
     Scope,
     ScopeSource,
@@ -153,54 +151,32 @@ def status(
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
-    project = read_json_model(layout.project_json, ProjectFile)
-    if project is None:
+    project_status = compute_status(layout)
+    if project_status is None:
         _err(f"{layout.project_json} is missing or unreadable.")
         raise typer.Exit(code=1)
 
-    file_count = symbol_count = 0
-    previous_hashes: dict[str, str] = {}
-    cache_exists = layout.memory_db.exists()
-    if cache_exists:
-        conn = sqlite3.connect(str(layout.memory_db))
-        try:
-            file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-            symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-            previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
-        finally:
-            conn.close()
-
-    current_tree_hash: str | None = None
-    modified_count = added_count = deleted_count = 0
-    try:
-        config = load_config(layout.config_path)
-        scanned = scan_files(layout.repo_root, config.index)
-        current_tree_hash = working_tree_fingerprint({f.path: f.content_hash for f in scanned})
-        changeset = diff_against_previous(scanned, previous_hashes)
-        modified_count = len(changeset.modified)
-        added_count = len(changeset.added)
-        deleted_count = len(changeset.deleted_paths)
-    except Exception:  # noqa: BLE001 - status must never crash on a scan hiccup
-        current_tree_hash = None
-
-    is_fresh = (
-        current_tree_hash is not None and current_tree_hash == project.last_indexed_tree_hash
-    )
-
     payload = {
-        "project_id": project.project_id,
-        "name": project.name,
-        "last_indexed_head": project.last_indexed_head,
-        "last_indexed_tree_hash": project.last_indexed_tree_hash,
-        "last_indexed_at": project.last_indexed_at,
-        "cache_exists": cache_exists,
-        "files_indexed": file_count,
-        "symbols_indexed": symbol_count,
-        "working_tree_fresh": is_fresh,
-        "files_modified": modified_count,
-        "files_added": added_count,
-        "files_deleted": deleted_count,
+        "project_id": project_status.project_id,
+        "name": project_status.name,
+        "last_indexed_head": project_status.last_indexed_head,
+        "last_indexed_tree_hash": project_status.last_indexed_tree_hash,
+        "last_indexed_at": project_status.last_indexed_at,
+        "cache_exists": project_status.cache_exists,
+        "files_indexed": project_status.files_indexed,
+        "symbols_indexed": project_status.symbols_indexed,
+        "working_tree_fresh": project_status.working_tree_fresh,
+        "files_modified": project_status.files_modified,
+        "files_added": project_status.files_added,
+        "files_deleted": project_status.files_deleted,
     }
+    cache_exists = project_status.cache_exists
+    file_count = project_status.files_indexed
+    symbol_count = project_status.symbols_indexed
+    is_fresh = project_status.working_tree_fresh
+    modified_count = project_status.files_modified
+    added_count = project_status.files_added
+    deleted_count = project_status.files_deleted
 
     if json_output:
         typer.echo(json_module.dumps(payload, indent=2))
@@ -985,6 +961,93 @@ def scope_for_cmd(
         for n in s.notes:
             warn = f" ({n.warning})" if n.warning else ""
             typer.echo(f"  note [{n.category}]{warn}: {n.content}")
+
+
+@app.command()
+def bootstrap(
+    mode: str = typer.Option(..., "--mode", help="'hard' or 'soft'."),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Structured agent-injection payload (ARCHITECTURE.md §7.3): `--mode
+    hard` returns current+visible global MUST Constraints plus
+    critical=true global Decisions (re-injected on every session.created
+    / session.compacted); `--mode soft` returns a project overview, scope
+    summaries, memory freshness, and the remaining non-critical global
+    Decisions (injected once per session.created). Core returns data
+    only -- no OpenCode-specific prompt wording (that's the adapter's
+    job)."""
+    if mode not in ("hard", "soft"):
+        _err("--mode must be 'hard' or 'soft'")
+        raise typer.Exit(code=1)
+    try:
+        layout = _require_layout(path or Path.cwd())
+        if mode == "hard":
+            hard = build_hard_bootstrap(layout)
+            payload = {
+                "mode": "hard",
+                "constraints": [
+                    {"record_id": c.record_id, "severity": c.severity, "content": c.content,
+                     "source_document": c.source_document, "source_section": c.source_section}
+                    for c in hard.constraints
+                ],
+                "decisions": [
+                    {"record_id": d.record_id, "content": d.content} for d in hard.decisions
+                ],
+                "estimated_tokens": hard.estimated_tokens,
+                "budget_tokens": hard.budget_tokens,
+                "overflow": hard.overflow,
+            }
+        else:
+            soft = build_soft_bootstrap(layout)
+            payload = {
+                "mode": "soft",
+                "project_name": soft.project_name,
+                "working_tree_fresh": soft.working_tree_fresh,
+                "files_indexed": soft.files_indexed,
+                "symbols_indexed": soft.symbols_indexed,
+                "scopes": [
+                    {"scope_id": s.scope_id, "name": s.name, "description": s.description,
+                     "summary": s.summary}
+                    for s in soft.scopes
+                ],
+                "decisions": [
+                    {"record_id": d.record_id, "content": d.content} for d in soft.decisions
+                ],
+                "estimated_tokens": soft.estimated_tokens,
+                "budget_tokens": soft.budget_tokens,
+                "overflow": soft.overflow,
+            }
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        typer.echo(json_module.dumps(payload, indent=2))
+        return
+
+    if mode == "hard":
+        if payload["overflow"]:
+            _err(
+                f"hard bootstrap overflow: {payload['estimated_tokens']} tokens > "
+                f"{payload['budget_tokens']} budget -- no rule was dropped, raise "
+                f"bootstrap.hard_budget_tokens or trim the global MUST set"
+            )
+        for c in payload["constraints"]:
+            typer.echo(f"[MUST] {c['record_id']}: {c['content']}")
+        for d in payload["decisions"]:
+            typer.echo(f"[critical decision] {d['record_id']}: {d['content']}")
+    else:
+        typer.echo(f"Project: {payload['project_name'] or '(unknown)'}")
+        typer.echo(
+            f"Working tree: {'fresh' if payload['working_tree_fresh'] else 'modified/unknown'} "
+            f"({payload['files_indexed']} files, {payload['symbols_indexed']} symbols indexed)"
+        )
+        for s in payload["scopes"]:
+            summary = f" -- {s['summary']}" if s["summary"] else ""
+            typer.echo(f"  scope {s['scope_id']} ({s['name']}){summary}")
+        for d in payload["decisions"]:
+            typer.echo(f"  decision {d['record_id']}: {d['content']}")
 
 
 def main() -> None:

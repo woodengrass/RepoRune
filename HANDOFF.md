@@ -203,6 +203,20 @@ current+visible 過濾規則，唯一新規則是 INFO severity 不主動注入�
 「`tool.execute.before` → `rune scope-for --path ... --json` → 注入 context」這條路徑，含
 dedup 邏輯，確認可行——沒有連到真實 OpenCode host。303 個 Python 測試全綠。
 
+**Milestone 7（第二輪）：`rune bootstrap` 完成**：見 IMPLEMENTATION_PLAN.md「Milestone 7 開工」
+第 132-133 條、ARCHITECTURE.md §14（第十四輪）。新增 `core.retrieval.context`
+（`build_hard_bootstrap`/`build_soft_bootstrap`）+ `rune bootstrap --mode hard|soft --json`，純粹
+落實 §7.3-§7.7 早已定案的設計，沒有新設計決策。同時把 `cli.main.status` 內嵌的新鮮度計算抽成
+`core.status.compute_status()` 供 soft bootstrap 重用。新增 13 個測試，316 個 Python 測試全綠、
+`ruff check` 全綠。**同時發現一個尚未解決的落差、還沒跟使用者確認**：裝了官方
+`@opencode-ai/plugin` npm 套件後，其真實 TypeScript 型別定義跟 ARCHITECTURE.md §6 先前記錄的 hook
+形狀不完全相符（沒有獨立的 `session.created`/`session.compacted`/`file.edited` hook key，改用單一
+`event` hook + discriminated union；`tool.execute.before`/`after` 沒有 `directory`/`worktree`/
+`messageID`），且同一套件內還有第二套平行的「v2/effect」plugin API。**在寫任何 session hook /
+`tool.execute.before` constraint delivery / custom tool 註冊的程式碼之前，必須先把這個落差攤開
+給使用者、取得如何處理的決定**——這正是本專案「agent-injection semantics 變更需要先過 governance
+doc 確認」慣例本該攔住的情況。
+
 ## 專案是什麼
 
 RepoRune（CLI/套件名：`rune`）= *Repository Understanding & Navigation Engine*。
@@ -279,7 +293,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
-| 7. OpenCode Adapter | 🚧 開工中（spike 完成） | `rune scope-for` + 最小 TS adapter 骨架已驗證可行；hard/soft bootstrap 注入、session hook、custom tool 尚未開始 |
+| 7. OpenCode Adapter | 🚧 開工中（`rune bootstrap` 完成） | `rune scope-for`/`rune bootstrap --mode hard\|soft` 皆已完成並測試；session hook/`tool.execute.before`/custom tool 卡在真實 OpenCode plugin API 落差待使用者確認 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
@@ -296,6 +310,7 @@ src/rune/
 │  ├─ hashing.py            # content_hash / git_blob_hash / working_tree_fingerprint
 │  ├─ project.py            # find_repo_root（真的呼叫 git，不是只看 .git 存不存在）、
 │  │                        # init_project（refuse/--force 語意）、RuneLayout（路徑集中管理）
+│  ├─ status.py             # compute_status()：新鮮度計算，`rune status` 與 soft bootstrap 共用
 │  ├─ update.py             # run_update(layout, full) —— 整個 Milestone 2/3 的協調中心
 │  ├─ scopes/
 │  │  ├─ model.py            # Scope CRUD、import-only incremental membership assignment
@@ -312,7 +327,8 @@ src/rune/
 │  ├─ retrieval/               # Milestone 6 完成，Milestone 7 開工中
 │  │  ├─ search.py            # 八層排序 search，FTS5 查詢
 │  │  ├─ check.py             # 變更檔案 -> 受影響 scope -> 相關 constraint
-│  │  └─ scope_for.py         # Milestone 7：path -> scope + summary + MUST/SHOULD + note
+│  │  ├─ scope_for.py         # Milestone 7：path -> scope + summary + MUST/SHOULD + note
+│  │  └─ context.py           # Milestone 7：build_hard_bootstrap/build_soft_bootstrap
 │  ├─ semantic/
 │  │  ├─ provider.py         # ModelProvider protocol、OpenRouter/OpenAI/通用 httpx 實作
 │  │  ├─ redaction.py        # free-text 欄位 secret 遮蔽（結構化參照欄位不碰）
@@ -457,15 +473,22 @@ TypeScript 骨架（`package.json`/`tsconfig.json`/`src/rune-cli.ts`/`src/spike.
 `active_scope_ids` dedup（同一 scope 同一 session 只注入一次），確認可行。**沒有連到真實 OpenCode
 host**（沒有可用的 OpenCode 執行環境），只驗證機制本身，不是真的部署。
 
-**下一步是 Milestone 7 的完整交付項目**：
-`rune bootstrap --mode hard|soft --json`（`core.retrieval.context` 新增
-`build_hard_bootstrap_context()`/`build_soft_bootstrap_context()`，hard 輸出超出 budget 時
-`overflow=true`、絕不靜默丟棄 MUST 規則，JSON 格式已在 ARCHITECTURE §7.6 定義好）、
-session-start/session-compaction hook（`hard_context_generation` 計數器要跟 `active_scope_ids`
-分開維護，不可共用同一個旗標）、`tool.execute.before` 掛 constraint delivery（`bash` 指令的特殊
-處理：V1 不嘗試解析 shell 語意，改在 `tool.execute.after` 用 git diff 事後偵測；`scope-for` 已經
-做好，這部分只需要接上 dedup 快取跟實際的 hook 註冊）、custom tool 註冊
-（`decision_propose`/`constraint_propose`/`note_add`，這些底層 core 函式 Milestone 6 已經做好，
-Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。開工前重讀
-IMPLEMENTATION_PLAN.md 的 Milestone 7 整段（含驗收標準——規格明講是「V1 真正價值的驗證階段」，
+**`rune bootstrap --mode hard|soft --json` 已完成**（見上方「Milestone 7（第二輪）」與
+IMPLEMENTATION_PLAN.md 第 132-133 條）：`core.retrieval.context` 的 `build_hard_bootstrap`/
+`build_soft_bootstrap`，hard 輸出超出 budget 時 `overflow=true`、絕不靜默丟棄 MUST 規則（有
+regression test 直接斷言），JSON 格式逐字對照 ARCHITECTURE §7.6。316 個測試全綠。
+
+**下一步卡在一個必須先跟使用者確認的落差，不能直接動手寫 TypeScript hook 程式碼**：裝了官方
+`@opencode-ai/plugin` npm 套件後，其真實型別定義顯示 ARCHITECTURE.md §6 記錄的 hook 形狀（獨立的
+`session.created`/`session.compacted`/`file.edited` hook key；`tool.execute.before` 帶
+`directory`/`worktree`）跟實際 API 不符（真實 API 是單一 `event` hook + discriminated union，
+`tool.execute.before` 只有 `{tool, sessionID, callID}` + 可變的 `args`），且同一套件內還有第二套
+平行的「v2/effect」plugin API，兩者該用哪一套尚未決定。**先把這個落差攤開給使用者，取得決定後
+再更新 ARCHITECTURE §6、才能繼續做** session-start/session-compaction hook（`hard_context_
+generation` 計數器要跟 `active_scope_ids` 分開維護，不可共用同一個旗標）、`tool.execute.before`
+掛 constraint delivery（`bash` 指令的特殊處理：V1 不嘗試解析 shell 語意，改在 `tool.execute.after`
+用 git diff 事後偵測；`scope-for` 已經做好，這部分只需要接上 dedup 快取跟實際的 hook 註冊）、
+custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`，這些底層 core 函式
+Milestone 6 已經做好，Milestone 7 只需要把它們包成 OpenCode custom tool，不需要重新設計）。開工前
+重讀 IMPLEMENTATION_PLAN.md 的 Milestone 7 整段（含驗收標準——規格明講是「V1 真正價值的驗證階段」，
 不可妥協）與 ARCHITECTURE.md §6-7。

@@ -4,7 +4,7 @@
 > 本文件其餘部分一律使用 `rune` 指稱這個工具本身（CLI、Python 套件、目錄名稱 `.rune/` 皆同名），
 > `RepoRune` 僅在需要完整品牌名稱的場合使用（例如文件標題、對外介紹）。
 
-狀態：**已確認（第十三輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
+狀態：**已確認（第十四輪修訂）**（V1 設計，經 2026-09-06 討論確認全部開放問題）。第四輪根據對照
 OpenCode 官方 plugin 文件的結果具體化 Milestone 7 設計、補上 ParserAdapter 介面契約、
 import/reference 信任層級原則、semantic worker fallback policy、SQLite 併發策略，並將 scope
 clustering 品質明確定位為「留待真實 repo 實驗調整」而非架構層需要鎖死的正確性需求。第五輪新增
@@ -45,7 +45,17 @@ update」的測試）改成明確加上 `semantic.enabled=false` 才算未使用
 新增 `rune scope-for <path> --json`（第 6 節先前只點名這個指令、沒有定義確切 JSON 格式，本輪補上），
 用一個最小的 TypeScript adapter 骨架（`adapters/opencode/`）實際跑過
 「`tool.execute.before` → `rune scope-for` → 注入 context」這條路徑，包含同一 scope 第二次不重複
-注入的 dedup 邏輯，確認整條路徑可行才進入 Milestone 7 全量開發。本文件與
+注入的 dedup 邏輯，確認整條路徑可行才進入 Milestone 7 全量開發。**第十四輪落實第 7 節早已定案的
+Hard/Soft Bootstrap 設計**：新增 `core.retrieval.context`（`build_hard_bootstrap`/
+`build_soft_bootstrap`）與 `rune bootstrap --mode hard|soft --json`，純粹是把 §7.3-§7.7 的規格轉成
+程式碼，沒有新的設計決策；同時把 `cli.main.status` 內嵌的新鮮度計算抽成 `core.status.
+compute_status()`，供 soft bootstrap 重用同一份計算而非另寫一份可能悄悄分岔的邏輯。**第十四輪同時
+記錄一個尚未解決的落差**：安裝官方 `@opencode-ai/plugin` npm 套件後對照其真實 TypeScript 型別定義，
+發現第 6 節先前記錄的 hook 形狀與實際 API 不完全相符（沒有獨立的 `session.created`/
+`session.compacted`/`file.edited` hook key，而是單一 `event` hook 搭配 discriminated union；
+`tool.execute.before`/`tool.execute.after` 沒有帶 `directory`/`worktree`/`messageID`），且同一套件
+內存在第二套平行的「v2/effect」plugin API——這個落差尚未與使用者確認如何處理，第 6 節暫不更動，
+留待下一輪修訂。本文件與
 `DATA_MODEL.md`、`IMPLEMENTATION_PLAN.md` 共同構成 Milestone 1 的實作基準。任何會改變 canonical
 schema、scope model、Decision/Constraint 語意、staleness 語意或 agent-injection 語意的後續變更，
 仍必須重新提案並取得確認後才能實作。

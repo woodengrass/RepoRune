@@ -1825,6 +1825,45 @@ finding 124、手動竄改 `schema_meta`/`fts_decisions` 表形狀重現 finding
 腳本，還沒有自動化測試框架（Milestone 7 全量開發時再補，這輪的目標只是驗證路徑可行）。303 個
 Python 測試全綠，`ruff check` 全綠。
 
-**尚未開始**：`rune bootstrap --mode hard|soft --json`、`core.retrieval.context`、
+**尚未開始**（spike 完成時）：`rune bootstrap --mode hard|soft --json`、`core.retrieval.context`、
 session-start/session-compaction hook、`tool.execute.before` 掛 constraint delivery（含
 `bash` 的事後偵測）、custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`）。
+
+### 第二輪修訂（`rune bootstrap` + `core.retrieval.context`；`core.status` 抽取）
+
+132. **`core.status.compute_status()`（從 `cli.main.status` 抽出）**：`core.retrieval.context`
+    的 soft bootstrap 需要跟 `rune status` 完全一樣的 working-tree 新鮮度計算（cache 檔案/符號數、
+    tree hash 比對、modified/added/deleted 計數），與其在 `context.py` 裡重寫一份「幾乎一樣但細節
+    可能悄悄分岔」的邏輯，不如把 `cli.main.status` 原本內嵌的計算搬進 `core.status`，`status()` 
+    CLI 命令改成呼叫它。純粹搬移，行為不變——`status()` 原本的錯誤處理（`project.json` 缺失/無法
+    讀取回傳 `None`、掃描失敗永不拋例外只回報 `working_tree_fresh=False`）逐字保留。
+133. **`core.retrieval.context`（新模組）+ `rune bootstrap --mode hard|soft --json`**：落實
+    ARCHITECTURE §7.3-§7.7 已經定案的設計，沒有新的設計決策，純粹是把規格轉成程式碼：
+    - **Hard bootstrap**：current+visible 的 Global MUST Constraint（`severity=MUST` ∧
+      `persistence_mode=persistent` ∧ `constraint_scopes` 無對應列 ∧ `status` 屬於
+      `active/review_required/stale`，跟 `rune check` 的 global MUST 查詢用同一組可見狀態）＋
+      `critical=true` 的 global Decision（`decision_scopes` 無對應列 ∧ `status` 屬於
+      `active/review_required`，跟 `rune search` 的 `_DECISION_VISIBLE` 同一組）。`estimated_tokens`
+      用 `len(text)//4` heuristic（無真實 tokenizer 依賴，只需要「大致抓超出預算」，不需要精確
+      對齊任何特定模型的真實 tokenization）。**§7.7 的「不可靜默截斷」規則**：超出
+      `bootstrap.hard_budget_tokens` 只設 `overflow=true`，絕不丟棄任何一條 constraint/decision——
+      有 regression test（`test_hard_bootstrap_overflow_flagged_never_drops_constraints`）直接斷言
+      5 條刻意撐爆預算的 MUST constraint 全部原樣回傳。
+    - **Soft bootstrap**：project overview（複用 `compute_status`）、scope 清單＋摘要（只有
+      `status=fresh` 的 semantic summary 才附上，`possibly_stale`/`stale` 一律 `summary=None`——
+      跟 hard bootstrap 不同，soft bootstrap 沒有「不可截斷」的義務，模糊或過期的摘要不值得硬塞）、
+      非 critical 的 global active Decision。**刻意省略 ARCHITECTURE §7.3 提到的「近期相關變更」**：
+      整份規格裡從未定義過這個欄位該用什麼查詢產生（`core.retrieval` 沒有任何「recent changes」
+      的既有機制），與其臨時發明一個新查詢形狀，不如明確記錄成範圍縮減——`rune check` 的
+      working-tree diff 已經覆蓋這個專案目前唯一定義過的「什麼變了」需求。
+    - CLI 輸出格式逐字對照 ARCHITECTURE §7.6 的 JSON 範例（`mode`/`constraints`/`decisions`/
+      `estimated_tokens`/`budget_tokens`/`overflow`）；`--mode` 只接受 `hard`/`soft`，其餘值
+      exit 1。
+
+新增 13 個測試（`tests/integration/test_retrieval_context.py` 12 個、`tests/unit/test_cli.py` 1 個
+CLI JSON round-trip，涵蓋 hard/soft 兩種 mode）。316 個 Python 測試全綠，`ruff check` 全綠。
+
+**尚未開始**：session-start/session-compaction hook（呼叫這裡新增的 `rune bootstrap`）、
+`tool.execute.before` 掛 constraint delivery（含 `bash` 的事後偵測）、custom tool 註冊
+（`decision_propose`/`constraint_propose`/`note_add`）——這幾項全部卡在 OpenCode 真實 plugin API
+與 ARCHITECTURE.md §6 既有設計之間發現的落差，見下一輪修訂前必須先跟使用者確認的問題。
