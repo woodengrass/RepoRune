@@ -805,11 +805,10 @@ overflow 只加警告不丟規則。`adapters/opencode/src/plugin.test.ts` 用�
 介面（不打真實 `rune` CLI）覆蓋同一組行為，外加 compaction 後 hard bootstrap 確實換新、以及不同
 session 之間狀態互不外洩。`extractPathsFromToolArgs()`（`tool-paths.ts`）從 `tool.execute.before`
 的 `output.args` 猜測 `filePath`/`path`/`file_path` 欄位名稱、`apply_patch` 解析
-`*** Add/Update/Delete File:` 標記——**這組欄位名稱未對照真實 host 驗證過**，猜錯的後果是「這次
-tool 呼叫沒有觸發任何 context 注入」（fail open，不是注入到錯的路徑）。
+`*** Add/Update/Delete File:` 標記；真實 OpenCode host 已驗證 `read` 的 `filePath` 與
+`apply_patch` 的 `patchText` shape，未知 tool shape 仍維持 fail-open（不注入到錯的路徑）。
 
-### 6.2 Adapter/Core protocol compatibility——`protocol_version`（第十七輪新增，純設計，M7 待完成
-contract，本輪不改任何 CLI schema）
+### 6.2 Adapter/Core protocol compatibility——`protocol_version`
 
 **問題**：Python `rune` CLI 是 machine-level 安裝一次（見第 14 節），OpenCode adapter 是獨立的 npm
 套件，兩者各自升級、版本號彼此無關。若 adapter 假設某個 `--json` 輸出一定長某個形狀，而使用者升級了
@@ -836,9 +835,8 @@ contract，本輪不改任何 CLI schema）
   版本不相容，需要升級其中一方」，不得吞掉錯誤或嘗試用舊邏輯硬解析新形狀（或反之）。這與
   ARCHITECTURE 其餘地方反覆出現的「大聲失敗優於靜默錯誤」原則（例如第 7.7 節 hard bootstrap
   overflow、`CanonicalConflictError`）完全一致。
-- **本輪不要求立即修改所有既有 `--json` 命令加上這個欄位**——那是實作工作，留給 Milestone 7 收尾時
-  一次性補齊（IMPLEMENTATION_PLAN.md 已記錄為 M7 contract 待辦項），本輪只確認設計、把它列為
-  M7 完工前必須補上的契約，不是「現在已經做了」。
+- **已實作為 version 1**：所有現有 adapter-facing `--json` output 都是頂層 object 並包含此欄位；
+   adapter 缺失或不相容時明確拒絕解析。未來改變 JSON contract 時依上述規則遞增版本。
 
 ## 7. Global Code Standards / Hard-Soft Bootstrap（本輪新增，agent-injection semantics 的正式一部分）
 
@@ -1267,14 +1265,12 @@ incremental 自動併入（因為當時只看得到 branch-local 的 import grap
 membership 就不再自動視為有效，需要落回人類審查，不是「因為之前 branch-local 已經自動寫過了，
 merge 後就自動維持」。
 
-## 17. Milestone 7 待完成 contract 清單（第十七輪新增，索引用途，避免散落各節找不到）
+## 17. Milestone 9 Scope Governance backlog（索引用途）
 
-本輪（第十七輪）新增的設計，有幾項明確標記為「尚待實作」，這裡集中列出，完整細節見各自章節與
-IMPLEMENTATION_PLAN.md 對應的待辦條目：
+Scope reconciliation 的設計已定，實作集中於 Milestone 9；完整細節見 §4.4 與 IMPLEMENTATION_PLAN.md：
 
-1. **`protocol_version` 加進既有 `--json` 輸出**（第 6.2 節）——本輪只定義設計，未修改任何 CLI。
-2. **`rune scope reconcile`（含 `--full`）與 AUTO/KEEP/REVIEW/BROKEN 輸出格式**（第 4.4 節新增
-   小節）——本輪只定義概念與規則，未實作 CLI 命令，也未鎖定 large-churn threshold 的具體數值。
-3. **Scope membership 的 per-membership provenance schema**（`ScopeMembership` 概念，第 4.4/16.6
-   節提及，完整內容見 DATA_MODEL.md §9）——本輪明確記錄為 future/V2，不在這輪或 Milestone 7 修改
+1. **`rune scope reconcile`（含 `--full`）與 AUTO/KEEP/REVIEW/BROKEN 輸出格式**：尚未實作 CLI 命令，
+   也未鎖定 large-churn threshold 的具體數值。
+2. **Scope membership 的 per-membership provenance schema**（`ScopeMembership` 概念，第 4.4/16.6
+   節提及，完整內容見 DATA_MODEL.md §9）是 future/V2，不在 Milestone 9 修改
    `Scope`/`ScopeMembers` schema。

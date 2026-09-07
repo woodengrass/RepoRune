@@ -590,6 +590,35 @@ text 解析）。
   就少回傳任何一條規則。
 - MCP tool 呼叫與對應 CLI 指令產生相同的資料形狀（兩個介面之間不 drift）。
 
+## Milestone 9 — Scope Governance
+**模組**：`rune.core.scopes`、`rune.cli`、`rune.core.update` 的 scope-membership 邊界。
+
+**目的：** 將既有的 incremental auto-assignment 泛化為可審核的 scope reconciliation，讓 merge、rename、
+刪除與長期演變後的 membership 有明確治理流程；不把 Scope 變成可由模型任意重算的衍生資料。
+
+**已定決議，實作不得改變：**
+- 預設 reconciliation 只處理 changed set；untouched region frozen。
+- 只有 import edge + 唯一 unlocked scope 的 high-confidence add 可 auto-apply。
+- removal、move、模糊重新指派與新 scope 一律輸出 review，不得靜默改寫 canonical。
+- `locked` scope 與 human-authoritative membership 永遠受保護；`--full` 也只能輸出 candidate/proposal/diff。
+- large churn 必須中止 auto-apply 並要求人類審查；具體 threshold 需以實作/真實 repo 資料決定，不能自行猜定。
+- `ScopeMembership` per-membership provenance schema 仍是 future/V2，不納入 M9；M9 必須誠實處理現行
+  schema 無法判定個別 membership provenance 的限制。
+
+**交付項目：**
+- `rune scope reconcile` 與明確 opt-in 的 `--full`。
+- 穩定、可機器解析的 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 結果，以及 changed/auto/review/keep count 與
+  suspicious-churn flag。
+- deterministic candidate/review proposal 產生與 human review workflow；不得新增模型直接改寫 membership 的路徑。
+- merge/integration worktree 使用說明與 integration reconciliation 驗收流程。
+
+**驗收標準：**
+- changed file 的唯一 high-confidence import evidence 能 auto-add；reference-only 或多候選一律 REVIEW。
+- untouched、locked 與 human-authoritative membership 在 incremental/`--full` 下都不被自動移除或搬移。
+- 已刪除的 human/locked target 產生 BROKEN，不靜默清除。
+- 觸發 large churn 時沒有 canonical auto-write，輸出明確要求 review。
+- 相同輸入在不同 `PYTHONHASHSEED`/process 下得到相同排序與結果。
+
 ## 測試計畫（跨 milestone，規格 §65-68）
 - **單元測試**：hash 計算、canonical 解析/atomic-write、**revision「current」選取必須是純
   `MAX(revision)`，明確包含 `rev1=active, rev2=inactive` -> current 是 rev2 這個回歸測試**（可見性
@@ -2002,8 +2031,8 @@ DATA_MODEL.md／IMPLEMENTATION_PLAN.md／HANDOFF.md 四份文件，本輪明確�
 未使用 AskUserQuestion。
 
 **尚待實作（本輪只完成設計，以下皆未動程式碼，不要誤讀為已完成）**：
-- `rune scope reconcile`（含 `--full`）CLI 命令與 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 輸出格式，以及
-  large-churn threshold 的具體數值（第 145 條，ARCHITECTURE §4.4）。
+- Milestone 9：`rune scope reconcile`（含 `--full`）CLI 命令與 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 輸出格式，
+  以及 large-churn threshold 的具體數值（第 145 條，ARCHITECTURE §4.4）。
 - `ScopeMembership` per-membership provenance schema——future/V2，非近期待辦（第 146 條，
   DATA_MODEL §9）。
 

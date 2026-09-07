@@ -358,6 +358,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
 | 7. OpenCode Adapter | ✅ 完成 | 正式 host 驗收：注入、path、bash/scope、custom tools、isolation、title/soft 與 compaction。 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
+| 9. Scope Governance | ❌ 未開始 | `rune scope reconcile`、review workflow、large-churn guardrail；規則已定，實作未開始。 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
 失敗
@@ -537,7 +538,7 @@ git-init 過的小型測試用 repo）。
   human/model/auto 加的」，也沒有「human exclude」機制——這是 multi-worktree scope
   reconciliation（ARCHITECTURE.md §4.4/§16.6）需要、但現行 schema 不支援的東西，明確記錄為
   future/V2，不是這輪或 Milestone 7 要做的事。
-- **`rune scope reconcile`（含 large-churn guardrail 的具體 threshold）尚未實作**：ARCHITECTURE.md
+- **Milestone 9 的 `rune scope reconcile`（含 large-churn guardrail 的具體 threshold）尚未實作**：ARCHITECTURE.md
   §4.4 已經把 incremental scope reconciliation 的完整規則寫清楚（untouched region frozen、
   AUTO/KEEP/REVIEW/BROKEN 分類、locked/human-confirmed membership 保護），但 CLI 命令本身、
   large-churn 的具體數值都還沒做，是設計先於實作的狀態。
@@ -552,6 +553,13 @@ git-init 過的小型測試用 repo）。
   相同、canonical 最終內容不受影響的近零實務影響不對稱，故不修。
 
 ## 立刻可以做的下一步
+
+**目前 roadmap 與交接起點：** Milestone 7 已完成並完成真 host 驗收。下一個工作是 **Milestone 8 — MCP +
+Polish**（MCP server、`rune doctor`、wheel/`uv tool install` 打包、README quickstart），完整交付與驗收標準見
+IMPLEMENTATION_PLAN.md 的 Milestone 8。M8 完成後執行 **Milestone 9 — Scope Governance**：只實作已定的
+`rune scope reconcile` 規則，先讀 ARCHITECTURE.md §4.4 與 IMPLEMENTATION_PLAN.md 的 Milestone 9；不得擴大
+成重新 clustering 全 repo、不得自動搬移/移除 human 或 locked membership、不得在沒有使用者確認前自行選定
+large-churn threshold。per-membership provenance 明確是 future/V2，不屬 M9。
 
 **Milestone 6（Policies & Memory）已全部完成**（見上方「第十九～二十一輪修訂」與
 IMPLEMENTATION_PLAN.md 第 95-106 條）：`core.memory.{revisions,hashes,proposals,notes,
