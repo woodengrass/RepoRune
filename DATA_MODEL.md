@@ -826,6 +826,15 @@ class BootstrapConfig(BaseModel):
     must_count_warn_threshold: int = 30
     # global MUST 數量超過此值時 `rune doctor` 發出整併建議警告（非硬限制）
 
+class ScopesConfig(BaseModel):
+    # Milestone 9 新增，見 ARCHITECTURE.md §4.4「Scope Membership Reconciliation」與
+    # IMPLEMENTATION_PLAN.md Milestone 9 決策記錄第 168 條的完整推理。
+    reconcile_large_churn_threshold: int = 20
+    # `rune scope reconcile`（非 `--full`）單次 run 裡 AUTO（high-confidence import、
+    # 唯一候選）membership 新增數量超過此值即視為 suspicious churn，中止整批自動寫入，
+    # 要求人類審查——這是硬性 invariant（ARCHITECTURE §4.4 point 5），不是像
+    # `must_count_warn_threshold` 那樣只印警告的軟性門檻。
+
 class RuneConfig(BaseModel):
     version: int = 1
     index: IndexConfig
@@ -835,6 +844,7 @@ class RuneConfig(BaseModel):
     proposals: ProposalsConfig = ProposalsConfig()
     pricing: PricingConfig = PricingConfig()
     bootstrap: BootstrapConfig = BootstrapConfig()
+    scopes: ScopesConfig = ScopesConfig()
 ```
 
 ## 8. 已知限制：多人協作下的 revision 衝突（V1 不解決，僅留 invariant）
@@ -896,6 +906,12 @@ class ScopeMembership:  # 概念草稿，非最終設計
 檔案不屬於這個 scope」時，未來的 auto/model membership inference 不應該每次重新推導又建議加回去。
 目前的 schema（單純的 `files`/`symbols` 清單）沒有辦法表示「排除」，只能表示「包含」，這也是
 per-membership provenance 缺失暴露出的同一類限制。
+
+**Milestone 9 實作 `rune scope reconcile` 時確認：這個限制仍然成立，本輪沒有修改 schema**。
+`core.scopes.reconcile` 用 `scope.locked OR scope.source == human` 當「human-authoritative」的
+whole-scope 級代理指標（IMPLEMENTATION_PLAN.md 第 167 條），並因為缺乏 per-membership provenance，
+明確選擇不去重新驗證*已經是*某 scope 成員的檔案在 repo 變動後是否仍然唯一滿足 high-confidence
+規則（第 170 條）——這正是本節記錄的限制在實作階段造成的直接、具體後果，而不是理論上的擔憂。
 
 **本輪明確不做的事**：不修改 `Scope`/`ScopeMembers` 的 Pydantic model、不修改 SQLite `scope_files`/
 `scope_symbols` 表結構、不新增 migration。這是 multi-worktree reconciliation／穩定 scope 治理的

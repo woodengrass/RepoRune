@@ -2284,3 +2284,147 @@ fresh 必須同時滿足可用 cache。`scope suggest` 同時從 raw SQLite conn
    transaction；使用者確認不導入 two-phase commit。`rebuild_cache()` 成功後，任一 deferred scopes/JSONL/
    project write 失敗即刪除 `memory.db` 與 sidecars，避免 readers 看見 cache 超前 canonical；下次 update 從
    source/canonical 完整重建。更新 project JSON 與 semantic append failure regressions。
+
+## Milestone 9 — Scope Governance（開工於獨立 worktree，`main` 同時有另一個 session 在做 Milestone 8）
+
+**範圍邊界（開工前重申，見本檔案 Milestone 9 一節與 ARCHITECTURE.md §4.4）**：只實作已定的
+`rune scope reconcile` 規則，不得擴大成重新 clustering 全 repo，不得自動搬移/移除 human 或 locked
+membership，large-churn threshold 由本輪決定並記錄理由（不能不設）。per-membership provenance 明確是
+future/V2，不屬本輪。
+
+165. **"Changed set" 的具體定義，本輪決定：canonical membership 與目前已 materialize 的 code index 之間的
+   落差，不是重跑一次工作目錄 git diff**。ARCHITECTURE §4.4 只定了「changed set」這個概念，沒有定義
+   `rune scope reconcile` 該怎麼計算它——`rune update`/`rune check`/`rune status` 各自用「掃描工作目錄、跟
+   `files` 表的 content_hash 比對」算出 added/modified/deleted，但那是「這次 `rune update` 該處理哪些檔案」
+   的問題，跟 `rune scope reconcile` 要回答的問題不同：後者假設呼叫時 `rune update` 已經在目標樹（通常是
+   merge 後的 integration worktree，ARCHITECTURE §16.4 明講的 workflow）上跑過、`memory.db` 已經反映最新
+   code index，`rune scope reconcile` 要問的是「這份已經最新的 code index，跟現有 `scopes.json` membership
+   之間哪裡對不上」。具體定義：目前 code index 裡存在、但不屬於任何 scope 的檔案/symbol，視為「新增」（沿用
+   Milestone 4 既有的 high-confidence import 規則）；scope membership 指向、但目前 code index 裡已經不存在
+   的檔案/symbol，視為「刪除」。這個定義的好處是它**不需要**額外重跑一次 diff 邏輯（重用
+   `read_current_code_index`，`core.scopes.reconcile` 因此完全不碰 `core.index.scanner`），而且天然滿足
+   「untouched region frozen」：任何內容改變但 scope membership 關係沒變的檔案，根本不會被這個落差比較挑出
+   來，不需要另外寫一條「排除已經 assigned 的檔案」的規則。程式碼與這段推理見
+   `src/rune/core/scopes/reconcile.py` 模組 docstring。
+166. **`AUTO`/`REVIEW`/`BROKEN` 的 high-confidence import 判準完全重用 Milestone 4 既有規則，不放寬也不另立
+   一套**：`scopes/model.py` 的 `assign_new_files_from_imports` 原本把「哪些檔案算某 scope 的成員」與
+   「單一 high-confidence import 候選」兩段邏輯內嵌在同一個函式裡，`rune update` 用它來寫入、`rune scope
+   reconcile` 需要同一套判斷邏輯做唯讀分類。抽成兩個共用函式（`member_files_by_unlocked_scope`、
+   `high_confidence_import_candidates`），`assign_new_files_from_imports` 改呼叫它們，`test_scopes.py`
+   既有的兩個回歸測試（唯一候選才 auto-assign、ambiguous/reference-only 一律拒絕）維持全綠，證明重構沒有
+   改變既有行為。
+167. **「human-authoritative」的判定，在缺乏 per-membership provenance 的現行 schema 下，本輪決定用
+   `scope.locked OR scope.source == human` 當代理指標，兩者任一成立就保護整個 scope 的每一筆
+   membership**：DATA_MODEL §9 明講 schema 沒有辦法回答「這一筆 membership 是誰加的」，只能在「整個
+   scope」這個較粗的粒度做判斷。單獨用 `locked` 不夠：`rune scope unlock` 之後，一個原本人類建立
+   （`source=human`，`create_scope` 預設 `locked=True`）的 scope 會變成 unlocked，但它的 membership
+   本質上仍然是人類決定的，不能因為使用者手動解鎖（通常是為了允許 Milestone 4 既有的 incremental
+   auto-assign *新增*成員）就連帶讓它已有的 membership 失去「刪除時必須進 BROKEN 而非靜默清除」的保護。
+   反過來，單獨用 `source == human` 也不夠：`locked` 是使用者可以獨立切換的顯式訊號（`rune scope
+   lock`/`unlock`），一個 model/auto 來源但被使用者手動 lock 的 scope，理當也要受保護。兩者任一即保護，
+   是這兩個訊號各自代表「人類已經對這個 scope 的 membership 做出過判斷」的合取，不是交集——用交集
+   （兩者都要）會讓「human 建立但已解鎖」的 scope 失去保護，明顯不對。已用專門的回歸測試鎖住這個決定
+   （`test_deleted_target_in_unlocked_human_scope_is_still_broken`），並用刻意注入的錯誤實作
+   （`_is_protected` 永遠回傳 `False`）驗證這條測試（與另外三條）真的會抓到這個回歸，revert 後全部轉綠才算
+   驗證通過。
+168. **Large-churn threshold：本輪決定為絕對數量 20（`config.scopes.reconcile_large_churn_threshold`），比較
+   `must_count_warn_threshold=30`（Milestone 8，ARCHITECTURE §7.7）的推理方式，但選了更保守的數字，理由
+   記錄如下**：`must_count_warn_threshold` 保護的是「每次 LLM 呼叫都要重複讀一次的 global MUST 規則清單」，
+   後果是 token 成本持續累積、閱讀負擔變高，是一個持續性、可逆的成本（超過門檻只是印警告，不阻止任何寫入）。
+   `rune scope reconcile` 的 AUTO 寫入是一次性、結構性地改變 `scopes.json`——ARCHITECTURE §4.4 開頭明講
+   「Scope 是穩定、漸進累積的 project knowledge，不是可以隨時重新計算的衍生資料」，且 V1 的預期使用情境是
+   「新專案從一開始就用 rune，scope 從小數量逐步累積」（§4.4 開場白），不是「丟一個大 repo 一次分完」。在這個
+   預期使用情境下，一次 reconcile 產生二十個以上高信心新增，已經是不尋常的批量事件（例如一次合併帶進大量
+   之前沒被任何 scope 認領的檔案），即使每一筆個別而言都符合 high-confidence 規則，仍然值得暫停讓人類看過
+   一次，而不是逐條自動接受——這是「個別判準正確」與「批量本身有風險」兩件事，guardrail 管的是後者。因此
+   選了比 `must_count_warn_threshold` 更小、更保守的絕對數字：20。之所以是絕對數量而非
+   changed-set-relative 比例（ARCHITECTURE §4.4 point 5 原文兩者都列為候選做法），是因為「changed set 本身
+   多大算合理」在 V1 沒有真實資料可以校準比例分母該怎麼定義（用「這次 reconcile 檢查了幾個檔案」當分母，
+   還是「目前 scopes.json 總 membership 數」，兩者語意不同、都缺乏依據），而 AUTO 寫入次數本身是使用者能
+   直接理解、之後能憑真實使用經驗調整的絕對量——這與 `must_count_warn_threshold=30` 選型時「沒有真實資料，
+   先給一個可推理、非隨意猜測的保守值，留給後續真實使用觀察再調」的精神一致，不是重新發明一套判斷方法。
+   `>` 而非 `>=`（剛好等於門檻值仍允許自動套用，見 `test_churn_threshold_boundary_is_inclusive`），因為門檻
+   本身已經是「多少算太多」的判斷，卡在門檻上不該被當成超標。用刻意注入的錯誤實作
+   （`suspicious_churn` 永遠為 `False`）驗證 `test_large_churn_blocks_every_auto_write` 真的會抓到「guardrail
+   被關掉」這個回歸。
+169. **`--full` 模式：本輪決定它擴大分類範圍（含 KEEP 逐筆列出，供完整 audit）但永遠不寫入，即使遇到
+   AUTO-eligible 的高信心單一候選也一樣**：ARCHITECTURE §4.4 point 4 的原文「Full reconciliation…且輸出只能
+   是 candidate/proposal/diff，不得靜默改寫 canonical membership」沒有明講 `--full` 到底擴大了什麼分類範圍
+   （因為當時只是預留 CLI flag、未實作）。本輪決定：預設模式的 entries 只列出真正需要人類注意的項目
+   （AUTO/REVIEW/BROKEN），KEEP 不逐筆列出（只計數），避免在大 repo 上每次 reconcile 都印出成千上萬行「沒事」
+   的訊息；`--full` 才逐筆列出 KEEP，用於「我想確認每一筆現有 membership 現在的狀態」這種主動稽核情境。
+   這個決定的直接後果是：預設模式與 `--full` 模式的差異純粹是「輸出詳盡度 + 是否允許寫入」兩個維度的組合，
+   不是「檢查範圍」的差異——兩者用的都是同一個 canonical-vs-index 落差（見第 165 條），沒有為 `--full`
+   另外實作一套「重新掃描/重新 cluster 整個 repo」的邏輯，這正是本輪範圍邊界明確禁止的事。
+   `test_full_mode_never_applies_even_high_confidence_auto`、CLI 層的
+   `test_scope_reconcile_full_never_writes` 鎖住這個決定。
+170. **明確決定不做、且記錄理由的一項（ARCHITECTURE §16.6 收尾段落暗示、但與本輪範圍邊界衝突）**：
+   §16.6 最後一段提到，branch-local 時期已經自動併入的 membership，merge 後若因為 import graph 多了其他
+   worktree 帶進的候選而不再滿足「唯一候選」，理論上「這筆 membership 就不再自動視為有效，需要落回人類
+   審查」——字面上這意味著 reconciliation 應該重新驗證**已經是 scope 成員**的檔案是否仍然唯一滿足
+   high-confidence 規則，不是只處理「目前完全沒有 scope 的檔案」。本輪**沒有實作這個重新驗證**：要做到這件
+   事，必須對每一筆現有 membership（而不只是未分配檔案）重新跑一次「它現在還唯一滿足高信心規則嗎」的檢查，
+   等於對整個 `scopes.json` 的既有內容做一次全面重新分類——這正是本輪範圍邊界明講「不得擴大成重新
+   clustering 全 repo」與「untouched region frozen」兩條要擋住的事，而且現行 schema（DATA_MODEL §9）根本
+   無法區分一筆既有 membership 是「當初被 Milestone 4 incremental auto-assign 自動寫入、理論上可以重新驗證」
+   還是「人類透過 `rune scope edit --add-file` 手動加的、不該被重新驗證」——沒有這個區分，對「所有現有
+   membership」一視同仁地重新驗證，實質上就是把每一筆 unlocked/非 human-source scope 的既有成員都變成
+   「每次 reconcile 都可能被踢出去重新分類」的狀態，這已經違反 §4.4 開頭「Scope 是穩定、漸進累積的 project
+   knowledge」的核心原則。這是本輪明確判斷「架構文件字面上暗示、但與同一份文件更上位的原則衝突」的情況，
+   記錄下來但不動手，留給有 per-membership provenance schema（DATA_MODEL §9 的 V2 候選）之後再處理，不在
+   `rune scope reconcile` 現有的 read_current_code_index-based 落差比較中悄悄擴大範圍。
+
+**交付項目完成情況**：`rune scope reconcile` CLI（`scope_app` 底下的 `reconcile` 子命令）與明確 opt-in 的
+`--full`；`AUTO`/`KEEP`/`REVIEW`/`BROKEN` 的穩定 `--json` 輸出（`protocol_version`、
+`auto_count`/`review_count`/`keep_count`/`broken_count`、`suspicious_churn`、逐筆 `entries`，每筆帶
+`scope_id`/`target_type`/`target`/`classification`/`reason`/`applied`/`candidate_scope_ids`，比照
+`search --json`/`scope-for --json` 既有的頂層 object + `protocol_version` 慣例）；deterministic
+candidate/review 產生（`core.scopes.reconcile.reconcile()`，純函式、不寫入，寫入交由 CLI 呼叫
+`save_scopes`，沿用 `core.update` 既有的「先算好再交易性寫入」模式）；沒有新增任何模型直接改寫 membership
+的路徑（`reconcile()` 本身不呼叫任何 LLM/model provider）。merge/integration worktree 使用流程與 integration
+reconciliation 驗收流程記錄在 ARCHITECTURE.md §4.4 新增小節（「Reconciliation CLI 與 merge/integration
+worktree 使用流程」）與 §16.4 的既有段落互相參照。
+
+**測試**：新增 13 個 `tests/unit/test_scope_reconcile.py`（AUTO/REVIEW/BROKEN/KEEP 各分類、locked 與
+`source=human`-but-unlocked 兩種保護訊號分開測試、large-churn guardrail 含邊界值測試、`--full` 永不寫入、
+symbol-level membership、跨 `PYTHONHASHSEED`/process 的 determinism 回歸測試，比照
+`test_references.py` 既有寫法）與 4 個 `tests/unit/test_cli.py` 端到端 CLI 測試（`--json` round-trip、
+`--full` 唯讀、BROKEN 保留 canonical、cache 不存在時的乾淨錯誤）。所有新測試都用刻意注入的錯誤實作
+（`_is_protected` 永遠 `False`、`suspicious_churn` 永遠 `False`）手動驗證過會抓到對應的回歸，不是只信任
+第一次寫對就通過。347 → 351 個 Python 測試全綠（本輪淨新增 17 個），`ruff check` 全綠。
+
+**已知限制（誠實記錄，非本輪疏漏）**：
+- 第 170 條記錄的「既有 membership 在 merge 後重新驗證」未實作，需要 per-membership provenance（future/V2）。
+- 沒有評估 zero-evidence 未分配檔案被列為 REVIEW 在大型既有 repo 上首次執行 `rune scope reconcile` 時是否
+  會產生大量雜訊（例如測試檔案、設定檔天生就不會有 import edge 指向任何 scope）——V1 定位仍是「新專案從
+  頭用 rune」，尚未有真實中大型 repo 的第一次執行經驗回饋，記錄供未來調整（例如替 REVIEW 加一個
+  `no_evidence` 子分類，讓使用者能選擇性地忽略/批量 dismiss，而不是每篇都要人工看過）。
+
+**Merge 前 code review 一輪（另一個 session 代使用者複查，兩處修正、一處記錄不動手）**：
+
+- **（中，已修）CLI 訊息順序**：`rune scope reconcile` 的人類可讀輸出原本
+  `if suspicious_churn: ... elif applied: ... elif full: ...` 依序判斷，導致 `--full` 搭配剛好超過
+  churn threshold 的樹時，印出「Suspicious churn... No changes were written -- review required」——
+  這句話本身沒錯（確實沒寫入），但把「沒寫入」的原因歸給 churn guardrail，而實際上 `--full` 本來就
+  絕對不寫入、跟 churn 完全無關。已改為先判斷 `full`，`--full` 一律印「N AUTO candidate(s) found
+  (--full, output-only)」，不再被 `suspicious_churn` 的訊息搶在前面。
+- **（低，已修）模組 docstring 用詞不精確**：`reconcile.py` 開頭原本寫「a file/symbol present in the
+  current index but a member of no scope is exactly the 'added file' case... reconcile applies that
+  same rule」，但程式碼只對「未分配的檔案」跑 AUTO/REVIEW 分類迴圈，從未對「未分配的 symbol」跑過
+  ——三個獨立 review 角度都各自發現這個字面矛盾。重新確認過 Milestone 4 原始的 incremental
+  auto-assignment 規則本來就只認 file-level import edge，沒有 symbol-level 的對應高信心規則，所以
+  程式碼行為（AUTO/REVIEW-for-new 只認檔案）才是對的；已改的是 docstring 措辭，讓它精確描述現況，
+  不再暗示 symbol 也有相同的「新增即分類」路徑。**是否要替「從未被任何 scope 以 symbol 形式收錄」的
+  symbol 也加一個 REVIEW 分類，本輪判斷為需要使用者確認的範圍擴張（可能在大型既有 repo 上對幾乎每個
+  未特別用 symbol 層級收錄的函式都跳出 REVIEW，雜訊風險比照上一條「zero-evidence 未分配檔案」的疑慮，
+  但量級可能大得多——大多數 scope 只用 `members.files`，`members.symbols` 是特例用法）**，記錄下來但
+  不動手，需要下一輪跟使用者確認後才實作。既有 membership 被刪除的方向（BROKEN/REVIEW-for-removal）
+  對檔案與 symbol 本來就對稱處理，不受這條影響。
+- **（低，記錄不動手）`reconcile()` 對未分配檔案的迴圈是 O(未分配檔案數 × edges 總數)**（`high_
+  confidence_import_candidates` 每次呼叫都重新掃一次 `code_index.edges`），在既有大型 repo 第一次執行
+  `rune scope reconcile` 時可能明顯變慢；`assign_new_files_from_imports`（`rune update` 既有的
+  incremental 路徑）不受影響，因為它只在小得多的「這次新增的檔案」delta 上跑。這是效能問題，不是正確性
+  問題，且與上一條「zero-evidence 雜訊」問題同源（首次在大型既有 repo 執行的體驗尚未有真實回饋）——記錄
+  下來，留待有真實大型 repo 執行數據後再決定是否要把 `edges` 依 `source_file` 預先分組成 dict。
+
+351 個測試維持全綠（這輪只改訊息順序與註解文字，不影響任何既有測試的斷言），`ruff check` 全綠。

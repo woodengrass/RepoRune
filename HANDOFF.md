@@ -1,8 +1,44 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，**Milestone 8（MCP + Polish）已完成**（見文末「立刻可以做的下一步」），
-**Milestone 9（Scope Governance）已在獨立分支 `milestone-9-scope-governance` 完成、待 review/merge**。
-以下先保留 Milestone 7 真實 OpenCode host 驗收完成時寫的段落（歷史記錄）：Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
+最後更新：2026-09-07，**Milestone 8（MCP + Polish）與 Milestone 9（Scope Governance）皆已完成並
+merge 進 `main`**。
+
+**Milestone 8**：新增 `rune.mcp.server`（17 個 MCP tool，清單經使用者確認，取代原本查無實據的
+「規格 §56 十個 tool」）、`rune doctor`（`core.doctor`）、四個新 `core.retrieval` 模組
+（`symbol_search`/`scope_read`/`related_context`/`changes`）、README quickstart、wheel 打包驗證過。
+Commit 前跑過一輪 8 角度 code review，修正 3 個真的問題（`related_context` 查詢路徑的 constraint
+severity/note category 原本用 rank 反推、會誤判/漏過 INFO severity，改用真正的 `get_constraint`/
+`get_note` 查詢；`CacheUnusableError` 在多數 MCP read tool 沒被攔截，改用單一 `@_tool` decorator
+統一把已知例外轉成 `ValueError`；`rune_scope_for` 的 symbol 解析邏輯原本寫在 protocol 層，違反
+`ARCHITECTURE.md §5`「業務邏輯只能在 core」的規則，移到 `core.retrieval.scope_for.resolve_scope_for`）。
+細節見 IMPLEMENTATION_PLAN.md「Milestone 8 已實作完成」段落。378 個測試全綠。
+
+**Milestone 9**：`rune scope reconcile`（含明確 opt-in 的 `--full`）已實作，`core.scopes.reconcile`
+純函式計算 AUTO/KEEP/REVIEW/BROKEN 分類（changed set 定義為 canonical `scopes.json` 與目前已
+materialize 的 code index 之間的落差，不是重跑一次工作目錄 diff），CLI 輸出比照既有 `--json` 慣例
+（`protocol_version` + 逐筆 `entries` + `auto_count`/`review_count`/`keep_count`/`broken_count`/
+`suspicious_churn`）。Large-churn guardrail 鎖定為絕對數量 20（`config.scopes.
+reconcile_large_churn_threshold`，理由見 IMPLEMENTATION_PLAN.md 第 168 條，比照
+`must_count_warn_threshold=30` 的推理方式但選了更保守的數字）。`locked`/`source==human` 任一即保護
+整個 scope 的 membership（現行 schema 沒有 per-membership provenance，只能用這個 whole-scope 級代理指標，
+見 DATA_MODEL.md §9 與 IMPLEMENTATION_PLAN.md 第 167 條）；deleted 的受保護 target 產生 `BROKEN`，從不靜默
+清除。**明確記錄一項刻意不做的事**：ARCHITECTURE.md §16.6 收尾段落字面上暗示「已經是 scope 成員的檔案，
+merge 後若不再唯一滿足 high-confidence 規則就該重新落回 REVIEW」，但這需要對整個既有 `scopes.json` 內容
+重新分類，與 §4.4 開頭「Scope 是穩定、漸進累積的 project knowledge」的核心原則衝突，且現行 schema 無法區分
+「當初被自動寫入、可以重新驗證」與「人類手動加的、不該被重新驗證」的 membership——判斷為架構文件內部的
+字面暗示與更上位原則衝突，選擇不動手，完整記錄在 IMPLEMENTATION_PLAN.md 第 170 條，留給 per-membership
+provenance（DATA_MODEL §9 的 V2 候選）之後再處理。開工於獨立背景 session（不同 git worktree），完成後
+同樣跑過一輪獨立 code review（另一個 session 代使用者複查），修正 CLI 訊息順序 bug（`--full` 搭配剛好
+超過 churn threshold 時，原本誤印成「churn guardrail 擋下寫入」而非「`--full` 本來就不寫入」）與 docstring
+用詞不精確的問題（symbol 沒有跟 file 一樣的「新增即分類」路徑，docstring 原本暗示兩者對稱），並記錄一項
+需要使用者後續確認的範圍問題：未被任何 scope 以 symbol 形式收錄的 symbol 要不要也產生 REVIEW（本輪判斷
+雜訊風險太高、需要先問使用者，未擅自決定）。收工時 352 個 Python 測試全綠，`ruff check` 全綠。
+
+**兩個 milestone 分別在 `main` 與獨立分支 `milestone-9-scope-governance` 開發，merge 時 `HANDOFF.md`/
+`IMPLEMENTATION_PLAN.md`/`tests/unit/test_cli.py` 有純文字疊加型衝突（兩邊各自新增不同章節/測試，沒有
+互相修改對方內容），已人工合併，兩邊內容都保留，未取捨掉任何一方的記錄。**
+
+之前一輪：Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
 Windows、host Node `v24.3.0`、OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`）：正式 adapter 成功載入，
 `system.transform` context 真的被模型看見；global/scoped MUST、`read`/`apply_patch` path、bash post-change scope
 activation、三個 custom tools、跨 session isolation 與 `session.compacted` 後 rehydrate 均已真實驗證。soft/title
@@ -360,7 +396,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
 | 7. OpenCode Adapter | ✅ 完成 | 正式 host 驗收：注入、path、bash/scope、custom tools、isolation、title/soft 與 compaction。 |
 | 8. MCP + Polish | ✅ 完成 | MCP server（17 tool）、`rune doctor`、打包（wheel 驗證過）、README |
-| 9. Scope Governance | 🔶 已在獨立分支完成，待 review/merge | `rune scope reconcile`（AUTO/KEEP/REVIEW/BROKEN）；分支 `milestone-9-scope-governance`，見下方說明 |
+| 9. Scope Governance | ✅ 完成 | `rune scope reconcile`（含 `--full`）、AUTO/KEEP/REVIEW/BROKEN、large-churn guardrail（閾值 20）。 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
 失敗
@@ -556,27 +592,23 @@ git-init 過的小型測試用 repo）。
 
 ## 立刻可以做的下一步
 
-**Milestone 8（MCP + Polish）已完成**：見上方表格與 IMPLEMENTATION_PLAN.md「Milestone 8 已實作完成
-（第二十五輪修訂）」段落——`rune.mcp.server`（17 個 MCP tool，清單經使用者確認、取代原本查無實據的
-「十個 tool」）、`core.doctor`、四個新 `core.retrieval` 模組（`symbol_search`/`scope_read`/
-`related_context`/`changes`）、README quickstart、wheel 打包驗證過可安裝。365 個測試全綠、
-`ruff check` 全綠。**尚未 commit**——下一步是先看過這輪的變更（`git status`/`git diff`）、確認滿意後
-自己決定 commit message 與是否 push。
+**Milestone 8 與 Milestone 9 都已完成、都已 commit、都已 merge 進 `main`**（`milestone-9-scope-
+governance` 分支的內容已合併，分支本身仍保留未刪除；`.claude/worktrees/` 底下的對應 git worktree
+也還在，未清理，供對照）。合併時 `HANDOFF.md`/`IMPLEMENTATION_PLAN.md`/`tests/unit/test_cli.py`
+三個檔案有純疊加型衝突（兩邊各自新增不同章節/測試，人工合併時兩邊都保留，沒有取捨掉任何一方的內容）。
+合併後跑過一次完整測試套件確認組合後仍全綠。
 
-**Milestone 9（Scope Governance）已在獨立背景 session 於分支 `milestone-9-scope-governance` 完成**
-（與本輪 M8 同時進行，兩者互不干擾，工作目錄各自獨立）：`rune scope reconcile [--full]`、
-AUTO/KEEP/REVIEW/BROKEN 分類、large-churn threshold 定為 20（`config.scopes.
-reconcile_large_churn_threshold`，理由見該 session 對 IMPLEMENTATION_PLAN.md 的決策記錄）。**該
-session 明確標記一項需要使用者確認的開放問題**：ARCHITECTURE §16.6 末段提及的「merge 後對*已指派*
-membership 的重新驗證」該 session 判斷為超出本 milestone 範圍、且缺乏 per-membership provenance
-無法安全實作，記錄為已知缺口而非動手實作——下一步除了 review/merge 這個分支的程式碼變更本身，也需要
-確認這個範圍判斷是否正確。**這個分支尚未合併進 `main`**，合併前建議：(1) 確認 M8（本輪，尚在
-working tree，未 commit）與 M9（該分支）之間沒有檔案層級衝突（M8 只碰
-`src/rune/{mcp,core/doctor.py,core/retrieval/{symbol_search,scope_read,related_context,changes}.py}`
-與少數既有檔案如 `scope_for.py`/`search.py`/`records.py`/`pyproject.toml`/`README.md`；M9 依其自述
-只碰 `core.scopes`/`cli`/`core.update` 的 scope-membership 邊界，理論上不重疊，但仍需實際跑一次
-merge 確認）、(2) 兩邊的測試計數與 `ruff check` 分別過了之後，合併後再跑一次完整測試套件確認組合後
-仍全線。
+**下一步兩個候選方向**：
+
+1. **確認 Milestone 9 記錄的開放問題**：ARCHITECTURE §16.6 末段提及的「merge 後對*已指派*
+   membership 的重新驗證」該工作判斷為超出本 milestone 範圍、且缺乏 per-membership provenance
+   無法安全實作，記錄為已知缺口而非動手實作（IMPLEMENTATION_PLAN.md 第 170 條）——需要使用者確認這個
+   範圍判斷是否正確。同一輪 review 也記錄了一個類似但更廣的開放問題：未被任何 scope 以 symbol 形式
+   收錄的 symbol 要不要也產生 REVIEW（目前判斷雜訊風險太高，未擅自決定，見 IMPLEMENTATION_PLAN.md
+   對應段落）。
+2. **開始規劃下一個 milestone / V2 方向**：8 個原定 milestone 已全部完成。V1 範圍內已知未做的事見
+   本文件「已知的限制／還沒做的事」一節（per-membership provenance、多人協作 revision 衝突偵測等），
+   這些明確是 V2 候選，不是本輪遺漏。
 
 **Milestone 6（Policies & Memory）已全部完成**（見上方「第十九～二十一輪修訂」與
 IMPLEMENTATION_PLAN.md 第 95-106 條）：`core.memory.{revisions,hashes,proposals,notes,

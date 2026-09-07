@@ -17,6 +17,7 @@ def test_write_default_config_then_load_roundtrips(tmp_path: Path) -> None:
     assert config.bootstrap.hard_budget_tokens == 3000
     assert config.bootstrap.soft_budget_tokens == 8000
     assert config.bootstrap.must_count_warn_threshold == 30
+    assert config.scopes.reconcile_large_churn_threshold == 20
     assert config.semantic.max_tokens == 16000
     assert config.semantic.reasoning.enabled is True
     assert config.semantic.reasoning.effort is None

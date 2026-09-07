@@ -109,6 +109,49 @@ def delete_scope(layout: RuneLayout, scope_id: str) -> None:
     save_scopes(layout, scopes_file)
 
 
+def member_files_by_unlocked_scope(
+    scopes_file: ScopesFile, symbol_files: dict[str, str]
+) -> dict[str, set[str]]:
+    """Maps each *unlocked* scope's id to the set of files it currently owns
+    (its own `members.files`, plus the owning file of each of its
+    `members.symbols`, resolved via `symbol_files`). Locked scopes are
+    excluded entirely -- they are never a valid target for the high-
+    confidence auto-assignment rule below, in `assign_new_files_from_imports`
+    or `core.scopes.reconcile`, which both build on this same map so the
+    "what counts as a candidate scope" question has exactly one
+    implementation (ARCHITECTURE.md §4.4).
+    """
+    return {
+        scope.id: set(scope.members.files)
+        | {symbol_files[symbol] for symbol in scope.members.symbols if symbol in symbol_files}
+        for scope in scopes_file.scopes
+        if not scope.locked
+    }
+
+
+def high_confidence_import_candidates(
+    member_files_by_scope: dict[str, set[str]], path: str, edges: Iterable[Edge]
+) -> set[str]:
+    """The set of unlocked scope ids `path` has a high-confidence
+    (`edge_type=imports`, `confidence=1.0`) import edge into. Zero, one, or
+    many -- the caller decides what "many"/"zero" means (ambiguous vs. no
+    evidence); this function only computes the raw candidate set, kept
+    separate so `assign_new_files_from_imports` (write path, `rune update`)
+    and `core.scopes.reconcile` (read-only classification, `rune scope
+    reconcile`) apply the exact same evidence rule without duplicating it.
+    """
+    return {
+        scope_id
+        for edge in edges
+        if edge.source_file == path
+        and edge.edge_type is EdgeType.imports
+        and edge.confidence == 1.0
+        and edge.target_file is not None
+        for scope_id, member_files in member_files_by_scope.items()
+        if edge.target_file in member_files
+    }
+
+
 def assign_new_files_from_imports(
     scopes_file: ScopesFile,
     added_paths: set[str],
@@ -122,24 +165,10 @@ def assign_new_files_from_imports(
     excluded (ARCHITECTURE.md §4.4).
     """
     symbol_files = {symbol.symbol_id: symbol.file for symbol in symbols}
-    member_files_by_scope = {
-        scope.id: set(scope.members.files)
-        | {symbol_files[symbol] for symbol in scope.members.symbols if symbol in symbol_files}
-        for scope in scopes_file.scopes
-        if not scope.locked
-    }
+    member_files_by_scope = member_files_by_unlocked_scope(scopes_file, symbol_files)
     changed_scope_ids: list[str] = []
     for path in sorted(added_paths):
-        candidate_ids = {
-            scope_id
-            for edge in edges
-            if edge.source_file == path
-            and edge.edge_type is EdgeType.imports
-            and edge.confidence == 1.0
-            and edge.target_file is not None
-            for scope_id, member_files in member_files_by_scope.items()
-            if edge.target_file in member_files
-        }
+        candidate_ids = high_confidence_import_candidates(member_files_by_scope, path, edges)
         if len(candidate_ids) != 1:
             continue
         scope_id = candidate_ids.pop()

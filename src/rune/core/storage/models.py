@@ -458,6 +458,20 @@ class BootstrapConfig(StrictModel):
     must_count_warn_threshold: int = 30
 
 
+class ScopesConfig(StrictModel):
+    """See ARCHITECTURE.md §4.4's Scope Membership Reconciliation section and
+    IMPLEMENTATION_PLAN.md's Milestone 9 decision log for the reasoning
+    behind the default. `reconcile_large_churn_threshold` bounds how many
+    AUTO (high-confidence import, single-candidate) membership additions
+    `rune scope reconcile` (non-`--full`) may write in one run before it
+    treats the batch as suspicious and aborts every auto-write in that run,
+    falling back to review-only output -- a hard invariant (ARCHITECTURE.md
+    §4.4 point 5), not a warning like `must_count_warn_threshold` above.
+    """
+
+    reconcile_large_churn_threshold: int = 20
+
+
 class RuneConfig(StrictModel):
     version: int = 1
     index: IndexConfig = Field(default_factory=IndexConfig)
@@ -467,3 +481,4 @@ class RuneConfig(StrictModel):
     proposals: ProposalsConfig = Field(default_factory=ProposalsConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
     bootstrap: BootstrapConfig = Field(default_factory=BootstrapConfig)
+    scopes: ScopesConfig = Field(default_factory=ScopesConfig)
