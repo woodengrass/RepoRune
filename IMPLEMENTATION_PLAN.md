@@ -590,6 +590,92 @@ text 解析）。
   就少回傳任何一條規則。
 - MCP tool 呼叫與對應 CLI 指令產生相同的資料形狀（兩個介面之間不 drift）。
 
+**Milestone 8 已實作完成（第二十五輪修訂）**：見 `src/rune/mcp/server.py`、`src/rune/core/doctor.py`、
+`src/rune/core/retrieval/{symbol_search,related_context,scope_read,changes}.py`。開工前確認了兩個
+規格缺口，記錄如下：
+
+1. **「規格 §56 的十個 tool」清單在本 repo 裡查不到**（原始規格文件不在 repo 內，只剩這份文件的引用）。
+   跟使用者確認後，改用使用者親自指定的 **17 個** tool 清單（`rune_status`/`rune_doctor`/`rune_search`/
+   `rune_symbol_search`/`rune_scope_for`/`rune_scope_read`/`rune_bootstrap`/`rune_related_context`/
+   `rune_check`/`rune_changes`/`rune_decision_get`/`rune_constraint_get`/`rune_note_get`/
+   `rune_decision_propose`/`rune_constraint_propose`/`rune_note_add`/`rune_note_update`），取代原本
+   「十個」的假設——這是使用者的明確決定，不是本輪自行擴大範圍。刻意不暴露：`rune update`（LLM/網路
+   成本 + 非顯式觸發的 canonical 寫入）、scope CRUD/`suggest`（設計上需要人類確認，ARCHITECTURE §4.4）、
+   `proposal approve`/`reject`/`edit`（核准正是治理記錄存在的人類把關點，agent 自己核准自己的提案會
+   讓整個機制失去意義）。
+2. **`schema_meta.materialized_from_head`/`materialized_from_tree_hash` 實際上不存在於 `schema.sql`**
+   （直接查證：`schema_meta` 只存過 `schema_version` 一個 key）。canonical/cache 一致性檢查改用
+   `compute_status()` 既有的 `cache_usable`/`working_tree_fresh`（`rune status` 本來就用的同一套
+   freshness 計算），不是新增 schema 欄位去對照一個規格草稿提到、但從未真正實作的欄位。
+
+**新增的 core 模組**（`rune_related_context`/`rune_scope_read`/`rune_changes` 沒有既有 core 函式可
+直接包，補的是「組合既有函式」而非新業務邏輯，符合「MCP 是薄包裝層」的原則）：
+- `core.retrieval.symbol_search`：結構化 symbol 查詢（name/qualified_name/kind/path，可選配合
+  `fts_symbols` 全文查詢），是 `core.retrieval.search`（純文字搜尋 Decision/Constraint/Note/語意摘要）
+  刻意不涵蓋 symbol 的對應功能。
+- `core.retrieval.scope_read`：依 scope_id 直接讀取單一 scope 的完整 agent-facing 視圖（metadata、
+  members、語意摘要、current+visible 的 Decision/Constraint/Note）。重構 `scope_for.py`，把
+  per-scope-id 查詢（`scope_summary`/`scope_constraints`/`scope_notes`）抽成 `scope_for`/`scope_read`
+  共用的公開函式，避免同一段 SQL 出現兩份會漂移的拷貝；新增 `scope_decisions`（`scope_for` 先前只回傳
+  Constraint/Note，從未有過 per-scope Decision 查詢）。
+- `core.retrieval.related_context`：`rune_related_context` 的核心，組合
+  `scope_for`/`scope_decisions`/`core.retrieval.search`/`symbol_search`，依 `path`/`symbol`/`query`
+  聚合並排序 scopes/constraints/decisions/notes/semantic/symbols 六個 bucket；`max_items` 對每個
+  bucket 各自截斷（不是總量預算）——刻意選擇，避免要 scope 又要 symbol 的呼叫者因為其中一個 bucket
+  命中很多而被犧牲。至少要給 `path`/`symbol`/`query` 其中一個，否則 `RelatedContextValidationError`。
+- `core.retrieval.changes`：重用 `rune check` 既有的 working-tree diff，額外回傳**全專案**（不只本次
+  diff 觸及的）`possibly_stale`/`stale` 語意摘要清單——這是刻意的設計選擇：`rune check` 的 constraint
+  清單本來就是「只看這次改動」的視角，但「哪些摘要該重新生成」是一個獨立於本次 diff 的待辦清單，
+  agent 問「還有什麼要處理」時應該看到全貌。
+- `core.retrieval.search.search()` 新增可選 `kinds` 參數（限定只查 decision/constraint/note/semantic
+  其中幾種），供 `rune_search` 的 `kinds` 過濾用；預設 `None`（全部四種）與所有既有呼叫者行為完全不變。
+- `core.memory.records` 新增 `get_decision`/`get_constraint`/`get_note`（單一 record 讀取，可選
+  `include_history`），供 `rune_decision_get`/`rune_constraint_get`/`rune_note_get` 使用。
+
+**`rune doctor`**（`core.doctor.run_doctor`）：git 可用性、config 合法性、tree-sitter parser
+可匯入性、canonical 檔案 schema_version（重用 `read_json_model`/`read_jsonl` 既有的
+`UnknownSchemaVersionError`，不重新實作版本檢查）、cache 可開啟性 + working-tree freshness、
+semantic provider 設定（**刻意只做靜態檢查**——`semantic.model` 是否為空、對應的 API key 環境變數
+是否存在——不呼叫 `check_semantic_health` 的即時連線探測，因為 `rune update` 本身已經做那個探測，
+`doctor` 應該保持零副作用、隨時可跑）、Global MUST 數量門檻與 hard bootstrap token 預算警告（重用
+`config.bootstrap.must_count_warn_threshold`，此欄位其實在 Milestone 5 那輪就已經加進
+`BootstrapConfig`，本輪才第一次被消費）、global（`scopes==[]`）但 `persistence_mode` 非
+`persistent` 的可疑 constraint 警告。`semantic/provider.py` 新增 `api_key_env_var()`
+公開函式，讓 `doctor` 能查詢「這個 provider 該讀哪個環境變數」而不用重複 `_ENV_VAR_BY_PROVIDER`
+這份對照表，也不需要真的呼叫 `build_provider()`。
+
+**MCP server**（`rune.mcp.server`，用官方 `mcp` Python SDK 2.x 的 `MCPServer`/`@mcp.tool()`——
+確認 pip 解出的是 2.1.1，其 `FastMCP` 已改名 `MCPServer`，import 路徑改為
+`mcp.server.mcpserver`）：17 個 tool 全部是 `core` 函式的薄包裝，in-process 直接呼叫（跟
+OpenCode adapter 不同——adapter 是獨立 TypeScript process，只能透過 `rune` CLI 的 `--json`
+輸出溝通；MCP server 是 Python，直接 import `rune.core`，不需要、也不應該再繞經 CLI 子行程）。
+`console_scripts` 新增 `rune-mcp` 進入點（`pyproject.toml`）。已用臨時 repo 手動端對端驗證過：
+`rune_decision_propose` 只建立 pending proposal、在核准前 `rune_search` 找不到它；核准
+（透過 CLI `proposal approve`）後才找得到；`rune_note_add`/`rune_note_get`/`rune_note_update`
+的寫入-讀取往返；`rune_scope_read`/`rune_related_context` 對不存在的 scope_id／缺 selector
+正確丟出可讀的 `ValueError`（MCP SDK 會把它轉成 tool error 回應，不是原始 traceback）。
+
+**已知未做到、記錄而非忽略的缺口**：
+- 驗收標準要求的「MCP tool 與對應 CLI 指令產生相同資料形狀，兩者不 drift」沒有自動化測試保護——
+  MCP 回傳的 dict 形狀是手動比照 CLI 對應指令的 `--json` 輸出寫的（欄位名稱、巢狀結構刻意一致），
+  但沒有像 `symbol_search`/`related_context` 的 core 函式那樣做到「唯一實作、兩處呼叫」，因為 CLI
+  組 JSON 的邏輯目前就內嵌在 `cli/main.py` 各指令函式裡，不是獨立可重用的函式。留給未來一輪視需要
+  抽出共用的 dict-shaping 函式。
+- `rune_scope_for`/`rune_related_context` 的 `symbol` 參數目前是「用 `symbol_search(query=symbol)`
+  取第一個命中結果的檔案」這種 best-effort 解析，不是精確的 symbol_id 查找；同名 symbol 出現在
+  多個檔案時可能解析到非預期的那個。規格只說「輸入 path 或 symbol」，沒有進一步定義 symbol 參數該是
+  qualified_name 還是 symbol_id 還是自由文字，此輪先用最寬鬆的全文比對滿足「可用」，精確化留待有
+  真實使用回饋後再決定。
+- `symbol_search()`/`related_context()`/`scope_read()`/`changes()` 目前只有 core 函式與 MCP tool
+  暴露，沒有對應的獨立 `rune` CLI 子指令（`rune symbol-search`/`rune related-context` 例外——這兩個
+  為了測試方便與既有 CLI 慣例一致而補上了；`rune scope-read`/`rune changes` 沒有）。MCP server 是
+  in-process 直接呼叫 core，不需要 CLI 子指令才能用，所以不補這兩個純屬範圍控制，不是遺漏。
+
+新增 20 個 regression test（`tests/unit/test_doctor.py`、`tests/integration/test_retrieval_
+{symbol_search,scope_read,changes,related_context}.py`、`tests/integration/test_mcp_server.py`、
+`tests/unit/test_cli.py` 新增 4 條），365 個測試全綠、`ruff check` 全綠。真的用臨時 git repo 跑過
+`rune init` -> propose -> approve -> search 的端對端流程確認 MCP 工具行為正確，不只是單元測試 mock。
+
 ## Milestone 9 — Scope Governance
 **模組**：`rune.core.scopes`、`rune.cli`、`rune.core.update` 的 scope-membership 邊界。
 

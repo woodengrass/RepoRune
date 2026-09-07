@@ -56,7 +56,7 @@ class SearchResult:
     # `--history`.
 
 
-def _fts_phrase(query: str) -> str:
+def fts_phrase(query: str) -> str:
     """FTS5 phrase-query form of an arbitrary user string: quoted, with
     embedded double-quotes doubled per FTS5's own escaping rule. V1
     deliberately does not expose FTS5's full query syntax (AND/OR/NEAR/
@@ -67,10 +67,28 @@ def _fts_phrase(query: str) -> str:
     return '"' + query.replace('"', '""') + '"'
 
 
-def search(layout: RuneLayout, query: str, *, history: bool = False, limit: int = 50) -> list[SearchResult]:
+_ALL_KINDS = frozenset({"constraint", "decision", "semantic", "note"})
+
+
+def search(
+    layout: RuneLayout,
+    query: str,
+    *,
+    history: bool = False,
+    limit: int = 50,
+    kinds: frozenset[str] | None = None,
+) -> list[SearchResult]:
     """Runs `query` against every FTS5 index and returns matches sorted by
     rank (ascending -- rank 1 first), then by id for a stable order within
     a rank.
+
+    `kinds`, when given, restricts which of `{"constraint", "decision",
+    "semantic", "note"}` are queried at all (not just filtered after the
+    fact -- skips the FTS5 query entirely for an excluded kind). `None`
+    (the default) means all four, preserving every existing caller's
+    behavior unchanged. Symbol search is not one of these kinds -- it's a
+    structured field lookup, not a phrase match over prose, and lives in
+    `core.retrieval.symbol_search` instead.
 
     `history=True` additionally includes:
     - non-visible *current* revisions (`inactive`/`orphaned` Decisions/
@@ -86,16 +104,21 @@ def search(layout: RuneLayout, query: str, *, history: bool = False, limit: int 
     as a real cache (0 bytes, truncated); returns `[]` if it doesn't
     exist at all (nothing has been indexed yet, not an error).
     """
+    wanted = kinds if kinds is not None else _ALL_KINDS
     if not layout.memory_db.exists():
         return []
     conn = connect_for_read(layout)
     try:
-        phrase = _fts_phrase(query)
+        phrase = fts_phrase(query)
         results: list[SearchResult] = []
-        results.extend(_search_constraints(conn, phrase, history))
-        results.extend(_search_decisions(conn, phrase, history))
-        results.extend(_search_semantic(conn, phrase))
-        results.extend(_search_notes(conn, phrase, history))
+        if "constraint" in wanted:
+            results.extend(_search_constraints(conn, phrase, history))
+        if "decision" in wanted:
+            results.extend(_search_decisions(conn, phrase, history))
+        if "semantic" in wanted:
+            results.extend(_search_semantic(conn, phrase))
+        if "note" in wanted:
+            results.extend(_search_notes(conn, phrase, history))
         results.sort(key=lambda r: (r.rank, r.id))
         return results[:limit]
     finally:
@@ -258,4 +281,4 @@ def _search_notes(conn: sqlite3.Connection, phrase: str, history: bool) -> list[
     return out
 
 
-__all__ = ["CacheUnusableError", "SearchResult", "possibly_stale_pointer", "search"]
+__all__ = ["CacheUnusableError", "SearchResult", "fts_phrase", "possibly_stale_pointer", "search"]

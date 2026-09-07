@@ -11,23 +11,34 @@ canonical schema change. Composed entirely from already-established
 building blocks: `semantic_objects` (Milestone 5), `constraint_scopes`/
 `note_scopes` (Milestone 6) -- current+visible filtering follows exactly
 the same rules `core.retrieval.search`/`check` already use.
+
+The per-scope-id query helpers below (`scope_summary`/`scope_constraints`/
+`scope_notes`/`scope_decisions`) take an open connection rather than a
+`RuneLayout` and are exported for reuse -- Milestone 8's `rune_scope_read`
+(look up a *known* scope_id directly) and `rune_related_context` need
+exactly the same per-scope queries `scope_for` (look up scope_id(s) *by
+path*) already does, and duplicating the SQL a second time would let the
+two drift out of sync.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
 
 from rune.core.project import RuneLayout
 from rune.core.retrieval.search import possibly_stale_pointer
+from rune.core.retrieval.symbol_search import symbol_search
 from rune.core.storage.sqlite.materialize import connect_for_read
 
-_VISIBLE_CONSTRAINT_STATUSES = {"active", "review_required", "stale"}
-_VISIBLE_NOTE_STATUSES = {"active", "stale"}
+VISIBLE_CONSTRAINT_STATUSES = {"active", "review_required", "stale"}
+VISIBLE_NOTE_STATUSES = {"active", "stale"}
+VISIBLE_DECISION_STATUSES = {"active", "review_required"}
 # ARCHITECTURE.md §7.1: only MUST/SHOULD are ever proactively injected;
 # INFO-severity constraints are discoverable via `rune search` but don't
 # justify spending context budget on every scope activation.
-_INJECTED_CONSTRAINT_SEVERITIES = {"MUST", "SHOULD"}
+INJECTED_CONSTRAINT_SEVERITIES = {"MUST", "SHOULD"}
 
 
 @dataclass(frozen=True)
@@ -46,6 +57,107 @@ class ScopeForNote:
     content: str
     status: str
     warning: str | None
+
+
+@dataclass(frozen=True)
+class ScopeForDecision:
+    record_id: str
+    content: str
+    status: str
+    warning: str | None
+
+
+def scope_summary(conn: sqlite3.Connection, scope_id: str) -> tuple[str | None, str | None]:
+    """(summary_text, summary_status) for `scope_id`: `(None, None)` if no
+    semantic summary was ever generated; the real `purpose` text for
+    `fresh`; `possibly_stale_pointer()`'s text (never the possibly-wrong
+    prose itself) for `possibly_stale`/`stale`; `(None, status)` for
+    `unavailable`/`orphaned` (a status exists, but nothing to show).
+    """
+    row = conn.execute(
+        "SELECT purpose, status, payload_json FROM semantic_objects WHERE scope_id = ?", (scope_id,)
+    ).fetchone()
+    if row is None:
+        return None, None
+    status = row["status"]
+    if status == "fresh":
+        return row["purpose"], status
+    if status in ("possibly_stale", "stale"):
+        payload = json.loads(row["payload_json"])
+        return possibly_stale_pointer(list(payload.get("source_files", {}))), status
+    return None, status
+
+
+def scope_constraints(conn: sqlite3.Connection, scope_id: str) -> list[ScopeForConstraint]:
+    rows = conn.execute(
+        "SELECT r.record_id, v.severity, v.content, v.status "
+        "FROM constraint_scopes cs "
+        "JOIN constraint_records r ON r.record_id = cs.record_id "
+        "JOIN constraint_revisions v "
+        "  ON v.record_id = r.record_id AND v.revision = r.current_revision "
+        "WHERE cs.scope_id = ? AND cs.revision = r.current_revision",
+        (scope_id,),
+    ).fetchall()
+    out = [
+        ScopeForConstraint(
+            record_id=row["record_id"], severity=row["severity"], content=row["content"],
+            status=row["status"],
+            warning=row["status"] if row["status"] in ("review_required", "stale") else None,
+        )
+        for row in rows
+        if row["status"] in VISIBLE_CONSTRAINT_STATUSES and row["severity"] in INJECTED_CONSTRAINT_SEVERITIES
+    ]
+    out.sort(key=lambda c: (c.severity != "MUST", c.record_id))
+    return out
+
+
+def scope_notes(conn: sqlite3.Connection, scope_id: str) -> list[ScopeForNote]:
+    rows = conn.execute(
+        "SELECT r.id, v.category, v.content, v.status "
+        "FROM note_scopes ns "
+        "JOIN note_records r ON r.id = ns.id "
+        "JOIN note_revisions v ON v.id = r.id AND v.revision = r.current_revision "
+        "WHERE ns.scope_id = ? AND ns.revision = r.current_revision",
+        (scope_id,),
+    ).fetchall()
+    out = [
+        ScopeForNote(
+            id=row["id"], category=row["category"], content=row["content"],
+            status=row["status"], warning="[STALE]" if row["status"] == "stale" else None,
+        )
+        for row in rows
+        if row["status"] in VISIBLE_NOTE_STATUSES
+    ]
+    out.sort(key=lambda n: n.id)
+    return out
+
+
+def scope_decisions(conn: sqlite3.Connection, scope_id: str) -> list[ScopeForDecision]:
+    """Current+visible Decisions scoped to `scope_id` -- there was
+    previously no per-scope Decision query anywhere in `core.retrieval`
+    (`scope_for` only ever returned Constraints/Notes), needed once
+    Milestone 8's `rune_scope_read`/`rune_related_context` MCP tools
+    wanted a scope's Decisions alongside its Constraints/Notes.
+    """
+    rows = conn.execute(
+        "SELECT r.record_id, v.content, v.status "
+        "FROM decision_scopes ds "
+        "JOIN decision_records r ON r.record_id = ds.record_id "
+        "JOIN decision_revisions v "
+        "  ON v.record_id = r.record_id AND v.revision = r.current_revision "
+        "WHERE ds.scope_id = ? AND ds.revision = r.current_revision",
+        (scope_id,),
+    ).fetchall()
+    out = [
+        ScopeForDecision(
+            record_id=row["record_id"], content=row["content"], status=row["status"],
+            warning="review_required" if row["status"] == "review_required" else None,
+        )
+        for row in rows
+        if row["status"] in VISIBLE_DECISION_STATUSES
+    ]
+    out.sort(key=lambda d: d.record_id)
+    return out
 
 
 @dataclass(frozen=True)
@@ -91,67 +203,44 @@ def scope_for(layout: RuneLayout, path: str) -> list[ScopeForScope]:
         results: list[ScopeForScope] = []
         for scope_row in scope_rows:
             scope_id = scope_row["id"]
-
-            summary_row = conn.execute(
-                "SELECT purpose, status, payload_json FROM semantic_objects WHERE scope_id = ?",
-                (scope_id,),
-            ).fetchone()
-            summary_text: str | None = None
-            summary_status: str | None = None
-            if summary_row is not None:
-                summary_status = summary_row["status"]
-                if summary_status == "fresh":
-                    summary_text = summary_row["purpose"]
-                elif summary_status in ("possibly_stale", "stale"):
-                    payload = json.loads(summary_row["payload_json"])
-                    summary_text = possibly_stale_pointer(list(payload.get("source_files", {})))
-
-            constraint_rows = conn.execute(
-                "SELECT r.record_id, v.severity, v.content, v.status "
-                "FROM constraint_scopes cs "
-                "JOIN constraint_records r ON r.record_id = cs.record_id "
-                "JOIN constraint_revisions v "
-                "  ON v.record_id = r.record_id AND v.revision = r.current_revision "
-                "WHERE cs.scope_id = ? AND cs.revision = r.current_revision",
-                (scope_id,),
-            ).fetchall()
-            constraints = [
-                ScopeForConstraint(
-                    record_id=row["record_id"], severity=row["severity"], content=row["content"],
-                    status=row["status"],
-                    warning=row["status"] if row["status"] in ("review_required", "stale") else None,
-                )
-                for row in constraint_rows
-                if row["status"] in _VISIBLE_CONSTRAINT_STATUSES
-                and row["severity"] in _INJECTED_CONSTRAINT_SEVERITIES
-            ]
-            constraints.sort(key=lambda c: (c.severity != "MUST", c.record_id))
-
-            note_rows = conn.execute(
-                "SELECT r.id, v.category, v.content, v.status "
-                "FROM note_scopes ns "
-                "JOIN note_records r ON r.id = ns.id "
-                "JOIN note_revisions v ON v.id = r.id AND v.revision = r.current_revision "
-                "WHERE ns.scope_id = ? AND ns.revision = r.current_revision",
-                (scope_id,),
-            ).fetchall()
-            notes = [
-                ScopeForNote(
-                    id=row["id"], category=row["category"], content=row["content"],
-                    status=row["status"], warning="[STALE]" if row["status"] == "stale" else None,
-                )
-                for row in note_rows
-                if row["status"] in _VISIBLE_NOTE_STATUSES
-            ]
-            notes.sort(key=lambda n: n.id)
-
+            summary_text, summary_status = scope_summary(conn, scope_id)
             results.append(
                 ScopeForScope(
                     scope_id=scope_id, name=scope_row["name"], description=scope_row["description"],
                     summary=summary_text, summary_status=summary_status,
-                    constraints=constraints, notes=notes,
+                    constraints=scope_constraints(conn, scope_id), notes=scope_notes(conn, scope_id),
                 )
             )
         return results
     finally:
         conn.close()
+
+
+def resolve_scope_for(
+    layout: RuneLayout, *, path: str | None = None, symbol: str | None = None
+) -> tuple[str | None, list[ScopeForScope]]:
+    """`scope_for` by either a known `path` or a `symbol` name -- resolves
+    `symbol` to its owning file via `symbol_search` (first full-text match;
+    best-effort, same as every other "resolve a free-text symbol name"
+    caller in this codebase) before delegating to `scope_for`. Exactly one
+    of `path`/`symbol` is expected (mirrors `scope_for`'s single-path
+    contract rather than silently picking one if both are given).
+
+    Extracted so this resolution -- previously written directly in the MCP
+    server's `rune_scope_for` tool -- lives in `core.retrieval` instead of
+    the protocol layer (ARCHITECTURE.md §5: "no business logic in the
+    protocol layer, only in core"), and so a future CLI `--symbol` option
+    could reuse it without a second copy.
+
+    Returns `(None, [])` if `path` is `None` and `symbol` resolves to no
+    symbol (nothing to look up); otherwise `(resolved_path, scope_for(...))`.
+    """
+    resolved_path = path
+    if resolved_path is None and symbol is not None:
+        matches = symbol_search(layout, query=symbol, limit=1)
+        if not matches:
+            return None, []
+        resolved_path = matches[0].file
+    if resolved_path is None:
+        return None, []
+    return resolved_path, scope_for(layout, resolved_path)

@@ -5,7 +5,7 @@ from pathlib import Path
 from rune.core.memory.notes import note_add
 from rune.core.memory.proposals import approve, propose
 from rune.core.project import init_project
-from rune.core.retrieval.scope_for import scope_for
+from rune.core.retrieval.scope_for import resolve_scope_for, scope_for
 from rune.core.storage.canonical import write_json_model
 from rune.core.storage.models import (
     NoteCategory,
@@ -164,3 +164,43 @@ def test_scope_for_matches_a_symbol_only_scope(python_simple_repo: Path) -> None
     run_update(layout, full=True)
 
     assert [scope.scope_id for scope in scope_for(layout, "app/services.py")] == ["service"]
+
+
+def test_resolve_scope_for_by_path(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", source=ScopeSource.human, members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    run_update(layout, full=True)
+
+    resolved_path, results = resolve_scope_for(layout, path="app/services.py")
+    assert resolved_path == "app/services.py"
+    assert [s.scope_id for s in results] == ["app"]
+
+
+def test_resolve_scope_for_by_symbol(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="app", name="App", source=ScopeSource.human, members=ScopeMembers(files=["app/services.py"])),
+        ]),
+    )
+    run_update(layout, full=True)
+
+    resolved_path, results = resolve_scope_for(layout, symbol="UserService")
+    assert resolved_path == "app/services.py"
+    assert [s.scope_id for s in results] == ["app"]
+
+
+def test_resolve_scope_for_unresolvable_symbol_returns_empty(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    resolved_path, results = resolve_scope_for(layout, symbol="NoSuchSymbolAtAll")
+    assert resolved_path is None
+    assert results == []

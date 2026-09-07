@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 
 from rune.core.config import load_config
+from rune.core.doctor import run_doctor
 from rune.core.memory.notes import NoteNotFoundError, NoteValidationError
 from rune.core.memory.notes import note_add as core_note_add
 from rune.core.memory.notes import note_update as core_note_update
@@ -46,8 +47,11 @@ from rune.core.project import (
 from rune.core.protocol import PROTOCOL_VERSION
 from rune.core.retrieval.check import check as core_check
 from rune.core.retrieval.context import build_hard_bootstrap, build_soft_bootstrap
+from rune.core.retrieval.related_context import RelatedContextValidationError
+from rune.core.retrieval.related_context import related_context as core_related_context
 from rune.core.retrieval.scope_for import scope_for as core_scope_for
 from rune.core.retrieval.search import search as core_search
+from rune.core.retrieval.symbol_search import symbol_search as core_symbol_search
 from rune.core.scopes.clustering import suggest_from_graph
 from rune.core.scopes.heuristics import ScopeCandidate, suggest_from_paths
 from rune.core.scopes.model import (
@@ -264,6 +268,43 @@ def rebuild_cache_cmd(
         raise typer.Exit(code=1) from exc
 
     typer.echo("Rebuilt cache: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+
+
+@app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Read-only environment/health diagnostics: config validity, canonical
+    schema versions, cache health, git/tree-sitter availability, semantic
+    provider setup (existence-only, no network call), and Global MUST
+    governance warnings (token budget / count threshold)."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    report = run_doctor(layout)
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "healthy": report.healthy,
+                    "checks": [
+                        {"name": c.name, "level": c.level.value, "message": c.message} for c in report.checks
+                    ],
+                },
+                indent=2,
+            )
+        )
+    else:
+        for c in report.checks:
+            marker = {"ok": "[ok]", "warn": "[warn]", "error": "[ERROR]"}[c.level.value]
+            typer.echo(f"{marker} {c.name}: {c.message}")
+    if not report.healthy:
+        raise typer.Exit(code=1)
 
 
 def _scope_layout(path: Path | None) -> RuneLayout:
@@ -1020,6 +1061,119 @@ def scope_for_cmd(
         for n in s.notes:
             warn = f" ({n.warning})" if n.warning else ""
             typer.echo(f"  note [{n.category}]{warn}: {n.content}")
+
+
+@app.command(name="symbol-search")
+def symbol_search_cmd(
+    query: str | None = typer.Option(None, "--query", help="Full-text match on qualified_name + signature."),
+    name: str | None = typer.Option(None, "--name"),
+    qualified_name: str | None = typer.Option(None, "--qualified-name"),
+    kind: str | None = typer.Option(None, "--kind"),
+    symbol_path: str | None = typer.Option(None, "--path-filter", help="Substring match on the owning file path."),
+    limit: int = typer.Option(50, "--limit"),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Structured symbol lookup (name/qualified_name/kind/path filters,
+    optionally combined with a full-text --query) -- the counterpart to
+    `rune search`'s free-text search over Decision/Constraint/Note/
+    semantic-summary prose."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+        results = core_symbol_search(
+            layout, query=query, name=name, qualified_name=qualified_name,
+            kind=kind, path=symbol_path, limit=limit,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "results": [
+                        {"symbol_id": s.symbol_id, "file": s.file, "name": s.name,
+                         "qualified_name": s.qualified_name, "kind": s.kind, "signature": s.signature,
+                         "start_line": s.start_line, "end_line": s.end_line}
+                        for s in results
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+    if not results:
+        typer.echo("No symbols found.")
+        return
+    for s in results:
+        typer.echo(f"{s.qualified_name} [{s.kind}] {s.file}:{s.start_line}-{s.end_line}")
+
+
+@app.command(name="related-context")
+def related_context_cmd(
+    context_path: str | None = typer.Option(None, "--path-filter", help="File path to gather context for."),
+    symbol: str | None = typer.Option(None, "--symbol"),
+    query: str | None = typer.Option(None, "--query"),
+    include: list[str] = typer.Option(
+        [], "--include",
+        help="Restrict to these buckets (repeatable): scopes/constraints/decisions/notes/semantic/symbols.",
+    ),
+    max_items: int = typer.Option(20, "--max-items", help="Cap per bucket, not a combined total."),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """One call for the most relevant Rune context for a task: scopes,
+    constraints, decisions, notes, semantic summaries, and symbols related
+    to a path, a symbol, and/or a free-text query. Composes `scope_for`/
+    `search`/`symbol_search` -- never generates new authoritative content."""
+    try:
+        layout = _require_layout(path or Path.cwd())
+        result = core_related_context(
+            layout, path=context_path, symbol=symbol, query=query,
+            include=set(include) or None, max_items=max_items,
+        )
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, RelatedContextValidationError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "scopes": [
+            {"scope_id": s.scope_id, "name": s.name, "description": s.description,
+             "summary": s.summary, "summary_status": s.summary_status}
+            for s in result.scopes
+        ],
+        "constraints": [
+            {"record_id": c.record_id, "severity": c.severity, "content": c.content,
+             "status": c.status, "warning": c.warning}
+            for c in result.constraints
+        ],
+        "decisions": [
+            {"record_id": d.record_id, "content": d.content, "status": d.status, "warning": d.warning}
+            for d in result.decisions
+        ],
+        "notes": [
+            {"id": n.id, "category": n.category, "content": n.content, "status": n.status, "warning": n.warning}
+            for n in result.notes
+        ],
+        "semantic": [
+            {"scope_id": s.scope_id, "name": s.name, "summary": s.summary, "summary_status": s.summary_status}
+            for s in result.semantic
+        ],
+        "symbols": [
+            {"symbol_id": s.symbol_id, "file": s.file, "name": s.name, "qualified_name": s.qualified_name,
+             "kind": s.kind, "signature": s.signature, "start_line": s.start_line, "end_line": s.end_line}
+            for s in result.symbols
+        ],
+    }
+    if json_output:
+        typer.echo(json_module.dumps(payload, indent=2))
+        return
+    for key in ("scopes", "constraints", "decisions", "notes", "symbols"):
+        typer.echo(f"{key}: {len(payload[key])}")
+        for item in payload[key]:
+            label = item.get("record_id") or item.get("scope_id") or item.get("id") or item.get("qualified_name")
+            typer.echo(f"  {label}")
 
 
 @app.command()

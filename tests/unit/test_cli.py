@@ -400,3 +400,39 @@ def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
     payload = json_module.loads(result.output)
     assert payload["protocol_version"] == 1
     assert payload["category"] == "pitfall"
+
+
+def test_doctor_cli_json_reports_checks(git_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    result = runner.invoke(app, ["doctor", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 1, result.output  # unhealthy: semantic.model is empty by default
+    payload = json.loads(result.output)
+    assert payload["protocol_version"] == 1
+    assert payload["healthy"] is False
+    assert any(c["name"] == "config" and c["level"] == "ok" for c in payload["checks"])
+
+
+def test_symbol_search_cli_json(python_simple_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(python_simple_repo)])
+    result = runner.invoke(app, ["symbol-search", "--name", "get_user", "--json", "--path", str(python_simple_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["protocol_version"] == 1
+    assert any(r["name"] == "get_user" for r in payload["results"])
+
+
+def test_related_context_cli_json(python_simple_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(python_simple_repo)])
+    result = runner.invoke(
+        app, ["related-context", "--path-filter", "app/services.py", "--json", "--path", str(python_simple_repo)]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["protocol_version"] == 1
+    assert "symbols" in payload
+
+
+def test_related_context_cli_requires_a_selector(python_simple_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(python_simple_repo)])
+    result = runner.invoke(app, ["related-context", "--path", str(python_simple_repo)])
+    assert result.exit_code == 1

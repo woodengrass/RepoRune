@@ -8,3 +8,4 @@ build/
 dist/
 token.env
 node_modules/
+.claude/

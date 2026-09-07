@@ -232,6 +232,16 @@ _ENV_VAR_BY_PROVIDER = {
 }
 
 
+def api_key_env_var(provider_name: str) -> str | None:
+    """The environment variable `build_provider` would read the API key
+    from for `provider_name`, or `None` if the provider name isn't
+    recognized. Exposed so `rune doctor` can report presence/absence of
+    the right variable without duplicating `_ENV_VAR_BY_PROVIDER` or
+    performing `build_provider`'s live network probe.
+    """
+    return _ENV_VAR_BY_PROVIDER.get(provider_name)
+
+
 def reasoning_payload(config: ReasoningConfig | None) -> dict | None:
     """Translates `SemanticConfig.reasoning` into the request-body shape
     OpenRouter expects. Returns None (omit the field entirely, use the

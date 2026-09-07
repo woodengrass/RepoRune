@@ -70,6 +70,45 @@ def current_by_note_id(notes: list[Note]) -> dict[str, Note]:
     return current_by(notes, "id")
 
 
+class RecordNotFoundError(Exception):
+    pass
+
+
+def _get_record[T](revisions_for_id: list[T], record_label: str, *, include_history: bool) -> tuple[T, list[T] | None]:
+    if not revisions_for_id:
+        raise RecordNotFoundError(f"no such {record_label}")
+    current = current_revision(revisions_for_id)
+    assert current is not None  # non-empty input, current_revision only returns None for []
+    history = sorted(revisions_for_id, key=lambda r: r.revision) if include_history else None
+    return current, history
+
+
+def get_decision(
+    layout: RuneLayout, record_id: str, *, include_history: bool = False
+) -> tuple[MemoryRevision, list[MemoryRevision] | None]:
+    """(current, history) for one Decision by id -- `history` is `None`
+    unless `include_history=True` (mirrors `rune search --history`'s
+    "history is an explicit opt-in, not always computed" convention).
+    Raises `RecordNotFoundError` if `record_id` has zero revisions.
+    """
+    revisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
+    matching = [r for r in revisions if r.type is RecordType.decision and r.record_id == record_id]
+    return _get_record(matching, f"decision {record_id!r}", include_history=include_history)
+
+
+def get_constraint(
+    layout: RuneLayout, record_id: str, *, include_history: bool = False
+) -> tuple[MemoryRevision, list[MemoryRevision] | None]:
+    revisions = read_jsonl(layout.constraints_jsonl, MemoryRevision)
+    matching = [r for r in revisions if r.type is RecordType.constraint and r.record_id == record_id]
+    return _get_record(matching, f"constraint {record_id!r}", include_history=include_history)
+
+
+def get_note(layout: RuneLayout, note_id: str, *, include_history: bool = False) -> tuple[Note, list[Note] | None]:
+    revisions = [n for n in read_jsonl(layout.notes_jsonl, Note) if n.id == note_id]
+    return _get_record(revisions, f"note {note_id!r}", include_history=include_history)
+
+
 def load_current_decisions(layout: RuneLayout) -> dict[str, MemoryRevision]:
     revisions = read_jsonl(layout.decisions_jsonl, MemoryRevision)
     return current_by_record_id([r for r in revisions if r.type is RecordType.decision])
