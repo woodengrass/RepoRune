@@ -2374,6 +2374,11 @@ future/V2，不屬本輪。
    記錄下來但不動手，留給有 per-membership provenance schema（DATA_MODEL §9 的 V2 候選）之後再處理，不在
    `rune scope reconcile` 現有的 read_current_code_index-based 落差比較中悄悄擴大範圍。
 
+   **（第 171 條撤回本條的「不做」結論，見下方新增段落——複查後發現第 170 條的推理有漏洞：不需要
+   per-membership provenance schema 也能做到範圍精確的重新驗證，用 git 本身讀 `scopes.json` 在
+   merge 前後的差集即可界定「這次 merge 引入了哪些 membership」，見下方「Merge-affected 重新驗證」
+   一輪的完整說明。）**
+
 **交付項目完成情況**：`rune scope reconcile` CLI（`scope_app` 底下的 `reconcile` 子命令）與明確 opt-in 的
 `--full`；`AUTO`/`KEEP`/`REVIEW`/`BROKEN` 的穩定 `--json` 輸出（`protocol_version`、
 `auto_count`/`review_count`/`keep_count`/`broken_count`、`suspicious_churn`、逐筆 `entries`，每筆帶
@@ -2394,7 +2399,9 @@ symbol-level membership、跨 `PYTHONHASHSEED`/process 的 determinism 回歸測
 第一次寫對就通過。347 → 351 個 Python 測試全綠（本輪淨新增 17 個），`ruff check` 全綠。
 
 **已知限制（誠實記錄，非本輪疏漏）**：
-- 第 170 條記錄的「既有 membership 在 merge 後重新驗證」未實作，需要 per-membership provenance（future/V2）。
+- ~~第 170 條記錄的「既有 membership 在 merge 後重新驗證」未實作，需要 per-membership provenance
+  （future/V2）~~ **已在後續一輪實作為 `rune scope reconcile --since <ref>`，見下方「Merge-affected
+  重新驗證」段落——第 170 條「需要 provenance schema」的判斷已撤回。**
 - 沒有評估 zero-evidence 未分配檔案被列為 REVIEW 在大型既有 repo 上首次執行 `rune scope reconcile` 時是否
   會產生大量雜訊（例如測試檔案、設定檔天生就不會有 import edge 指向任何 scope）——V1 定位仍是「新專案從
   頭用 rune」，尚未有真實中大型 repo 的第一次執行經驗回饋，記錄供未來調整（例如替 REVIEW 加一個
@@ -2428,3 +2435,47 @@ symbol-level membership、跨 `PYTHONHASHSEED`/process 的 determinism 回歸測
   下來，留待有真實大型 repo 執行數據後再決定是否要把 `edges` 依 `source_file` 預先分組成 dict。
 
 351 個測試維持全綠（這輪只改訊息順序與註解文字，不影響任何既有測試的斷言），`ruff check` 全綠。
+
+**Merge-affected 重新驗證（撤回第 170 條，實作 ARCHITECTURE.md §16.6）**：
+
+使用者直接引用 §16.6 的規範文字追問「M9 這部分做得如何」，逐字比對後發現第 170 條的「不做」判斷站不住
+腳。§16.6 要求的其實是：
+
+> After merge, Rune MUST revalidate only merge-affected auto-inferred scope memberships against the
+> merged repository state. Human-confirmed or locked memberships are never automatically reassigned;
+> conflicting or unverifiable cases become REVIEW/BROKEN rather than being silently changed.
+
+這比第 170 條理解的「對所有現有 membership 重新分類，等於重新 clustering 全 repo」窄得多——關鍵字是
+**merge-affected**（只限這次 merge 引入的，不是全部）跟 **auto-inferred**（只限非人類確認的）。第
+170 條當時的推理卡在「schema 沒有 per-membership provenance，沒辦法只挑 auto-inferred 的出來」，但
+這個推理忽略了一個現成的機制：`.rune/scopes.json` 本身就是 git 追蹤的檔案。「這次 merge 引入了哪些
+membership」不需要 schema 層的 provenance 就能精確界定——直接比較 `scopes.json` 在呼叫者指定的
+`since`（merge 前的某個 ref，通常是 merge base）當時的內容，跟現在 canonical 內容的差集即可：人類
+另外用 `rune scope edit`/`create` 加的東西是獨立一次 commit，天然不會落在「`since` 到 `HEAD` 之間」
+這個差集裡，完全不需要另外分辨「這筆 membership 是不是自動寫的」。
+
+**已實作為 `rune scope reconcile --since <ref>`**（`core.scopes.reconcile._merge_affected_entries`/
+`_scopes_json_at_ref`）：
+- 用 `git show <since>:.rune/scopes.json`（不是 working-tree diff）讀出 `since` 當時的
+  `scopes.json` 內容；`since` 不是合法 git ref 時丟出新的 `InvalidRefError`（CLI 轉成乾淨的
+  exit code 1，不是原始 traceback）。
+- 只處理現在是 unlocked、`source != human` scope 成員、但 `since` 當時不是的 file membership——
+  沿用既有的 `_is_protected` 保護代理指標，跟 BROKEN 分類共用同一套判斷，不是另外發明一套。
+- 對每筆這樣的 membership，用現在（merged 後）的 import graph 重跑既有的
+  `high_confidence_import_candidates`；仍唯一命中同一個 scope 就不產生任何 entry；命中零個、多個、
+  或命中別的單一 scope，一律 `REVIEW`（附上目前候選 scope id 與說明文字，標明是 merge-affected）。
+  **沒有新的 AUTO 路徑**——這些 membership 已經存在，唯一的問題只是「還要不要相信它」，不是「要不要
+  寫入」，`reconcile()` 既有的 AUTO-only 寫入路徑完全不受這段邏輯影響。
+- 未帶 `--since` 時完全不跑這段邏輯（純 opt-in，預設行為不變）：reconcile 本身沒辦法在事後自動判斷
+  「這是不是一次 merge」（`git merge` 完成後 `.git/MERGE_HEAD` 就消失了），猜錯 base ref 會漏掉真正
+  的 case，或誤把不相關的歷史當成 merge 影響，所以要求呼叫者明確給 `since`。
+- 只處理 file membership，不處理 symbol membership——理由與第 171 條之前那輪（docstring 精確化）
+  記錄的原因相同：symbol-level 從來沒有對應的高信心自動推斷規則，沒有「這筆 symbol membership曾經是
+  自動寫的」這種情境需要重新驗證。
+
+ARCHITECTURE.md §16.6 新增對應段落、§17 第 2 點更新為「已實作」，撤回「需要 provenance schema 才能做」
+的舊結論。新增 7 個回歸測試：`tests/unit/test_scope_reconcile.py` 5 個（merge-affected 證據改變後
+變成 REVIEW、證據仍然吻合時不產生 entry、protected scope 被跳過、不帶 `since` 時完全不跑這段邏輯的
+baseline、非法 ref 丟 `InvalidRefError`）+ `tests/unit/test_cli.py` 2 個端到端測試（真實檔案／真實
+git commit／真實 `rune update` 掃描整個流程走一遍、非法 ref 的 CLI 錯誤路徑）。403 個測試全綠
+（396 → 403），`ruff check` 全綠。

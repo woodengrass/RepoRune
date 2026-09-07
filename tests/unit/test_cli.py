@@ -7,7 +7,8 @@ from typer.testing import CliRunner
 
 from rune.cli.main import app
 from rune.core.project import RuneLayout
-from rune.core.scopes.model import load_scopes
+from rune.core.scopes.model import load_scopes, save_scopes
+from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
 
 runner = CliRunner()
 
@@ -597,4 +598,88 @@ def test_scope_reconcile_before_cache_exists_fails_cleanly(git_repo: Path) -> No
     assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
     RuneLayout(git_repo).memory_db.unlink()  # `rune init` already ran a full update; remove it
     result = runner.invoke(app, ["scope", "reconcile", "--path", str(git_repo)])
+    assert result.exit_code == 1
+
+
+def _git_commit_all(repo: Path, message: str) -> str:
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", message],
+        cwd=repo, check=True,
+    )
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def test_scope_reconcile_since_flags_merge_affected_membership_end_to_end(git_repo: Path) -> None:
+    """End-to-end (real files, real tree-sitter parsing, real git commits)
+    of ARCHITECTURE.md §16.6's scenario: a branch-local `rune update`
+    incrementally auto-assigns a new file into a scope; that write is then
+    (simulated by editing the file directly, standing in for "merged in
+    from another branch") no longer backed by the same import evidence.
+    `--since <pre-merge ref>` must catch it as REVIEW, not silently leave
+    it looking fine.
+    """
+    import json as json_module
+
+    (git_repo / "app").mkdir()
+    (git_repo / "app" / "services.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    (git_repo / "other").mkdir()
+    (git_repo / "other" / "thing.py").write_text("def thing():\n    pass\n", encoding="utf-8")
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text("[semantic]\nenabled = false\n", encoding="utf-8")
+    layout = RuneLayout(git_repo)
+    # `source=model` (not `rune scope create`'s always-human) -- reconcile's
+    # merge-affected revalidation is scoped to unlocked, non-human-source
+    # scopes (the same `_is_protected` proxy already used for BROKEN vs.
+    # REVIEW), so a human-authored scope wouldn't exercise it here.
+    save_scopes(layout, ScopesFile(scopes=[
+        Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+              members=ScopeMembers(files=["app/services.py"])),
+        Scope(id="other", name="Other", locked=False, source=ScopeSource.model,
+              members=ScopeMembers(files=["other/thing.py"])),
+    ]))
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+    since_ref = _git_commit_all(git_repo, "pre-merge base")
+
+    # Branch-local `rune update`: a new file uniquely imports app.services,
+    # so it auto-assigns into "app" -- exactly Milestone 4's existing rule.
+    (git_repo / "app" / "new.py").write_text("from app.services import run\n", encoding="utf-8")
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+    scopes = load_scopes(RuneLayout(git_repo)).scopes
+    assert "app/new.py" in next(s for s in scopes if s.id == "app").members.files
+
+    # Simulate the merge landing a change that alters app/new.py's import
+    # graph (e.g. the other branch refactored it) -- no longer unique
+    # evidence for "app".
+    (git_repo / "app" / "new.py").write_text("from other.thing import thing\n", encoding="utf-8")
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, [
+        "scope", "reconcile", "--since", since_ref, "--json", "--path", str(git_repo),
+    ])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["since"] == since_ref
+    entry = next(e for e in payload["entries"] if e["target"] == "app/new.py")
+    assert entry["classification"] == "REVIEW"
+    assert entry["scope_id"] == "app"
+    assert entry["candidate_scope_ids"] == ["other"]
+    assert "merge-affected" in entry["reason"]
+
+    # Never silently reassigned: still under "app" in canonical.
+    scopes_after = load_scopes(RuneLayout(git_repo)).scopes
+    assert "app/new.py" in next(s for s in scopes_after if s.id == "app").members.files
+
+
+def test_scope_reconcile_since_invalid_ref_fails_cleanly(git_repo: Path) -> None:
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    result = runner.invoke(app, [
+        "scope", "reconcile", "--since", "not-a-real-ref", "--path", str(git_repo),
+    ])
     assert result.exit_code == 1

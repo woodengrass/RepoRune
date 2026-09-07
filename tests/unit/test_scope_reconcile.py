@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from rune.core.project import init_project
 from rune.core.scopes.model import load_scopes, save_scopes
-from rune.core.scopes.reconcile import ReconcileClassification, reconcile
+from rune.core.scopes.reconcile import (
+    InvalidRefError,
+    ReconcileClassification,
+    reconcile,
+)
 from rune.core.storage.models import (
     Edge,
     EdgeType,
@@ -353,3 +360,162 @@ def test_reconcile_result_deterministic_across_hash_seeds(git_repo: Path) -> Non
     assert results == {json.dumps(["one", "three", "two"])}, (
         f"reconcile candidate ordering must be identical across hash seeds, got: {results}"
     )
+
+
+def _git_commit_all(repo: Path, message: str) -> str:
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "add", "-A"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", message],
+        cwd=repo, check=True,
+    )
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+def test_since_flags_merge_affected_membership_with_changed_evidence(git_repo: Path) -> None:
+    """ARCHITECTURE.md §16.6: a membership introduced between `since` and
+    HEAD (simulating "branch-local incremental auto-assign, then merged")
+    must be re-checked against the current import graph -- if it no
+    longer uniquely resolves to the same scope, it becomes REVIEW, never
+    silently kept or reassigned.
+    """
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["app/services.py"])),
+            Scope(id="other", name="Other", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["other/thing.py"])),
+        ]
+    )
+    layout = _setup(
+        git_repo, scopes_file, ["app/services.py", "other/thing.py"],
+        edges=[
+            Edge(source_file="app/services.py", target_file="app/services.py",
+                 edge_type=EdgeType.imports, confidence=1.0),
+        ],
+    )
+    since_ref = _git_commit_all(git_repo, "pre-merge base")
+
+    # Simulate what a branch-local `rune update` incremental auto-assign
+    # would have done before the merge: app/new.py got auto-written into
+    # "app" because at the time it uniquely imported app/services.py.
+    scopes_file.scopes[0].members.files.append("app/new.py")
+    save_scopes(layout, scopes_file)
+    # Simulate the merge changing the import graph: app/new.py now
+    # imports other/thing.py instead (e.g. the other branch refactored
+    # it) -- no longer unique evidence for "app".
+    rebuild_cache(
+        layout,
+        code_index=CodeIndexData(
+            files=[_file(p) for p in ("app/services.py", "other/thing.py", "app/new.py")],
+            edges=[
+                Edge(source_file="app/new.py", target_file="other/thing.py",
+                     edge_type=EdgeType.imports, confidence=1.0),
+            ],
+        ),
+    )
+
+    result, updated = reconcile(layout, full=False, since=since_ref)
+    entry = next(e for e in result.entries if e.target == "app/new.py")
+    assert entry.classification is ReconcileClassification.review
+    assert entry.scope_id == "app"
+    assert entry.candidate_scope_ids == ("other",)
+    assert "merge-affected" in entry.reason
+    # Never silently reassigned: still a member of "app" in canonical, and
+    # this function never writes on its own (reconcile()'s AUTO-only write
+    # path is untouched by since= entries).
+    assert updated is None or "app/new.py" not in next(
+        s for s in updated.scopes if s.id == "other"
+    ).members.files
+
+
+def test_since_no_entry_when_merge_affected_evidence_still_matches(git_repo: Path) -> None:
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["app/services.py"])),
+        ]
+    )
+    layout = _setup(
+        git_repo, scopes_file, ["app/services.py"],
+        edges=[Edge(source_file="app/services.py", target_file="app/services.py",
+                     edge_type=EdgeType.imports, confidence=1.0)],
+    )
+    since_ref = _git_commit_all(git_repo, "pre-merge base")
+
+    scopes_file.scopes[0].members.files.append("app/new.py")
+    save_scopes(layout, scopes_file)
+    rebuild_cache(
+        layout,
+        code_index=CodeIndexData(
+            files=[_file(p) for p in ("app/services.py", "app/new.py")],
+            edges=[Edge(source_file="app/new.py", target_file="app/services.py",
+                         edge_type=EdgeType.imports, confidence=1.0)],
+        ),
+    )
+
+    result, _ = reconcile(layout, full=False, since=since_ref)
+    assert not any(e.target == "app/new.py" for e in result.entries)
+
+
+def test_since_skips_protected_scope(git_repo: Path) -> None:
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=True, source=ScopeSource.human,
+                  members=ScopeMembers(files=["app/services.py"])),
+            Scope(id="other", name="Other", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["other/thing.py"])),
+        ]
+    )
+    layout = _setup(git_repo, scopes_file, ["app/services.py", "other/thing.py"])
+    since_ref = _git_commit_all(git_repo, "pre-merge base")
+
+    scopes_file.scopes[0].members.files.append("app/new.py")
+    save_scopes(layout, scopes_file)
+    rebuild_cache(
+        layout,
+        code_index=CodeIndexData(
+            files=[_file(p) for p in ("app/services.py", "other/thing.py", "app/new.py")],
+            edges=[Edge(source_file="app/new.py", target_file="other/thing.py",
+                         edge_type=EdgeType.imports, confidence=1.0)],
+        ),
+    )
+
+    result, _ = reconcile(layout, full=False, since=since_ref)
+    assert not any(e.target == "app/new.py" for e in result.entries)
+
+
+def test_since_none_skips_revalidation_entirely(git_repo: Path) -> None:
+    """Baseline: omitting `since` (the default) must not run merge-affected
+    revalidation at all, even where it would otherwise flag something --
+    this is strictly opt-in.
+    """
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(files=["app/services.py", "app/new.py"])),
+        ]
+    )
+    layout = _setup(
+        git_repo, scopes_file, ["app/services.py", "app/new.py"],
+        edges=[Edge(source_file="app/new.py", target_file="nonexistent.py",
+                     edge_type=EdgeType.imports, confidence=1.0)],
+    )
+
+    result, _ = reconcile(layout, full=False)
+    assert not any(e.target == "app/new.py" for e in result.entries)
+
+
+def test_since_invalid_ref_raises(git_repo: Path) -> None:
+    scopes_file = ScopesFile(
+        scopes=[Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                       members=ScopeMembers(files=["app/services.py"]))]
+    )
+    layout = _setup(git_repo, scopes_file, ["app/services.py"])
+    with pytest.raises(InvalidRefError):
+        reconcile(layout, full=False, since="not-a-real-ref-at-all")

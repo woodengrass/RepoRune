@@ -1313,6 +1313,27 @@ incremental 自動併入（因為當時只看得到 branch-local 的 import grap
 membership 就不再自動視為有效，需要落回人類審查，不是「因為之前 branch-local 已經自動寫過了，
 merge 後就自動維持」。
 
+**這段落後就已經明講了「merge-affected auto-inferred membership revalidation」是需要的**——第
+一輪 Milestone 9 實作原本以「沒有 per-membership provenance schema，做這件事等於重新 clustering
+全 repo」為由整段沒做（見下方 §17 第 2 點的舊版記錄），事後複查發現這個理由不成立：不需要 schema
+層的 provenance，直接讀 `scopes.json` 這個 git 追蹤檔案在 `since` ref（merge base／merge 前任一
+commit）當時的內容，跟現在的 canonical 內容做差集，就能精確界定「這次 merge 本身引入了哪些
+membership」——人類另外用 `rune scope edit`/`create` 加的東西是獨立一次 commit，天然不會被算進
+「`since` 到 `HEAD` 之間」這個差集裡，不需要另外分辨「這筆是不是自動寫的」。**已實作為
+`rune scope reconcile --since <ref>`**（`core.scopes.reconcile._merge_affected_entries`）：
+
+- 範圍限定：只處理「現在是某個 unlocked、`source != human` scope 成員，但在 `since` 當時的
+  `scopes.json` 裡還不是」的 file membership（`locked`/`source == human` 用的是同一個
+  `_is_protected` 保護代理指標，跟 BROKEN 分類共用）。
+- 對每筆這樣的 membership，用目前（merged 後）的 import graph 重跑
+  `high_confidence_import_candidates`；還是唯一命中同一個 scope 就不產生任何輸出；命中零個、
+  多個、或命中別的單一 scope，一律產生 `REVIEW`（附上目前的候選 scope id），**絕不自動改寫或
+  搬移**——這個函式本身沒有寫入路徑，`reconcile()` 既有的 AUTO-only 寫入邏輯完全不受影響。
+- 這是選擇性參數（`--since` 不給就完全不跑這段邏輯，行為與之前一致），因為 reconcile 本身無法在事後
+  自動判斷「這是不是一次 merge」（`git merge` 完成後 `.git/MERGE_HEAD` 就消失了）——猜錯 base ref
+  會漏掉真正的 merge-affected case，或誤把不相關的歷史當成 merge 影響，所以要求呼叫者明確提供
+  `since`。
+
 ## 17. Milestone 9 Scope Governance backlog（索引用途）
 
 Scope reconciliation 的設計已定，**Milestone 9 已完成實作**；完整細節見 §4.4（含新增的
@@ -1324,6 +1345,9 @@ Milestone 9 決策記錄：
    絕對數量 20（`config.scopes.reconcile_large_churn_threshold`，理由見 IMPLEMENTATION_PLAN.md 第
    168 條）。
 2. **Scope membership 的 per-membership provenance schema**（`ScopeMembership` 概念，第 4.4/16.6
-   節提及，完整內容見 DATA_MODEL.md §9）**仍是 future/V2，Milestone 9 沒有修改**
-   `Scope`/`ScopeMembers` schema——這也是 Milestone 9 明確選擇不重新驗證既有 membership 是否仍然
-   唯一滿足 high-confidence 規則的直接原因（IMPLEMENTATION_PLAN.md 第 170 條）。
+   節提及，完整內容見 DATA_MODEL.md §9）**仍是 future/V2，沒有修改** `Scope`/`ScopeMembers`
+   schema。**但「merge 後重新驗證既有 membership」這件事本身已經實作**（`rune scope reconcile
+   --since <ref>`，見上方 §16.6 新增段落）——複查後發現不需要 schema 層的 provenance 就能做到：
+   直接用 git 讀 `scopes.json` 在 `since` 當時的內容跟現在的差集，界定「這次 merge 引入了哪些
+   membership」，範圍精確，不是重新 clustering 全 repo。IMPLEMENTATION_PLAN.md 第 170 條記錄的
+   舊版「因為缺 provenance schema 所以不做」判斷已撤回，見同檔案新增的決策記錄。

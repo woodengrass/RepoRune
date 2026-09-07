@@ -44,19 +44,48 @@ hasn't changed, so it's never visited, which *is* "untouched region
 frozen" (ARCHITECTURE.md §4.4 point 1), not a separate filter bolted on
 top.
 
-**Deliberately NOT implemented (see IMPLEMENTATION_PLAN.md Milestone 9
-decision log for the full reasoning)**: re-verifying whether an *already*-
-assigned file (previously auto-assigned or human-added, the schema cannot
-tell which -- DATA_MODEL.md §9) still uniquely satisfies the high-
-confidence import rule after a merge changed the graph around it
-(ARCHITECTURE.md §16.6's closing paragraph gestures at this). Doing that
-for every existing membership is, in effect, re-clustering the whole
-repository on every reconcile run, which every non-goal in this milestone
-explicitly rules out. This is a known, documented gap, not an oversight.
+**Merge-affected auto-inferred membership revalidation (`since=`, ARCHITECTURE.md
+§16.6)**: re-verifying *every* existing membership after every reconcile run
+would be re-clustering the whole repository, which the non-goals above rule
+out -- but ARCHITECTURE.md §16.6 asks for something narrower and concrete:
+a membership that was *itself introduced by the merge* (via branch-local
+incremental auto-assignment, before that branch could see the other side's
+import graph) must be re-checked against the *merged* graph, not
+auto-kept just because it was already auto-written once. This is bounded
+without any new provenance schema by reading `.rune/scopes.json` at a
+caller-supplied `since` ref (the merge base, or any pre-merge commit) via
+`git show` and diffing it against the current canonical file:
+
+- "merge-affected" = a file membership present now but absent from
+  `scopes.json` at `since` -- i.e. introduced by commits between `since`
+  and `HEAD` (which includes the merge commit itself), not a
+  working-tree diff and not "every file that ever changed."
+- "auto-inferred" = restricted to unlocked, non-human-source scopes (the
+  same `_is_protected` proxy the deleted-target loop above already uses)
+  -- a human adding a membership via `rune scope edit`/`create` does so
+  in its own separate commit, so it is naturally excluded from "what
+  changed between `since` and `HEAD` in `scopes.json`" without needing
+  per-membership provenance in the schema (DATA_MODEL.md §9's still-open
+  gap is irrelevant here: this doesn't need to know *when* or *how* an
+  existing membership was created, only what a specific merge added).
+
+A merge-affected membership that still uniquely resolves to the same
+scope under the merged graph is left alone (no entry). One that no longer
+does (zero, multiple, or a *different* single candidate) becomes REVIEW,
+never silently reassigned or removed -- there is no AUTO path here, since
+the membership already exists; the only question is whether to flag it.
+
+Opt-in via `since=` (`rune scope reconcile --since <ref>`) precisely
+because it requires the caller to know what the pre-merge base was --
+reconcile has no way to infer "was a merge" after the fact (a completed
+`git merge` leaves no `MERGE_HEAD`), and guessing wrong would either miss
+real cases or flag unrelated history as "merge-affected."
 """
 
 from __future__ import annotations
 
+import subprocess
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -66,8 +95,12 @@ from rune.core.scopes.model import (
     load_scopes,
     member_files_by_unlocked_scope,
 )
-from rune.core.storage.models import ScopesFile, ScopeSource
+from rune.core.storage.models import Edge, ScopesFile, ScopeSource
 from rune.core.storage.sqlite.materialize import read_current_code_index
+
+
+class InvalidRefError(Exception):
+    pass
 
 
 class ReconcileClassification(str, Enum):
@@ -115,8 +148,72 @@ def _is_protected(source: ScopeSource, locked: bool) -> bool:
     return locked or source is ScopeSource.human
 
 
+def _scopes_json_at_ref(layout: RuneLayout, ref: str) -> ScopesFile | None:
+    """`scopes.json`'s content at `ref`, or `None` if the file didn't exist
+    there yet. Raises `InvalidRefError` if `ref` itself doesn't resolve to
+    a real commit -- a typo'd ref must fail loudly, not be silently
+    treated as "the file didn't exist there yet".
+    """
+    verify = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        cwd=layout.repo_root, capture_output=True, text=True, check=False,
+    )
+    if verify.returncode != 0:
+        raise InvalidRefError(f"{ref!r} is not a valid git ref in this repository.")
+
+    rel_path = layout.scopes_json.relative_to(layout.repo_root).as_posix()
+    result = subprocess.run(
+        ["git", "show", f"{ref}:{rel_path}"],
+        cwd=layout.repo_root, capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return ScopesFile.model_validate_json(result.stdout)
+
+
+def _merge_affected_entries(
+    layout: RuneLayout,
+    since: str,
+    scopes_file: ScopesFile,
+    known_files: set[str],
+    member_files_by_scope: dict[str, set[str]],
+    edges: Iterable[Edge],
+) -> list[ReconcileEntry]:
+    """See the module docstring's "Merge-affected auto-inferred membership
+    revalidation" section. Always REVIEW, never AUTO -- these memberships
+    already exist; the only question is whether the merged import graph
+    still agrees with them.
+    """
+    previous = _scopes_json_at_ref(layout, since)
+    previous_files_by_scope = {
+        s.id: set(s.members.files) for s in (previous.scopes if previous is not None else [])
+    }
+    entries: list[ReconcileEntry] = []
+    for scope in sorted(scopes_file.scopes, key=lambda s: s.id):
+        if _is_protected(scope.source, scope.locked):
+            continue
+        newly_added = sorted(set(scope.members.files) - previous_files_by_scope.get(scope.id, set()))
+        for path in newly_added:
+            if path not in known_files:
+                continue  # already reported BROKEN/REVIEW by the deleted-target loop above
+            candidates = high_confidence_import_candidates(member_files_by_scope, path, edges)
+            if candidates == {scope.id}:
+                continue  # still uniquely resolves to this same scope -- nothing changed
+            entries.append(
+                ReconcileEntry(
+                    scope.id, "file", path, ReconcileClassification.review,
+                    f"merge-affected: this membership was introduced since {since!r} by "
+                    "auto-assignment, but no longer uniquely resolves to this scope under "
+                    "the current (merged) import graph -- never auto-reassigned "
+                    "(ARCHITECTURE.md §16.6)",
+                    candidate_scope_ids=tuple(sorted(candidates)),
+                )
+            )
+    return entries
+
+
 def reconcile(
-    layout: RuneLayout, *, full: bool = False, large_churn_threshold: int = 20
+    layout: RuneLayout, *, full: bool = False, large_churn_threshold: int = 20, since: str | None = None
 ) -> tuple[ReconcileResult, ScopesFile | None]:
     """Computes the AUTO/KEEP/REVIEW/BROKEN classification and, for a
     non-`--full` run that isn't blocked by the large-churn guardrail,
@@ -133,6 +230,11 @@ def reconcile(
     membership target looks "missing", which is the correct, honest
     answer (the caller should have required `rune update` to have run
     first; this function doesn't re-derive that policy).
+
+    `since`, when given, additionally runs the merge-affected auto-inferred
+    membership revalidation described in the module docstring (raises
+    `InvalidRefError` if `since` isn't a real git ref). Adds REVIEW entries
+    only -- never affects `auto_count`/`suspicious_churn`/the write path.
     """
     scopes_file = load_scopes(layout)
     code_index = read_current_code_index(layout)
@@ -235,6 +337,11 @@ def reconcile(
                     candidate_scope_ids=tuple(sorted(candidates)),
                 )
             )
+
+    if since is not None:
+        entries.extend(
+            _merge_affected_entries(layout, since, scopes_file, known_files, member_files_by_scope, code_index.edges)
+        )
 
     auto_count = len(auto_candidates)
     review_count = sum(1 for e in entries if e.classification is ReconcileClassification.review)

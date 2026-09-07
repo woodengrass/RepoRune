@@ -64,6 +64,7 @@ from rune.core.scopes.model import (
     set_scope_locked,
     update_scope,
 )
+from rune.core.scopes.reconcile import InvalidRefError
 from rune.core.scopes.reconcile import reconcile as core_reconcile
 from rune.core.status import compute_status
 from rune.core.storage.models import (
@@ -495,6 +496,12 @@ def scope_reconcile(
         help="Audit every existing membership too (KEEP entries included). Output-only: "
         "never writes, even for high-confidence AUTO candidates -- see ARCHITECTURE.md §4.4.",
     ),
+    since: str | None = typer.Option(
+        None, "--since",
+        help="Pre-merge git ref (e.g. the merge base) to revalidate merge-affected "
+        "auto-inferred memberships against the merged import graph -- ARCHITECTURE.md "
+        "§16.6. Adds REVIEW-only entries; never auto-reassigns or removes.",
+    ),
     json_output: bool = typer.Option(False, "--json"),
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
@@ -505,7 +512,9 @@ def scope_reconcile(
     locked/human-authoritative target that no longer exists) is reported
     for human review, never silently written. Run `rune update` first so
     the index reflects the tree you want to reconcile against (the
-    intended flow after merging worktrees, ARCHITECTURE.md §16.4)."""
+    intended flow after merging worktrees, ARCHITECTURE.md §16.4). Pass
+    `--since <ref>` after a merge to also revalidate memberships the merge
+    itself introduced (§16.6)."""
     try:
         layout = _scope_layout(path)
         if not layout.memory_db.exists():
@@ -513,12 +522,12 @@ def scope_reconcile(
             raise typer.Exit(code=1)
         config = load_config(layout.config_path)
         result, updated_scopes_file = core_reconcile(
-            layout, full=full,
+            layout, full=full, since=since,
             large_churn_threshold=config.scopes.reconcile_large_churn_threshold,
         )
         if updated_scopes_file is not None:
             save_scopes(layout, updated_scopes_file)
-    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, InvalidRefError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
@@ -528,6 +537,7 @@ def scope_reconcile(
                 {
                     "protocol_version": PROTOCOL_VERSION,
                     "full": result.full,
+                    "since": since,
                     "applied": result.applied,
                     "suspicious_churn": result.suspicious_churn,
                     "auto_count": result.auto_count,

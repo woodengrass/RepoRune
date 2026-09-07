@@ -22,21 +22,34 @@ reconcile_large_churn_threshold`，理由見 IMPLEMENTATION_PLAN.md 第 168 條�
 `must_count_warn_threshold=30` 的推理方式但選了更保守的數字）。`locked`/`source==human` 任一即保護
 整個 scope 的 membership（現行 schema 沒有 per-membership provenance，只能用這個 whole-scope 級代理指標，
 見 DATA_MODEL.md §9 與 IMPLEMENTATION_PLAN.md 第 167 條）；deleted 的受保護 target 產生 `BROKEN`，從不靜默
-清除。**明確記錄一項刻意不做的事**：ARCHITECTURE.md §16.6 收尾段落字面上暗示「已經是 scope 成員的檔案，
-merge 後若不再唯一滿足 high-confidence 規則就該重新落回 REVIEW」，但這需要對整個既有 `scopes.json` 內容
-重新分類，與 §4.4 開頭「Scope 是穩定、漸進累積的 project knowledge」的核心原則衝突，且現行 schema 無法區分
-「當初被自動寫入、可以重新驗證」與「人類手動加的、不該被重新驗證」的 membership——判斷為架構文件內部的
-字面暗示與更上位原則衝突，選擇不動手，完整記錄在 IMPLEMENTATION_PLAN.md 第 170 條，留給 per-membership
-provenance（DATA_MODEL §9 的 V2 候選）之後再處理。開工於獨立背景 session（不同 git worktree），完成後
+清除。第一輪明確記錄一項刻意不做的事：ARCHITECTURE.md §16.6 收尾段落字面上暗示「已經是 scope 成員的檔案，
+merge 後若不再唯一滿足 high-confidence 規則就該重新落回 REVIEW」，當時以「需要對整個既有 `scopes.json`
+內容重新分類、且 schema 無法區分 auto-inferred 與人類手加的 membership」為由記錄不動手（IMPLEMENTATION_
+PLAN.md 第 170 條）。**這個判斷後來被使用者直接引用 §16.6 原文追問後撤回**：§16.6 實際規範的是
+「merge-affected（只限這次 merge 引入的）+ auto-inferred（只限非人類確認的）」，比第 170 條理解的「全部
+重新分類」窄得多，而且不需要 schema provenance——`scopes.json` 本身是 git 追蹤檔案，直接讀它在呼叫者指定
+的 `since` ref（merge 前）當時的內容跟現在的差集，就能精確界定「這次 merge 引入了哪些 membership」，人類
+另外加的東西天然落在差集之外。**已實作為 `rune scope reconcile --since <ref>`**（只產生 REVIEW，絕不自動
+改寫；未帶 `--since` 時完全不跑，純 opt-in），細節見 IMPLEMENTATION_PLAN.md「Merge-affected 重新驗證」段落
+與 ARCHITECTURE.md §16.6/§17。開工於獨立背景 session（不同 git worktree），完成後
 同樣跑過一輪獨立 code review（另一個 session 代使用者複查），修正 CLI 訊息順序 bug（`--full` 搭配剛好
 超過 churn threshold 時，原本誤印成「churn guardrail 擋下寫入」而非「`--full` 本來就不寫入」）與 docstring
 用詞不精確的問題（symbol 沒有跟 file 一樣的「新增即分類」路徑，docstring 原本暗示兩者對稱），並記錄一項
 需要使用者後續確認的範圍問題：未被任何 scope 以 symbol 形式收錄的 symbol 要不要也產生 REVIEW（本輪判斷
-雜訊風險太高、需要先問使用者，未擅自決定）。收工時 352 個 Python 測試全綠，`ruff check` 全綠。
+雜訊風險太高、需要先問使用者，未擅自決定）。352 個 Python 測試全綠，`ruff check` 全綠。
 
 **兩個 milestone 分別在 `main` 與獨立分支 `milestone-9-scope-governance` 開發，merge 時 `HANDOFF.md`/
 `IMPLEMENTATION_PLAN.md`/`tests/unit/test_cli.py` 有純文字疊加型衝突（兩邊各自新增不同章節/測試，沒有
 互相修改對方內容），已人工合併，兩邊內容都保留，未取捨掉任何一方的記錄。**
+
+**Merge 後追加一輪：`rune scope reconcile --since <ref>`**（上方已提到，實作細節在此重複一次方便對照）
+——使用者直接引用 ARCHITECTURE.md §16.6 的英文規範文字追問「M9 這部分做得如何」，複查後撤回第 170 條
+「需要 per-membership provenance schema 才能做」的舊結論，改用 git 讀 `scopes.json` 在 `since` ref
+（merge 前）與現在的差集來界定「這次 merge 引入了哪些 membership」，不需要動 schema。新增
+`core.scopes.reconcile._merge_affected_entries`/`_scopes_json_at_ref`/`InvalidRefError`，CLI 補上
+`--since` 選項與對應 JSON `since` 欄位。7 個新回歸測試（5 個 core 單元測試 + 2 個 CLI 端到端測試，含
+一個用真實檔案/真實 git commit/真實 `rune update` 掃描走一遍完整流程的測試）。403 個 Python 測試全綠
+（396 → 403），`ruff check` 全綠。ARCHITECTURE.md §16.6 新增段落、§17 第 2 點更新為已實作。
 
 之前一輪：Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
 Windows、host Node `v24.3.0`、OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`）：正式 adapter 成功載入，
@@ -571,15 +584,14 @@ git-init 過的小型測試用 repo）。
   現在就要做到完美聚類。
 - **`project.json` 的 `last_indexed_*` 欄位跟 SQLite commit 不是原子的**：這是接受的已知限制，
   有文件記錄取捨理由跟自我修復機制（下次 update 一定會重新算，不會被過期 metadata 帶壞）。
-- **Scope membership 沒有 per-membership provenance**（本輪新增記錄，見 DATA_MODEL.md
+- **Scope membership 沒有 per-membership provenance**（寫於 Milestone 7 時期，見 DATA_MODEL.md
   §9）：`ScopeMembers` 只有 `files`/`symbols` 兩個純清單，回答不了「這條 membership 是
-  human/model/auto 加的」，也沒有「human exclude」機制——這是 multi-worktree scope
-  reconciliation（ARCHITECTURE.md §4.4/§16.6）需要、但現行 schema 不支援的東西，明確記錄為
-  future/V2，不是這輪或 Milestone 7 要做的事。
-- **Milestone 9 的 `rune scope reconcile`（含 large-churn guardrail 的具體 threshold）尚未實作**：ARCHITECTURE.md
-  §4.4 已經把 incremental scope reconciliation 的完整規則寫清楚（untouched region frozen、
-  AUTO/KEEP/REVIEW/BROKEN 分類、locked/human-confirmed membership 保護），但 CLI 命令本身、
-  large-churn 的具體數值都還沒做，是設計先於實作的狀態。
+  human/model/auto 加的」，仍是 future/V2 schema 限制。**但 merge-affected 重新驗證這個具體情境
+  已經不需要它就做到了**（`rune scope reconcile --since <ref>`，見上方 Milestone 9 段落——用 git
+  讀 `scopes.json` 的歷史差集繞開了這個 schema 限制），所以剩下真正卡住的只有「所有既有 membership
+  全面重新驗證」這種更大範圍的情境，不是每個 provenance 相關需求都被這個 schema 限制卡住。
+- ~~**Milestone 9 的 `rune scope reconcile`（含 large-churn guardrail 的具體 threshold）尚未實作**~~
+  **已完成，見上方 Milestone 9 段落**（此條寫於 Milestone 7 時期，當時 M9 確實還沒開始）。
 - **`protocol_version` 已實作為 1**：所有現有 `--json` 輸出皆為頂層 object 並帶有此欄位（`search`
   的結果清單改置於 `results`）；OpenCode adapter 在 JSON parse 後驗證版本，不符即明確拒絕，提示升級
   core 或 adapter。此 Milestone 7 contract 已完成。
@@ -600,12 +612,11 @@ governance` 分支的內容已合併，分支本身仍保留未刪除；`.claude
 
 **下一步兩個候選方向**：
 
-1. **確認 Milestone 9 記錄的開放問題**：ARCHITECTURE §16.6 末段提及的「merge 後對*已指派*
-   membership 的重新驗證」該工作判斷為超出本 milestone 範圍、且缺乏 per-membership provenance
-   無法安全實作，記錄為已知缺口而非動手實作（IMPLEMENTATION_PLAN.md 第 170 條）——需要使用者確認這個
-   範圍判斷是否正確。同一輪 review 也記錄了一個類似但更廣的開放問題：未被任何 scope 以 symbol 形式
-   收錄的 symbol 要不要也產生 REVIEW（目前判斷雜訊風險太高，未擅自決定，見 IMPLEMENTATION_PLAN.md
-   對應段落）。
+1. **一項開放問題已解決**：ARCHITECTURE §16.6「merge 後對已指派 membership 的重新驗證」原本記錄為
+   超出範圍（IMPLEMENTATION_PLAN.md 第 170 條），使用者追問後複查撤回，已實作為
+   `rune scope reconcile --since <ref>`（見上方段落）。**還剩一項類似但更廣的開放問題未解決**：未被
+   任何 scope 以 symbol 形式收錄的 symbol 要不要也產生 REVIEW（目前判斷雜訊風險太高，未擅自決定，見
+   IMPLEMENTATION_PLAN.md 對應段落）——下次有人要動這塊之前應該先問使用者。
 2. **開始規劃下一個 milestone / V2 方向**：8 個原定 milestone 已全部完成。V1 範圍內已知未做的事見
    本文件「已知的限制／還沒做的事」一節（per-membership provenance、多人協作 revision 衝突偵測等），
    這些明確是 V2 候選，不是本輪遺漏。
