@@ -400,3 +400,133 @@ def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
     payload = json_module.loads(result.output)
     assert payload["protocol_version"] == 1
     assert payload["category"] == "pitfall"
+
+
+def test_scope_reconcile_cli_json_auto_apply_and_review(git_repo: Path) -> None:
+    """End-to-end: `rune init` -> `rune update` -> `rune scope reconcile
+    --json`. `services.py` is locked into `app`; `new.py` (a fresh,
+    unassigned file that imports `services.py`) should AUTO-apply into
+    `app`; `orphan.py` (no import relationship to anything) should come
+    back as REVIEW, not silently ignored or auto-added anywhere.
+    """
+    import json as json_module
+
+    (git_repo / "app").mkdir()
+    (git_repo / "app" / "services.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    (git_repo / "app" / "new.py").write_text(
+        "from app.services import run\n", encoding="utf-8"
+    )
+    (git_repo / "orphan.py").write_text("x = 1\n", encoding="utf-8")
+
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text(
+        "[semantic]\nenabled = false\n", encoding="utf-8"
+    )
+    assert runner.invoke(app, [
+        "scope", "create", "app", "--name", "App", "--file", "app/services.py",
+        "--path", str(git_repo),
+    ]).exit_code == 0
+    assert runner.invoke(app, [
+        "scope", "unlock", "app", "--path", str(git_repo),
+    ]).exit_code == 0
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, ["scope", "reconcile", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["protocol_version"] == 1
+    assert payload["full"] is False
+    assert payload["applied"] is True
+    assert payload["suspicious_churn"] is False
+    assert payload["auto_count"] == 1
+    assert payload["review_count"] == 1
+
+    entries_by_target = {e["target"]: e for e in payload["entries"]}
+    auto_entry = entries_by_target["app/new.py"]
+    assert auto_entry["classification"] == "AUTO"
+    assert auto_entry["scope_id"] == "app"
+    assert auto_entry["applied"] is True
+
+    review_entry = entries_by_target["orphan.py"]
+    assert review_entry["classification"] == "REVIEW"
+    assert review_entry["candidate_scope_ids"] == []
+
+    # The write actually landed in canonical scopes.json.
+    scopes = load_scopes(RuneLayout(git_repo)).scopes
+    app_scope = next(s for s in scopes if s.id == "app")
+    assert "app/new.py" in app_scope.members.files
+
+    # Re-running is idempotent: app/new.py is no longer "unassigned", so
+    # it drops out of the reconcile entirely; orphan.py is still REVIEW.
+    second = runner.invoke(app, ["scope", "reconcile", "--json", "--path", str(git_repo)])
+    assert second.exit_code == 0, second.output
+    second_payload = json_module.loads(second.output)
+    assert second_payload["auto_count"] == 0
+    assert second_payload["applied"] is False
+    assert {e["target"] for e in second_payload["entries"]} == {"orphan.py"}
+
+
+def test_scope_reconcile_full_never_writes(git_repo: Path) -> None:
+    import json as json_module
+
+    (git_repo / "app").mkdir()
+    (git_repo / "app" / "services.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    (git_repo / "app" / "new.py").write_text(
+        "from app.services import run\n", encoding="utf-8"
+    )
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text(
+        "[semantic]\nenabled = false\n", encoding="utf-8"
+    )
+    assert runner.invoke(app, [
+        "scope", "create", "app", "--name", "App", "--file", "app/services.py",
+        "--path", str(git_repo),
+    ]).exit_code == 0
+    assert runner.invoke(app, ["scope", "unlock", "app", "--path", str(git_repo)]).exit_code == 0
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, ["scope", "reconcile", "--full", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["full"] is True
+    assert payload["applied"] is False
+    assert payload["auto_count"] == 1
+
+    scopes = load_scopes(RuneLayout(git_repo)).scopes
+    app_scope = next(s for s in scopes if s.id == "app")
+    assert "app/new.py" not in app_scope.members.files  # --full never writes
+
+
+def test_scope_reconcile_deleted_locked_target_is_broken_and_preserved(git_repo: Path) -> None:
+    import json as json_module
+
+    (git_repo / "keep.py").write_text("x = 1\n", encoding="utf-8")
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text(
+        "[semantic]\nenabled = false\n", encoding="utf-8"
+    )
+    assert runner.invoke(app, [
+        "scope", "create", "important", "--name", "Important", "--file", "keep.py",
+        "--path", str(git_repo),
+    ]).exit_code == 0  # scope create starts locked
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    (git_repo / "keep.py").unlink()
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, ["scope", "reconcile", "--json", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    payload = json_module.loads(result.output)
+    assert payload["broken_count"] == 1
+    entry = next(e for e in payload["entries"] if e["target"] == "keep.py")
+    assert entry["classification"] == "BROKEN"
+
+    scopes = load_scopes(RuneLayout(git_repo)).scopes
+    assert "keep.py" in next(s for s in scopes if s.id == "important").members.files
+
+
+def test_scope_reconcile_before_cache_exists_fails_cleanly(git_repo: Path) -> None:
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    RuneLayout(git_repo).memory_db.unlink()  # `rune init` already ran a full update; remove it
+    result = runner.invoke(app, ["scope", "reconcile", "--path", str(git_repo)])
+    assert result.exit_code == 1

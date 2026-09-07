@@ -60,6 +60,7 @@ from rune.core.scopes.model import (
     set_scope_locked,
     update_scope,
 )
+from rune.core.scopes.reconcile import reconcile as core_reconcile
 from rune.core.status import compute_status
 from rune.core.storage.models import (
     NoteCategory,
@@ -444,6 +445,96 @@ def scope_suggest(
     if accepted:
         save_scopes(layout, scopes_file)
     typer.echo(f"Accepted {accepted} scope suggestion(s).")
+
+
+@scope_app.command("reconcile")
+def scope_reconcile(
+    full: bool = typer.Option(
+        False, "--full",
+        help="Audit every existing membership too (KEEP entries included). Output-only: "
+        "never writes, even for high-confidence AUTO candidates -- see ARCHITECTURE.md §4.4.",
+    ),
+    json_output: bool = typer.Option(False, "--json"),
+    path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
+) -> None:
+    """Reconcile scope membership against the current materialized code
+    index: high-confidence single-candidate imports for unassigned files
+    auto-apply (unless the large-churn guardrail trips), everything else
+    (ambiguous/no-evidence assignment, a removed membership target, a
+    locked/human-authoritative target that no longer exists) is reported
+    for human review, never silently written. Run `rune update` first so
+    the index reflects the tree you want to reconcile against (the
+    intended flow after merging worktrees, ARCHITECTURE.md §16.4)."""
+    try:
+        layout = _scope_layout(path)
+        if not layout.memory_db.exists():
+            _err(f"{layout.memory_db} does not exist yet. Run `rune update` first.")
+            raise typer.Exit(code=1)
+        config = load_config(layout.config_path)
+        result, updated_scopes_file = core_reconcile(
+            layout, full=full,
+            large_churn_threshold=config.scopes.reconcile_large_churn_threshold,
+        )
+        if updated_scopes_file is not None:
+            save_scopes(layout, updated_scopes_file)
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        typer.echo(
+            json_module.dumps(
+                {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "full": result.full,
+                    "applied": result.applied,
+                    "suspicious_churn": result.suspicious_churn,
+                    "auto_count": result.auto_count,
+                    "review_count": result.review_count,
+                    "keep_count": result.keep_count,
+                    "broken_count": result.broken_count,
+                    "entries": [
+                        {
+                            "scope_id": e.scope_id, "target_type": e.target_type, "target": e.target,
+                            "classification": e.classification.value, "reason": e.reason,
+                            "applied": e.applied, "candidate_scope_ids": list(e.candidate_scope_ids),
+                        }
+                        for e in result.entries
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if result.suspicious_churn:
+        typer.secho(
+            f"Suspicious churn: {result.auto_count} AUTO-eligible change(s) exceed the "
+            f"configured threshold ({config.scopes.reconcile_large_churn_threshold}). "
+            "No changes were written -- review required.",
+            fg=typer.colors.YELLOW,
+        )
+    elif result.applied:
+        typer.echo(f"Applied {result.auto_count} AUTO membership change(s).")
+    elif full:
+        typer.echo(f"{result.auto_count} AUTO candidate(s) found (--full, output-only).")
+    if not result.entries:
+        typer.echo("Nothing to reconcile: membership matches the current code index.")
+        return
+    for e in result.entries:
+        scope_part = f" scope={e.scope_id}" if e.scope_id else ""
+        candidates_part = (
+            f" candidates=[{', '.join(e.candidate_scope_ids)}]" if e.candidate_scope_ids else ""
+        )
+        applied_part = " (applied)" if e.applied else ""
+        typer.echo(
+            f"[{e.classification.value}]{scope_part} {e.target_type}:{e.target}"
+            f"{candidates_part}{applied_part} -- {e.reason}"
+        )
+    typer.echo(
+        f"auto={result.auto_count} review={result.review_count} "
+        f"keep={result.keep_count} broken={result.broken_count}"
+    )
 
 
 # --------------------------------------------------------------------------

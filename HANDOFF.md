@@ -1,6 +1,28 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
+最後更新：2026-09-07，**Milestone 9（Scope Governance）已在獨立 git worktree 完成**（`main` 同時有另一個
+session 在做 Milestone 8，兩者互不衝突，尚待使用者手動 merge 兩個 worktree 的結果）：`rune scope
+reconcile`（含明確 opt-in 的 `--full`）已實作，`core.scopes.reconcile` 純函式計算 AUTO/KEEP/REVIEW/BROKEN
+分類（changed set 定義為 canonical `scopes.json` 與目前已 materialize 的 code index 之間的落差，不是重跑
+一次工作目錄 diff），CLI 輸出比照既有 `--json` 慣例（`protocol_version` + 逐筆 `entries` +
+`auto_count`/`review_count`/`keep_count`/`broken_count`/`suspicious_churn`）。Large-churn guardrail 鎖定為
+絕對數量 20（`config.scopes.reconcile_large_churn_threshold`，理由見 IMPLEMENTATION_PLAN.md 第 168
+條，比照 `must_count_warn_threshold=30` 的推理方式但選了更保守的數字）。`locked`/`source==human` 任一即保護
+整個 scope 的 membership（現行 schema 沒有 per-membership provenance，只能用這個 whole-scope 級代理指標，
+見 DATA_MODEL.md §9 與 IMPLEMENTATION_PLAN.md 第 167 條）；deleted 的受保護 target 產生 `BROKEN`，從不靜默
+清除。**明確記錄一項刻意不做的事**：ARCHITECTURE.md §16.6 收尾段落字面上暗示「已經是 scope 成員的檔案，
+merge 後若不再唯一滿足 high-confidence 規則就該重新落回 REVIEW」，但這需要對整個既有 `scopes.json` 內容
+重新分類，與 §4.4 開頭「Scope 是穩定、漸進累積的 project knowledge」的核心原則衝突，且現行 schema 無法區分
+「當初被自動寫入、可以重新驗證」與「人類手動加的、不該被重新驗證」的 membership——判斷為架構文件內部的
+字面暗示與更上位原則衝突，選擇不動手，完整記錄在 IMPLEMENTATION_PLAN.md 第 170 條，留給 per-membership
+provenance（DATA_MODEL §9 的 V2 候選）之後再處理。新增 17 個回歸測試（13 個 `core.scopes.reconcile` 單元
+測試 + 4 個端到端 CLI 測試），每個都用刻意注入的錯誤實作（保護判斷永遠關閉、churn guardrail 永遠關閉）手動
+驗證過會抓到對應回歸；也新增一個跨 `PYTHONHASHSEED`/process 的 determinism 回歸測試，比照
+`test_references.py` 既有寫法（`high_confidence_import_candidates` 內部用到 `set`，同一類風險）。開工前
+基準 334 個測試全綠，本輪淨新增 17 個，收工時 351 個 Python 測試全綠，`ruff check` 全綠。
+分支：`milestone-9-scope-governance`，尚未 push、尚未與 `main`（Milestone 8 的工作）merge。
+
+之前一輪：Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
 Windows、host Node `v24.3.0`、OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`）：正式 adapter 成功載入，
 `system.transform` context 真的被模型看見；global/scoped MUST、`read`/`apply_patch` path、bash post-change scope
 activation、三個 custom tools、跨 session isolation 與 `session.compacted` 後 rehydrate 均已真實驗證。soft/title
@@ -358,7 +380,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
 | 7. OpenCode Adapter | ✅ 完成 | 正式 host 驗收：注入、path、bash/scope、custom tools、isolation、title/soft 與 compaction。 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
-| 9. Scope Governance | ❌ 未開始 | `rune scope reconcile`、review workflow、large-churn guardrail；規則已定，實作未開始。 |
+| 9. Scope Governance | ✅ 完成（獨立 worktree，尚待與 main merge） | `rune scope reconcile`（含 `--full`）、AUTO/KEEP/REVIEW/BROKEN、large-churn guardrail（閾值 20）。 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的
 失敗

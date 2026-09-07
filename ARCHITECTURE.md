@@ -343,12 +343,60 @@ worktree merge 是最主要的觸發場景，見第 16 節，但規則本身不�
    threshold**（絕對數量、changed-file-based 比例都是候選做法）——架構層只鎖死「非預期的大量 churn
    絕不能自動套用」這條不變式，數值交給未來實作/`config.toml` 決定，避免現在鎖一個沒有真實資料佐證
    的數字。
-6. **概念上的四種 reconciliation 結果分類（未來 CLI 輸出格式，本輪只定概念、不實作）**：`AUTO`（新
-   檔案依既有規則自動併入某 scope）、`KEEP`（既有 human-authoritative membership 不變）、`REVIEW`
-   （模糊的重新指派/移除/多個候選 scope，需要人類決定）、`BROKEN`（human/locked membership 指向的
-   目標已消失）。連同 changed files 數、auto-applied 數、review 數、維持不變的既有 membership 數、
-   suspicious churn 旗標一起呈現——這是未來 `rune scope reconcile` 實作時的輸出需求規格，記錄進
-   IMPLEMENTATION_PLAN.md 的待辦清單，本輪不實作 CLI。
+6. **概念上的四種 reconciliation 結果分類**：`AUTO`（新檔案依既有規則自動併入某 scope）、`KEEP`（既有
+   human-authoritative membership 不變）、`REVIEW`（模糊的重新指派/移除/多個候選 scope，需要人類決定）、
+   `BROKEN`（human/locked membership 指向的目標已消失）。連同 changed files 數、auto-applied 數、review
+   數、維持不變的既有 membership 數、suspicious churn 旗標一起呈現——**Milestone 9 已實作**
+   `rune scope reconcile`，見下方「Reconciliation CLI 與 merge/integration worktree 使用流程」小節。
+
+### Reconciliation CLI 與 merge/integration worktree 使用流程（Milestone 9 實作完成）
+
+`rune scope reconcile`（`core.scopes.reconcile.reconcile()`）把上面第 1-6 點的規則落地為可執行的命令：
+
+- **輸入來源是目前已 materialize 的 code index，不是重新掃描工作目錄**：`reconcile()` 讀
+  `read_current_code_index()`（`memory.db` 裡的 `files`/`symbols`/`edges`），拿它跟 canonical
+  `scopes.json` 的既有 membership 比對出落差——這代表呼叫 `rune scope reconcile` 前必須先跑過
+  `rune update`，讓 code index 反映你想要 reconcile 的那棵樹（見下方 workflow）。這個設計選擇的完整
+  理由見 IMPLEMENTATION_PLAN.md Milestone 9 決策記錄第 165 條。
+- **落差的兩個方向**：code index 裡存在、但不屬於任何 scope 的檔案/symbol，套用第 3 點既有的
+  high-confidence import 規則分類為 `AUTO`（唯一候選）或 `REVIEW`（零個/多個候選，或只有 best-effort
+  reference 證據）；scope membership 指向、但 code index 裡已經不存在的檔案/symbol，依 scope 是否
+  `locked` 或 `source == human`（第 167 條：兩個訊號任一成立即保護，理由見決策記錄）分類為 `BROKEN`
+  （受保護，只警告不清除）或 `REVIEW`（未受保護，候選移除仍需人類確認）。任何內容有變但 scope
+  membership 關係沒變的既有成員，不在這個落差裡，因此天然滿足「untouched region frozen」，不需要另外
+  過濾。
+- **預設模式（無 `--full`）**：只列出 `AUTO`/`REVIEW`/`BROKEN`（`KEEP` 只計數，不逐筆列出），`AUTO`
+  項目在寫入前檢查 large-churn guardrail（`config.scopes.reconcile_large_churn_threshold`，預設
+  20——理由見 IMPLEMENTATION_PLAN.md 決策記錄第 168 條），沒有觸發就直接把 AUTO 變更寫進
+  `scopes.json`；觸發了就整批不寫，`suspicious_churn=true`，要求人類審查。
+- **`--full`**：逐筆列出包含 `KEEP` 在內的完整分類（供人工稽核目前每一筆 membership 的狀態），但**永遠
+  不寫入**，即使有 `AUTO`-eligible 的高信心單一候選也只回報、不套用——這與 §4.4 point 4「Full
+  reconciliation 輸出只能是 candidate/proposal/diff」一致，理由見決策記錄第 169 條。
+- **未實作的部分（誠實記錄，見決策記錄第 170 條）**：不會重新驗證*已經是*某 scope 成員的檔案，在合併
+  之後是否仍然唯一滿足 high-confidence 規則——這需要 per-membership provenance（DATA_MODEL §9 的
+  future/V2）才能安全地做，否則等於對整個 `scopes.json` 既有內容重新分類一遍，違反「Scope 是穩定、
+  漸進累積的 project knowledge」這條 §4.4 開頭的核心原則。
+
+**Merge/integration worktree 的具體使用流程**（銜接第 16.4 節「integration worktree 的角色」，第 6 步
+「執行最終的 scope reconciliation」在此展開）：
+
+1. Integration worktree 完成程式碼 merge、resolve 掉 16.2 節描述的 canonical revision 衝突。
+2. `rune update`（merge 後的樹上重新跑一次決定性索引；不需要 `--full`/`rebuild-cache`，除非 code
+   index 本身需要重建）——這一步之後，`memory.db` 反映的就是 merge 後的完整程式碼結構。
+3. `rune scope reconcile --json`：檢視 `auto_count`/`review_count`/`broken_count`，確認
+   `suspicious_churn` 是否為 `true`。
+   - `suspicious_churn=true`：**不要**重跑加大 threshold 蒙混過去——先讀 `entries` 裡的 `AUTO`
+     項目，理解為什麼一次出現這麼多高信心新增（常見原因：某個 worktree 帶進一批先前完全沒有任何
+     scope 的新檔案），視情況用 `rune scope edit`/`create` 手動處理一部分，或調整
+     `config.scopes.reconcile_large_churn_threshold`（需要明確理由，不是預設繞過）。
+   - `suspicious_churn=false`：AUTO 項目已經自動寫入 `scopes.json`；檢視 `REVIEW`/`BROKEN` 項目，逐筆用
+     `rune scope edit`（重新指派/移除）或 `rune scope lock`/`unlock`（調整保護狀態）處理，`BROKEN`
+     的目標若確認已經永久移除，用 `rune scope edit --remove-file`/`--remove-symbol` 明確清除——這仍是
+     人類決定的動作，`rune scope reconcile` 本身不會自動做。
+4. 重新執行 `rune scope reconcile --json` 確認 `review_count`/`broken_count` 已經降到預期（通常是
+   0，除非刻意保留待觀察的項目），再 commit `scopes.json`。
+5. 若使用 `--full` 做完整稽核（例如 merge 涉及大量檔案、想確認每一筆既有 membership 目前狀態），流程
+   相同，只是第 3-4 步不會有任何 canonical 寫入，純粹是人類參考用的報告。
 
 ### 4.5 Semantic Worker（`core.semantic`）
 針對過期／缺漏的 scope summary，用該 scope 的成員檔案／symbol 組 prompt，呼叫設定的 `ModelProvider` 取得
@@ -1267,10 +1315,15 @@ merge 後就自動維持」。
 
 ## 17. Milestone 9 Scope Governance backlog（索引用途）
 
-Scope reconciliation 的設計已定，實作集中於 Milestone 9；完整細節見 §4.4 與 IMPLEMENTATION_PLAN.md：
+Scope reconciliation 的設計已定，**Milestone 9 已完成實作**；完整細節見 §4.4（含新增的
+「Reconciliation CLI 與 merge/integration worktree 使用流程」小節）與 IMPLEMENTATION_PLAN.md 的
+Milestone 9 決策記錄：
 
-1. **`rune scope reconcile`（含 `--full`）與 AUTO/KEEP/REVIEW/BROKEN 輸出格式**：尚未實作 CLI 命令，
-   也未鎖定 large-churn threshold 的具體數值。
+1. **`rune scope reconcile`（含 `--full`）與 AUTO/KEEP/REVIEW/BROKEN 輸出格式**：已實作
+   （`core.scopes.reconcile`、`scope_app` 底下的 `reconcile` 子命令），large-churn threshold 鎖定為
+   絕對數量 20（`config.scopes.reconcile_large_churn_threshold`，理由見 IMPLEMENTATION_PLAN.md 第
+   168 條）。
 2. **Scope membership 的 per-membership provenance schema**（`ScopeMembership` 概念，第 4.4/16.6
-   節提及，完整內容見 DATA_MODEL.md §9）是 future/V2，不在 Milestone 9 修改
-   `Scope`/`ScopeMembers` schema。
+   節提及，完整內容見 DATA_MODEL.md §9）**仍是 future/V2，Milestone 9 沒有修改**
+   `Scope`/`ScopeMembers` schema——這也是 Milestone 9 明確選擇不重新驗證既有 membership 是否仍然
+   唯一滿足 high-confidence 規則的直接原因（IMPLEMENTATION_PLAN.md 第 170 條）。
