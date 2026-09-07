@@ -507,7 +507,18 @@ def scope_reconcile(
         )
         return
 
-    if result.suspicious_churn:
+    if full:
+        # `--full` never writes regardless of churn (ARCHITECTURE.md §4.4
+        # point 4) -- checked before `suspicious_churn` so a `--full` run
+        # over a large-churn tree doesn't misleadingly attribute the
+        # (already-guaranteed) no-write to the churn guardrail instead of
+        # to `--full` itself. A review pass caught this ordering bug by
+        # hand: with the old `if suspicious_churn: ... elif applied: ...
+        # elif full: ...` order, `--full` on a tree past the churn
+        # threshold printed "No changes were written -- review required"
+        # (true, but for the wrong reason) instead of this message.
+        typer.echo(f"{result.auto_count} AUTO candidate(s) found (--full, output-only).")
+    elif result.suspicious_churn:
         typer.secho(
             f"Suspicious churn: {result.auto_count} AUTO-eligible change(s) exceed the "
             f"configured threshold ({config.scopes.reconcile_large_churn_threshold}). "
@@ -516,8 +527,6 @@ def scope_reconcile(
         )
     elif result.applied:
         typer.echo(f"Applied {result.auto_count} AUTO membership change(s).")
-    elif full:
-        typer.echo(f"{result.auto_count} AUTO candidate(s) found (--full, output-only).")
     if not result.entries:
         typer.echo("Nothing to reconcile: membership matches the current code index.")
         return

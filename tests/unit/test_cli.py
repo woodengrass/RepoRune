@@ -497,6 +497,38 @@ def test_scope_reconcile_full_never_writes(git_repo: Path) -> None:
     assert "app/new.py" not in app_scope.members.files  # --full never writes
 
 
+def test_scope_reconcile_full_message_not_attributed_to_churn(git_repo: Path) -> None:
+    """A review pass caught this by hand: the human-readable output used
+    to check `suspicious_churn` before `full`, so `--full` on a tree past
+    the (lowered, for this test) churn threshold printed the churn
+    message ("No changes were written -- review required") instead of
+    the `--full` one -- true in effect (nothing was written either way)
+    but misattributed the reason. `--full` must always print its own
+    message, regardless of churn, since `--full` alone already guarantees
+    no write.
+    """
+    (git_repo / "app").mkdir()
+    (git_repo / "app" / "services.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    (git_repo / "app" / "new1.py").write_text("from app.services import run\n", encoding="utf-8")
+    (git_repo / "app" / "new2.py").write_text("from app.services import run\n", encoding="utf-8")
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text(
+        "[semantic]\nenabled = false\n[scopes]\nreconcile_large_churn_threshold = 1\n",
+        encoding="utf-8",
+    )
+    assert runner.invoke(app, [
+        "scope", "create", "app", "--name", "App", "--file", "app/services.py",
+        "--path", str(git_repo),
+    ]).exit_code == 0
+    assert runner.invoke(app, ["scope", "unlock", "app", "--path", str(git_repo)]).exit_code == 0
+    assert runner.invoke(app, ["update", "--path", str(git_repo)]).exit_code == 0
+
+    result = runner.invoke(app, ["scope", "reconcile", "--full", "--path", str(git_repo)])
+    assert result.exit_code == 0, result.output
+    assert "AUTO candidate(s) found (--full, output-only)" in result.output
+    assert "Suspicious churn" not in result.output
+
+
 def test_scope_reconcile_deleted_locked_target_is_broken_and_preserved(git_repo: Path) -> None:
     import json as json_module
 

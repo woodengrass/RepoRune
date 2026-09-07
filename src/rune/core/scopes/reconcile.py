@@ -13,11 +13,29 @@ update` on the merged tree -> `rune scope reconcile`", ARCHITECTURE.md
 §16.4) -- so its changed set is simply the disagreement between canonical
 `scopes.json` and the current materialized code index:
 
-- A file/symbol present in the current index but a member of *no* scope
-  is exactly the "added file" case Milestone 4 already has a rule for --
+- A **file** present in the current index but a member of *no* scope is
+  exactly the "added file" case Milestone 4 already has a rule for --
   reconcile applies that same rule (`high_confidence_import_candidates`).
-- A file/symbol that is a scope member but no longer exists in the
-  current index is exactly the "deleted, membership target gone" case.
+  This is file-only, not symbol-only-too: Milestone 4's own auto-
+  assignment rule was always file-only (import edges are a file-level
+  relationship; there's no equivalent high-confidence heuristic for "this
+  specific symbol, not just its file, belongs in scope X"), so there is
+  deliberately no AUTO/REVIEW classification for a symbol that exists in
+  the index but isn't a member of any scope's `members.symbols` -- most
+  scopes only ever use `members.files` in practice, and treating every
+  never-symbol-scoped function/class in the repo as a REVIEW entry every
+  run would flood the report with noise no one asked reconcile to
+  surface. Flagged, not silently decided: if per-symbol "never scoped"
+  review turns out to be wanted, that is a scope expansion for a future
+  round to confirm with the user first, per this project's own
+  "先問使用者，再動手" convention -- not something this round should
+  guess at, especially with no existing UX precedent for how noisy that
+  would be on a real repo.
+- A file **or symbol** that is a scope member but no longer exists in the
+  current index is exactly the "deleted, membership target gone" case --
+  this direction (existing membership -> BROKEN/REVIEW) does apply
+  symmetrically to both, since it is not a "new item" flood risk: it is
+  strictly bounded by how many memberships already exist in `scopes.json`.
 
 Everything else -- a file that changed content but is *already* a member
 of some scope, or was already correctly absent from all scopes -- is by

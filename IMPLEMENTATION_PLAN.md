@@ -2313,3 +2313,32 @@ symbol-level membership、跨 `PYTHONHASHSEED`/process 的 determinism 回歸測
   會產生大量雜訊（例如測試檔案、設定檔天生就不會有 import edge 指向任何 scope）——V1 定位仍是「新專案從
   頭用 rune」，尚未有真實中大型 repo 的第一次執行經驗回饋，記錄供未來調整（例如替 REVIEW 加一個
   `no_evidence` 子分類，讓使用者能選擇性地忽略/批量 dismiss，而不是每篇都要人工看過）。
+
+**Merge 前 code review 一輪（另一個 session 代使用者複查，兩處修正、一處記錄不動手）**：
+
+- **（中，已修）CLI 訊息順序**：`rune scope reconcile` 的人類可讀輸出原本
+  `if suspicious_churn: ... elif applied: ... elif full: ...` 依序判斷，導致 `--full` 搭配剛好超過
+  churn threshold 的樹時，印出「Suspicious churn... No changes were written -- review required」——
+  這句話本身沒錯（確實沒寫入），但把「沒寫入」的原因歸給 churn guardrail，而實際上 `--full` 本來就
+  絕對不寫入、跟 churn 完全無關。已改為先判斷 `full`，`--full` 一律印「N AUTO candidate(s) found
+  (--full, output-only)」，不再被 `suspicious_churn` 的訊息搶在前面。
+- **（低，已修）模組 docstring 用詞不精確**：`reconcile.py` 開頭原本寫「a file/symbol present in the
+  current index but a member of no scope is exactly the 'added file' case... reconcile applies that
+  same rule」，但程式碼只對「未分配的檔案」跑 AUTO/REVIEW 分類迴圈，從未對「未分配的 symbol」跑過
+  ——三個獨立 review 角度都各自發現這個字面矛盾。重新確認過 Milestone 4 原始的 incremental
+  auto-assignment 規則本來就只認 file-level import edge，沒有 symbol-level 的對應高信心規則，所以
+  程式碼行為（AUTO/REVIEW-for-new 只認檔案）才是對的；已改的是 docstring 措辭，讓它精確描述現況，
+  不再暗示 symbol 也有相同的「新增即分類」路徑。**是否要替「從未被任何 scope 以 symbol 形式收錄」的
+  symbol 也加一個 REVIEW 分類，本輪判斷為需要使用者確認的範圍擴張（可能在大型既有 repo 上對幾乎每個
+  未特別用 symbol 層級收錄的函式都跳出 REVIEW，雜訊風險比照上一條「zero-evidence 未分配檔案」的疑慮，
+  但量級可能大得多——大多數 scope 只用 `members.files`，`members.symbols` 是特例用法）**，記錄下來但
+  不動手，需要下一輪跟使用者確認後才實作。既有 membership 被刪除的方向（BROKEN/REVIEW-for-removal）
+  對檔案與 symbol 本來就對稱處理，不受這條影響。
+- **（低，記錄不動手）`reconcile()` 對未分配檔案的迴圈是 O(未分配檔案數 × edges 總數)**（`high_
+  confidence_import_candidates` 每次呼叫都重新掃一次 `code_index.edges`），在既有大型 repo 第一次執行
+  `rune scope reconcile` 時可能明顯變慢；`assign_new_files_from_imports`（`rune update` 既有的
+  incremental 路徑）不受影響，因為它只在小得多的「這次新增的檔案」delta 上跑。這是效能問題，不是正確性
+  問題，且與上一條「zero-evidence 雜訊」問題同源（首次在大型既有 repo 執行的體驗尚未有真實回饋）——記錄
+  下來，留待有真實大型 repo 執行數據後再決定是否要把 `edges` 依 `source_file` 預先分組成 dict。
+
+351 個測試維持全綠（這輪只改訊息順序與註解文字，不影響任何既有測試的斷言），`ruff check` 全綠。
