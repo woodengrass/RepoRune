@@ -197,8 +197,11 @@ adapter      server
 1. **Canonical 文字檔是 memory 唯一的 source of truth。** SQLite 永遠可以透過 `rune rebuild-cache` 從
    canonical 重建，且過程零 LLM 呼叫。兩者不一致時，以 canonical 為準。
 2. **原始碼是程式碼事實唯一的 source of truth。** rune 從不「記住」某函式存在——每次 `rune update` 都重新
-   從 repo 推導。Semantic summary 與 Note 可以「描述」程式碼事實，但依附在已過期／已刪除來源 hash 上的
-   summary 絕不會被當作目前的事實直接呈現。
+    從 repo 推導。Semantic summary 與 Note 可以「描述」程式碼事實，但依附在已過期／已刪除來源 hash 上的
+    summary 絕不會被當作目前的事實直接呈現。
+3. **cache 不得超前 canonical。** `rebuild_cache()` 已 commit 後，若任何延後的 canonical write 失敗，
+   rune 立即刪除 `memory.db` 及其 sidecar。個別 canonical 檔案仍可能已有部分成功寫入，因此下次
+   update/rebuild 從 canonical 重新推導，不承諾跨多檔 transaction。
 
 ## 4. 元件職責
 
@@ -214,7 +217,7 @@ variable/constant/component）、擷取 import、best-effort 擷取 reference。
 失敗，但 `status=parse_error` 具體代表什麼**分兩種情況**（本輪修正先前「標記後跳過」這句過於簡化、與
 Milestone 2/3 實際行為不符的敘述）：
 
-1. **真的丟例外**（檔案讀不到、或 tree-sitter 的 `MISSING` 節點讓某個必要欄位變成 `None`
+1. **真的丟例外**（tree-sitter 的 `MISSING` 節點讓某個必要欄位變成 `None`
    導致我方 walker 出錯）：該檔案標記 `parse_error`，symbol/edge 一律為空——這才是真正的「跳過」。
 2. **`adapter.has_syntax_error(source)` 為真，但擷取本身沒有丟例外**：tree-sitter 對語法錯誤採
    error-recovery（回傳含 ERROR 節點的部分樹，不丟例外），此時擷取到的 symbol 可能是從錯誤區域附近
@@ -225,7 +228,11 @@ Milestone 2/3 實際行為不符的敘述）：
 會**持續存在**直到該檔案真的被重新解析：一個 content_hash 沒變的檔案（`rune update` 認定為
 「unchanged」、不會再丟進 tree-sitter）必須沿用它上一次的真實狀態，不能因為「這次沒有重新解析」就
 預設它是 `ok`——否則一個曾經解析失敗的檔案，只要之後沒有人去動它，反而會在下一次無修改的
-`rune update` 之後看起來像是「已修好」。
+ `rune update` 之後看起來像是「已修好」。
+
+Scanner 走訪時若 path 存在但 `stat` 或讀取失敗，這是獨立的 `status=scan_error`，不是刪除或
+`parse_error`。既有 index 保留最後已知的 file/symbol/edge facts；新 path 暫不索引；成功讀取後即使
+content hash 未變也強制重新解析以恢復狀態。整次 update 繼續執行並回報 `files_scan_errors`。
 
 Symbol rename 在 V1 視為「刪除舊 symbol + 建立新 symbol」（`symbol_id` 由 `path + qualified_name + kind`
 推導，rename 自然產生新 ID），不做 fuzzy rename 追蹤——刻意選擇，避免引入誤配對風險。
@@ -783,8 +790,8 @@ current+visible 的 MUST/SHOULD constraint（INFO severity 不主動注入，見
 - **`experimental.chat.system.transform` 每次呼叫都重新 render hard bootstrap 與 active scopes**，用一組固定的
   `<!-- rune-context:start/end -->` marker 包裹，`mergeRuneBlock()`
   （同檔案）**原地覆寫**已存在的 marker 區塊，或附加到現有的最後一個 system 字串——**絕不對
-  `output.system` 陣列 push 新元素**（跟使用者確認：部分 OpenAI-compatible provider 會拒絕帶超過
-  一個 system-role 訊息的請求，見規格）。這保證：同一份 context 重繪 N 次，`system` 陣列長度不變、
+   `output.system` 陣列建立第二個元素**（空陣列時建立唯一元素是必要的 host fallback；實際 host 目前傳入
+   一個元素）。這保證：同一份 context 重繪 N 次，`system` 陣列長度不變、
   不重複、也不會意外製造出第二個 system 角色訊息。
 - **`client.session.prompt({noReply: true})` 不作 V1 的 soft bootstrap delivery**：真實 host 驗證發現它仍會
   產生額外 assistant turn，違反「不觸發模型回覆」的前提。它保留為未接入 helper；若未來
@@ -932,7 +939,6 @@ bootstrap 可以包含少數 `critical=true` 的 global Decision，**但不能�
 ```json
 {
   "mode": "hard",
-  "generation_hint": "call this once per session.created / session.compacted",
   "constraints": [
     {
       "record_id": "no-business-logic-in-adapters",

@@ -26,7 +26,11 @@ from rune.core.config import load_config
 from rune.core.hashing import working_tree_fingerprint
 from rune.core.index.imports import build_import_edges
 from rune.core.index.references import group_symbols_by_path, resolve_references
-from rune.core.index.scanner import ScannedFile, diff_against_previous, scan_files
+from rune.core.index.scanner import (
+    ScannedFile,
+    diff_against_previous,
+    scan_files_with_issues,
+)
 from rune.core.index.treesitter import RawReference, get_parser_adapter
 from rune.core.memory.records import current_by_note_id, current_by_record_id
 from rune.core.memory.staleness import (
@@ -75,6 +79,7 @@ from rune.core.storage.sqlite.materialize import (
     CodeIndexData,
     SemanticRunMetricsRecord,
     current_scope_summaries,
+    discard_cache,
     read_current_code_index,
     rebuild_cache,
 )
@@ -225,7 +230,10 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     repo_root = layout.repo_root
     now = utc_now_iso()
 
-    previous = CodeIndexData() if full else read_current_code_index(layout)
+    # A full update parses every readable file from scratch, but still needs
+    # the prior facts for a path the scanner could not read this run.
+    indexed_before_scan = read_current_code_index(layout)
+    previous = CodeIndexData() if full else indexed_before_scan
     previous_hashes = {f.path: f.content_hash for f in previous.files}
     previous_status_by_path = {f.path: f.status for f in previous.files}
     symbols_by_path: dict[str, list[Symbol]] = defaultdict(list)
@@ -235,8 +243,11 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     for e in previous.edges:
         edges_by_path[e.source_file].append(e)
 
-    scanned = scan_files(repo_root, config.index)
+    scan_result = scan_files_with_issues(repo_root, config.index)
+    scanned = scan_result.files
     changeset = diff_against_previous(scanned, previous_hashes)
+    unreadable_paths = set(scan_result.unreadable_paths)
+    deleted_paths = [path for path in changeset.deleted_paths if path not in unreadable_paths]
 
     new_files: list[IndexedFile] = []
     new_symbols: list[Symbol] = []
@@ -258,6 +269,17 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
         # a no-op `rune update` would silently launder a known-bad file
         # back to `ok` without re-running the parser at all.
         previous_status = previous_status_by_path.get(scanned_file.path, IndexedFileStatus.ok)
+        if previous_status is IndexedFileStatus.scan_error:
+            # A transient scanner failure retains the last good index only
+            # until this path becomes readable again. Reparse even when its
+            # content hash matches so the status can recover to `ok`.
+            symbols, import_edges, raw_references, status = _parse_file(repo_root, scanned_file)
+            files_parsed += 1
+            new_files.append(_to_indexed_file(scanned_file, now, status))
+            new_symbols.extend(symbols)
+            new_edges.extend(import_edges)
+            pending_references[scanned_file.path] = raw_references
+            continue
         new_files.append(_to_indexed_file(scanned_file, now, previous_status))
         new_symbols.extend(symbols_by_path.get(scanned_file.path, []))
         # Only `imports` edges are safe to reuse verbatim here: import
@@ -280,6 +302,22 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
         new_symbols.extend(symbols)
         new_edges.extend(import_edges)
         pending_references[scanned_file.path] = raw_references
+
+    unreadable_existing_paths = unreadable_paths & {
+        file.path for file in indexed_before_scan.files
+    }
+    for path in sorted(unreadable_existing_paths):
+        previous_file = next(file for file in indexed_before_scan.files if file.path == path)
+        new_files.append(previous_file.model_copy(update={"status": IndexedFileStatus.scan_error}))
+        new_symbols.extend(
+            symbol for symbol in indexed_before_scan.symbols if symbol.file == path
+        )
+        # This source file cannot be reread, so preserve every last-known
+        # edge rather than discarding reference facts solely due to a
+        # transient filesystem failure.
+        new_edges.extend(
+            edge for edge in indexed_before_scan.edges if edge.source_file == path
+        )
 
     if pending_references:
         # Resolution needs the complete cross-file symbol table, including
@@ -484,46 +522,33 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
         constraints_override=constraints_override,
         notes_override=notes_override,
     )
-    if updated_scopes_file is not None:
-        save_scopes(layout, updated_scopes_file)
-    # A single atomic write for every new semantic revision this run
-    # (orphan markers plus any real refreshes) instead of N separate
-    # append_jsonl calls — see append_jsonl_many's docstring for why N
-    # separate atomic writes isn't good enough here: a failure partway
-    # through would leave canonical behind what the already-committed
-    # SQLite transaction above reflects for some scopes but not others.
-    append_jsonl_many(layout.semantic_jsonl, new_semantic_revisions)
-    _append_semantic_log(layout, semantic_local_log)
-    # Same all-or-nothing rationale as semantic.jsonl above: these
-    # canonical appends only happen after rebuild_cache has already
-    # committed the same revisions into this run's SQLite transaction.
-    append_jsonl_many(layout.decisions_jsonl, new_decision_revisions)
-    append_jsonl_many(layout.constraints_jsonl, new_constraint_revisions)
-    append_jsonl_many(layout.notes_jsonl, new_note_revisions)
-
-    # KNOWN LIMITATION (see IMPLEMENTATION_PLAN.md): this write is not
-    # atomic with the SQLite commit above — memory.db and project.json are
-    # two separate files, and true two-phase-commit across them is not
-    # worth the complexity for what it buys. If this write fails (e.g.
-    # disk full) after rebuild_cache already succeeded, memory.db is
-    # correctly up to date but project.json's last_indexed_* fields go
-    # stale, which only affects `rune status`'s freshness display — it
-    # does NOT corrupt future updates, because `read_current_code_index`
-    # (used for incremental diffing) reads the actual `files` table, never
-    # project.json. The next successful `rune update` recomputes and
-    # rewrites these fields regardless of what they said before, so this
-    # self-heals. The reverse ordering (write project.json first) would be
-    # worse: a subsequent rebuild_cache failure would leave project.json
-    # confidently reporting a fresh index that was never actually written.
-    if updated_project is not None:
-        write_json_model(layout.project_json, updated_project)
+    try:
+        if updated_scopes_file is not None:
+            save_scopes(layout, updated_scopes_file)
+        append_jsonl_many(layout.semantic_jsonl, new_semantic_revisions)
+        _append_semantic_log(layout, semantic_local_log)
+        append_jsonl_many(layout.decisions_jsonl, new_decision_revisions)
+        append_jsonl_many(layout.constraints_jsonl, new_constraint_revisions)
+        append_jsonl_many(layout.notes_jsonl, new_note_revisions)
+        if updated_project is not None:
+            write_json_model(layout.project_json, updated_project)
+    except BaseException:
+        # Canonical is authoritative. If any deferred canonical write fails
+        # after SQLite committed, remove the now-untrustworthy derived cache
+        # rather than letting readers observe data canonical does not contain.
+        try:
+            discard_cache(layout)
+        except OSError:
+            pass
+        raise
 
     stats.update(
         {
             "files_scanned": len(scanned),
             "files_parsed": files_parsed,
             "files_reused": len(changeset.unchanged),
-            "files_deleted": len(changeset.deleted_paths),
+            "files_deleted": len(deleted_paths),
+            "files_scan_errors": len(scan_result.unreadable_paths),
             "scope_files_auto_assigned": len(auto_assigned_scope_ids),
             "semantic_scopes_refreshed": len(new_semantic_revisions),
             "semantic_scopes_possibly_stale": len(possibly_stale_revisions),

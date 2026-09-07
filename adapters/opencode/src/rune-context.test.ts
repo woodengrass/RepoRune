@@ -6,6 +6,7 @@ import type { HardBootstrapResult, ScopeForScope } from "./rune-cli.js";
 
 function hard(overrides: Partial<HardBootstrapResult> = {}): HardBootstrapResult {
   return {
+    protocol_version: 1,
     mode: "hard",
     constraints: [],
     decisions: [],
@@ -46,6 +47,20 @@ test("active scoped constraints persist across subsequent renders", () => {
   const second = ctx.render();
   assert.match(first, /app-c1/);
   assert.match(second, /app-c1/);
+});
+
+test("scoped constraint warnings are rendered with their status", () => {
+  const ctx = new RuneSessionContext();
+  ctx.addActiveScope({
+    ...scope("app"),
+    constraints: [{
+      record_id: "stale-rule", severity: "MUST", content: "review this", status: "stale",
+      warning: "source changed since approval",
+    }],
+  });
+
+  const rendered = ctx.render();
+  assert.match(rendered, /WARNING \[stale\]: source changed since approval/);
 });
 
 test("a second addActiveScope call for the same scope id is a no-op", () => {

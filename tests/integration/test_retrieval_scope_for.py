@@ -142,3 +142,25 @@ def test_scope_for_file_in_multiple_scopes(python_simple_repo: Path) -> None:
 
     results = scope_for(layout, "app/services.py")
     assert sorted(s.scope_id for s in results) == ["app", "core"]
+
+
+def test_scope_for_matches_a_symbol_only_scope(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    import sqlite3
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    symbol_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'UserService.get_user'"
+    ).fetchone()[0]
+    conn.close()
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="service", name="Service", source=ScopeSource.human,
+                  members=ScopeMembers(symbols=[symbol_id])),
+        ]),
+    )
+    run_update(layout, full=True)
+
+    assert [scope.scope_id for scope in scope_for(layout, "app/services.py")] == ["service"]

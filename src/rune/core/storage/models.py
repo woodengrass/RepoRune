@@ -89,6 +89,7 @@ class ProjectFile(BaseModel):
 class IndexedFileStatus(str, Enum):
     ok = "ok"
     parse_error = "parse_error"
+    scan_error = "scan_error"
 
 
 class IndexedFile(BaseModel):

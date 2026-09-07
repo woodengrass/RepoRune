@@ -238,7 +238,7 @@ IMPLEMENTATION_PLAN.md「Milestone 7 開工」第 134-140 條、ARCHITECTURE.md 
 tool 自己的參數），型別定義裡唯一的 system-level 通道是 experimental 的
 `experimental.chat.system.transform`。使用者給了具體設計指示：**不是一次性 queue-drain**，改成
 每個 session 持續維護 hard bootstrap／active scopes／pending events 三桶狀態，每次 LLM 呼叫前
-重新 render 整份 context，**絕不對 `output.system` push 新元素**（部分 OpenAI-compatible provider
+重新 render 整份 context，**不會在已有 entry 時建立第二個 `output.system` 元素**（部分 OpenAI-compatible provider
 拒絕多個 system-role 訊息）、原地覆寫既有 marker 區塊。新增 `adapters/opencode/src/
 {rune-context,plugin,tool-paths}.ts`（`rune-context.ts`/`tool-paths.ts` 是零 OpenCode/CLI 依賴的
 純邏輯，方便不 mock 整個 Hooks 介面就能測）與 `rune-cli.ts` 的六個新 wrapper；Python CLI
@@ -420,7 +420,7 @@ src/rune/
 - `src/rune-context.ts`——零 OpenCode/CLI 依賴的純邏輯：`RuneSessionContext`（每個 session 持續
   維護 hard bootstrap／active scopes／pending events 三桶狀態並 render 成文字）、
   `mergeRuneBlock()`（原地覆寫 `<!-- rune-context:start/end -->` marker 區塊，絕不對
-  `output.system` push 新元素）。
+   已有 entry 時建立第二個 `output.system` 元素）。
 - `src/tool-paths.ts`——`extractPathsFromToolArgs()`：從 `tool.execute.before` 的 `output.args`
   猜測受影響檔案路徑（未對照真實 host 驗證，fail open）。
 - `src/plugin.ts`——真正的 `Plugin`/`Hooks` 匯出：`event`（session.created/compacted）、
@@ -481,8 +481,9 @@ git-init 過的小型測試用 repo）。
    測得出來。`references.py` 已經修好且有這種跨行程測試，未來任何類似的「從集合裡挑一個」邏輯都
    要留意這件事。
 7. **`content_hash` 沒變 ≠ 上次解析是乾淨的**：`IndexedFileStatus.parse_error` 必須一路沿用到
-   該檔案真的被重新解析為止，不能因為這次是 "unchanged"（不會重新丟進 tree-sitter）就預設狀態是
-   `ok`。這是最新一次（d9cc48a）修的 bug。
+    該檔案真的被重新解析為止，不能因為這次是 "unchanged"（不會重新丟進 tree-sitter）就預設狀態是
+    `ok`。`scan_error` 是另一種暫時 I/O 狀態：保留 last-known index，恢復可讀時即使 hash 未變仍強制
+    重解析；不得將它視為刪除。
 8. **config.toml 用 `extra="forbid"`**：未知欄位（打錯字的 config 區塊）會直接拋錯，不會被
    Pydantic 靜默吞掉。這是刻意的，因為靜默接受設定錯字比丟例外更危險。
 9. **`find_repo_root` 真的呼叫 `git rev-parse --show-toplevel`**，不是只檢查 `.git` 路徑存不
@@ -541,8 +542,9 @@ git-init 過的小型測試用 repo）。
   §4.4 已經把 incremental scope reconciliation 的完整規則寫清楚（untouched region frozen、
   AUTO/KEEP/REVIEW/BROKEN 分類、locked/human-confirmed membership 保護），但 CLI 命令本身、
   large-churn 的具體數值都還沒做，是設計先於實作的狀態。
-- **`protocol_version` 尚未加進任何 `--json` 輸出**：ARCHITECTURE.md §6.2 已經定義好 adapter/core
-  相容性契約的設計，但目前所有 `--json` 命令都還沒有這個欄位，是 Milestone 7 收尾前要補的 contract。
+- **`protocol_version` 已實作為 1**：所有現有 `--json` 輸出皆為頂層 object 並帶有此欄位（`search`
+  的結果清單改置於 `results`）；OpenCode adapter 在 JSON parse 後驗證版本，不符即明確拒絕，提示升級
+  core 或 adapter。此 Milestone 7 contract 已完成。
 - **`approve()` 的崩潰重試冪等檢查有一個評估後判定不修的 false-positive**（見
   `proposals.py`：`_APPROVAL_CONTENT_FIELDS` 旁的註解、IMPLEMENTATION_PLAN.md 第 152 條）：兩個
   內容逐欄位相同、record_id 相同的**獨立**新 proposal（例如同一個修法被複製貼上提案兩次）若都被
@@ -593,8 +595,8 @@ regression test 直接斷言），JSON 格式逐字對照 ARCHITECTURE §7.6。3
 **Milestone 7 之後、純設計文件修訂一輪（不含程式碼）**：見 IMPLEMENTATION_PLAN.md「Milestone 7
 開工」第四輪修訂（第 141-147 條）、ARCHITECTURE.md 新第 14/16/17 節與 §4.4/§6.2、DATA_MODEL.md
 新第 9 節。確認了部署模型（machine-level install once、per-repo `rune init`、plugin 偵測
-`.rune/` 且絕不自動 init、V1 不用 daemon）、`protocol_version` adapter/core 相容性契約（設計已定，
-CLI 尚未實作）、git worktree／多 agent 協作 workflow 與 "merge reconciliation follows
+`.rune/` 且絕不自動 init、V1 不用 daemon）、`protocol_version` adapter/core 相容性契約（已實作為
+version 1）、git worktree／多 agent 協作 workflow 與 "merge reconciliation follows
 provenance" 原則、把既有 incremental scope 自動併入規則泛化成完整的 Scope Membership
 Reconciliation 設計（untouched region frozen、large-churn guardrail、AUTO/KEEP/REVIEW/BROKEN
 分類，CLI 尚未實作）、記錄 Scope membership 缺乏 per-membership provenance 的 schema 限制

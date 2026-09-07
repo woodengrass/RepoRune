@@ -1880,7 +1880,7 @@ custom tool 註冊（`decision_propose`/`constraint_propose`/`note_add`）——
     `experimental.chat.system.transform`（`output: {system: string[]}`，每次 LLM 呼叫前執行）。
     使用者給出具體設計指示：**不要做成一次性 queue-drain**，改成每個 session 持續維護狀態（hard
     bootstrap／active scopes／pending events 三個桶），`system.transform` 每次都重新 render 整份
-    狀態；**絕不對 `output.system` push 新元素**（部分 OpenAI-compatible provider 拒絕多個
+    狀態；**已有 entry 時絕不建立第二個 `output.system` 元素**（部分 OpenAI-compatible provider 拒絕多個
     system-role 訊息），改成原地覆寫既有 marker 區塊或附加到最後一個既有字串；
     `client.session.prompt({noReply:true})` 只留作未接入的降級 fallback，不是 V1 主要機制。細節
     與完整設計理由見 ARCHITECTURE.md §6.1（第十六輪）。
@@ -2002,7 +2002,6 @@ DATA_MODEL.md／IMPLEMENTATION_PLAN.md／HANDOFF.md 四份文件，本輪明確�
 未使用 AskUserQuestion。
 
 **尚待實作（本輪只完成設計，以下皆未動程式碼，不要誤讀為已完成）**：
-- `protocol_version` 加進既有 `--json` 輸出（第 142 條，ARCHITECTURE §6.2）。
 - `rune scope reconcile`（含 `--full`）CLI 命令與 `AUTO`/`KEEP`/`REVIEW`/`BROKEN` 輸出格式，以及
   large-churn threshold 的具體數值（第 145 條，ARCHITECTURE §4.4）。
 - `ScopeMembership` per-membership provenance schema——future/V2，非近期待辦（第 146 條，
@@ -2137,4 +2136,33 @@ staleness 語意或 agent-injection 語意——全部是既有已定案行為�
      實際修改 `scope_a.py`，`tool.execute.after` 的 `git status` 回報 repo-relative `scope_a.py`（以及預期的 Rune
      untracked files），沒有 `[object Object]`。同 session 的下一個 `system.transform` 維持一個 system entry，模型回覆
      `GLOBAL_ACCEPTANCE_MUST SCOPE_A_ACCEPTANCE_MUST`，證實 hard bootstrap、bash post-change scope activation 與 scoped
-     constraint injection 均恢復。第 157 條的 HTTP 503 僅為舊 provider 可用性，不再是 M7 host blocker。
+      constraint injection 均恢復。第 157 條的 HTTP 503 僅為舊 provider 可用性，不再是 M7 host blocker。
+
+### Milestone 7 correctness and contract fixes
+
+159. **Symbol-only scope activation/check 漏失**：`ScopeMembers` 明確支援 files 與 symbols 的多對多 membership，
+semantic worker 也會由 symbol 追溯 owning file；但 `scope_for()` 與 `check()` 只查 `scope_files`。親自以
+`UserService.get_user` 建立 members.symbols 唯一的 scope，確認開啟/修改 `app/services.py` 完全找不到該
+scope，導致 scoped constraint 不會被注入或列入 `rune check`。修法是兩條 query 都加入
+`scope_symbols JOIN symbols` 的 owning-file 路徑；新增兩個 integration regression tests。
+160. **Cache health 與 scope suggest 診斷**：損毀 `memory.db` 時，`status` 雖將 count 歸零，卻仍只用
+`project.json` tree hash 報 fresh；這會把「可用且最新」錯報為「只有原始碼未變」。新增 `cache_usable`，並讓
+fresh 必須同時滿足可用 cache。`scope suggest` 同時從 raw SQLite connect 改用 `connect_for_read()`，維持其餘
+讀取命令的可操作 cache error。新增/更新 CLI regression coverage。
+161. **Proposal canonical secret safety and edit diagnostics**：Note/semantic 已在進 canonical 前依設定遮蔽 secret，
+但 Decision/Constraint proposal 未遮蔽，且 edited payload 可在核准時直接寫入。`propose()` 和 `approve()`
+現均接受並套用 `redact_secrets`；CLI 從 config 傳入。`proposal edit` 同時補齊其他 canonical write command
+既有的 cache-refresh-failure 診斷，避免寫入成功後顯示 raw traceback。新增 proposal redaction regression test。
+162. **Adapter/core `protocol_version` contract 完成**：`core.protocol.PROTOCOL_VERSION=1`；所有現有 `--json`
+輸出均是頂層 object 並帶有 `protocol_version`，原本 array top-level 的 `rune search --json` 改為
+`{"protocol_version": 1, "results": [...]}`。TypeScript adapter 解析 JSON 時驗證整數版本相等，不符或缺失即
+ 丟出明確 core/adapter mismatch error；新增 TS regression test。這是 ARCHITECTURE §6.2 已定設計的實作，未
+ 改變 canonical schema、scope model 或 agent-injection semantics。
+163. **Scanner I/O failure 不可偽裝成刪除**：新增 `scan_files_with_issues()` 與 derived
+   `IndexedFileStatus.scan_error`。暫時無法 `stat`/讀取的既有檔案保留 last-known file/symbol/edge facts，
+   新檔暫不索引；恢復可讀時即使 hash 未變也強制重新解析。單元與 integration regression coverage 確認 update
+   不 abort、不誤刪且可恢復。
+164. **Deferred canonical write failure 丟棄 cache**：SQLite transaction 與多 canonical files 無跨檔 atomic
+   transaction；使用者確認不導入 two-phase commit。`rebuild_cache()` 成功後，任一 deferred scopes/JSONL/
+   project write 失敗即刪除 `memory.db` 與 sidecars，避免 readers 看見 cache 超前 canonical；下次 update 從
+   source/canonical 完整重建。更新 project JSON 與 semantic append failure regressions。

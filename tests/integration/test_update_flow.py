@@ -553,6 +553,50 @@ def test_one_file_parse_failure_does_not_abort_the_whole_update(
     assert stats["files"] == 3
 
 
+def test_unreadable_existing_file_keeps_last_known_index_and_recovers(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    """A scanner-level I/O failure happens before parser isolation. It must
+    retain an existing file's last-known facts, avoid false deletion, and
+    reparse once the filesystem becomes readable again.
+    """
+    import rune.core.index.scanner as scanner_module
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    real_hash = scanner_module.content_hash_of_file
+
+    def failing_hash(path: Path) -> str:
+        if path.name == "services.py":
+            raise PermissionError("simulated sharing violation")
+        return real_hash(path)
+
+    monkeypatch.setattr(scanner_module, "content_hash_of_file", failing_hash)
+    stats = run_update(layout, full=True)
+
+    conn = sqlite3.connect(str(layout.memory_db))
+    row = conn.execute(
+        "SELECT status FROM files WHERE path = 'app/services.py'"
+    ).fetchone()
+    symbol_count = conn.execute(
+        "SELECT COUNT(*) FROM symbols WHERE file = 'app/services.py'"
+    ).fetchone()[0]
+    conn.close()
+    assert row == ("scan_error",)
+    assert symbol_count > 0
+    assert stats["files_deleted"] == 0
+    assert stats["files_scan_errors"] == 1
+
+    monkeypatch.setattr(scanner_module, "content_hash_of_file", real_hash)
+    recovered = run_update(layout, full=False)
+    conn = sqlite3.connect(str(layout.memory_db))
+    assert conn.execute(
+        "SELECT status FROM files WHERE path = 'app/services.py'"
+    ).fetchone() == ("ok",)
+    conn.close()
+    assert recovered["files_parsed"] == 1
+
+
 def test_unchanged_file_keeps_its_previous_parse_error_status(tmp_path: Path) -> None:
     """Regression test: content_hash-unchanged means "not re-parsed this
     run", not "known good". A file that previously failed to parse
@@ -594,15 +638,12 @@ def test_unchanged_file_keeps_its_previous_parse_error_status(tmp_path: Path) ->
     assert conn2.execute("SELECT status FROM files").fetchone()[0] == "parse_error"
 
 
-def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
+def test_project_json_write_failure_after_cache_commit_discards_cache(
     python_simple_repo: Path, monkeypatch
 ) -> None:
-    """Known limitation documented in core.update.run_update: the SQLite
-    commit and the project.json write are not atomic with each other. If
-    project.json's write fails right after a successful cache commit, the
-    cache itself must still be correct, and the next `run_update` call
-    must still behave correctly (it diffs against the `files` table, not
-    against project.json, so a stale project.json cannot corrupt it).
+    """Canonical is authoritative: a failed deferred canonical write must
+    discard the already-committed derived cache rather than expose data
+    that canonical has not confirmed.
     """
     import rune.core.update as update_module
 
@@ -624,19 +665,13 @@ def test_project_json_write_failure_after_cache_commit_self_heals_next_run(
     except OSError:
         pass
 
-    # the cache itself was still correctly committed despite the metadata
-    # write failing afterward
-    conn = sqlite3.connect(str(layout.memory_db))
-    qnames = {row[0] for row in conn.execute("SELECT qualified_name FROM symbols")}
-    assert "UserService.get_user" in qnames
+    assert not layout.memory_db.exists()
 
-    # a subsequent, unpatched update must still work correctly: it diffs
-    # against the files table (already up to date), not the stale
-    # project.json, so nothing is corrupted by the earlier failure
+    # A subsequent unpatched update regenerates the fully-derived cache.
     monkeypatch.undo()
     stats = run_update(layout, full=False)
-    assert stats["files_parsed"] == 0  # nothing changed since the failed attempt
-    assert stats["files_reused"] == 3
+    assert stats["files_parsed"] == 3
+    assert stats["files_reused"] == 0
 
 
 def _ok_health():
@@ -1027,13 +1062,9 @@ def test_multiple_semantic_revisions_append_atomically_in_one_run(
 
     # Nothing was written to canonical -- not "the first scope only".
     assert read_jsonl(layout.semantic_jsonl, ScopeSummary) == []
-    # But the (unpatched, real) SQLite commit already happened inside
-    # rebuild_cache before append_jsonl_many was ever called -- this is
-    # the pre-existing, accepted asymmetry (same as project.json), not
-    # something this test is trying to fix.
-    conn = sqlite3.connect(str(layout.memory_db))
-    sqlite_scopes = {row[0] for row in conn.execute("SELECT scope_id FROM semantic_objects")}
-    assert sqlite_scopes == {"scope_a", "scope_b"}
+    # The already-committed cache is deliberately discarded rather than
+    # exposing semantic revisions that never reached canonical state.
+    assert not layout.memory_db.exists()
 
 
 def test_semantic_run_metrics_persist_across_runs(python_simple_repo: Path, monkeypatch) -> None:

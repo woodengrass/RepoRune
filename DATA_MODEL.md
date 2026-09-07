@@ -89,7 +89,7 @@ class IndexedFile(BaseModel):
     mtime: float
     git_blob_hash: str | None
     indexed_at: str
-    status: Literal["ok", "parse_error"] = "ok"
+    status: Literal["ok", "parse_error", "scan_error"] = "ok"
 
 class SymbolKind(str, Enum):
     function = "function"

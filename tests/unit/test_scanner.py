@@ -6,6 +6,7 @@ from rune.core.index.scanner import (
     ScannedFile,
     diff_against_previous,
     scan_files,
+    scan_files_with_issues,
 )
 from rune.core.storage.models import IndexConfig
 
@@ -52,6 +53,35 @@ def test_scan_files_detects_language_by_extension(tmp_path: Path) -> None:
     _write(tmp_path / "c.js", "const x = 1;\n")
     results = {r.path: r.language for r in scan_files(tmp_path, IndexConfig())}
     assert results == {"a.py": "python", "b.ts": "typescript", "c.js": "javascript"}
+
+
+def test_scan_files_reports_an_unreadable_source_without_aborting(tmp_path: Path, monkeypatch) -> None:
+    import rune.core.index.scanner as scanner_module
+
+    _write(tmp_path / "good.py")
+    _write(tmp_path / "blocked.py")
+    real_hash = scanner_module.content_hash_of_file
+
+    def failing_hash(path: Path) -> str:
+        if path.name == "blocked.py":
+            raise PermissionError("simulated sharing violation")
+        return real_hash(path)
+
+    monkeypatch.setattr(scanner_module, "content_hash_of_file", failing_hash)
+
+    real_exists = Path.exists
+
+    def inaccessible_exists(path: Path) -> bool:
+        if path.name == "blocked.py":
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(Path, "exists", inaccessible_exists)
+
+    result = scan_files_with_issues(tmp_path, IndexConfig())
+
+    assert [file.path for file in result.files] == ["good.py"]
+    assert result.unreadable_paths == ["blocked.py"]
 
 
 def _scanned(path: str, content_hash: str) -> ScannedFile:

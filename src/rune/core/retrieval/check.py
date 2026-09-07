@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from rune.core.config import load_config
-from rune.core.index.scanner import diff_against_previous, scan_files
+from rune.core.index.scanner import diff_against_previous, scan_files_with_issues
 from rune.core.project import RuneLayout
 from rune.core.storage.sqlite.materialize import connect_for_read
 
@@ -54,7 +54,8 @@ def check(layout: RuneLayout) -> CheckResult:
         return CheckResult()
 
     config = load_config(layout.config_path)
-    scanned = scan_files(layout.repo_root, config.index)
+    scan_result = scan_files_with_issues(layout.repo_root, config.index)
+    scanned = scan_result.files
 
     conn = connect_for_read(layout)
     try:
@@ -63,7 +64,7 @@ def check(layout: RuneLayout) -> CheckResult:
         changed_files = sorted(
             {f.path for f in changeset.added}
             | {f.path for f in changeset.modified}
-            | set(changeset.deleted_paths)
+            | (set(changeset.deleted_paths) - set(scan_result.unreadable_paths))
         )
         if not changed_files:
             return CheckResult()
@@ -71,7 +72,12 @@ def check(layout: RuneLayout) -> CheckResult:
         affected_scope_ids: set[str] = set()
         for path in changed_files:
             rows = conn.execute(
-                "SELECT scope_id FROM scope_files WHERE file = ?", (path,)
+                "SELECT scope_id FROM scope_files WHERE file = ? "
+                "UNION "
+                "SELECT ss.scope_id FROM scope_symbols ss "
+                "JOIN symbols sym ON sym.symbol_id = ss.symbol_id "
+                "WHERE sym.file = ?",
+                (path, path),
             ).fetchall()
             affected_scope_ids.update(row["scope_id"] for row in rows)
 

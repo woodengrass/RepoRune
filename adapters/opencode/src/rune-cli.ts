@@ -17,6 +17,7 @@ const execFileAsync = promisify(execFile);
 // real deployment story (Milestone 8 packaging) is expected to put
 // `rune` on PATH, at which point this default is what actually runs.
 const RUNE_CLI_PATH = process.env.RUNE_CLI_PATH ?? "rune";
+export const RUNE_PROTOCOL_VERSION = 1;
 
 export class RuneCliError extends Error {
   constructor(
@@ -36,14 +37,38 @@ export class RuneCliError extends Error {
  * find the repo root and `.rune/` (this adapter never resolves that
  * itself).
  */
-export async function callRuneJson<T>(directory: string, args: string[]): Promise<T> {
+interface ProtocolResponse {
+  protocol_version: number;
+}
+
+export function parseRuneJson<T extends ProtocolResponse>(stdout: string): T {
+  const payload: unknown = JSON.parse(stdout);
+  if (
+    !payload || typeof payload !== "object" || Array.isArray(payload)
+    || !Number.isInteger((payload as ProtocolResponse).protocol_version)
+    || (payload as ProtocolResponse).protocol_version !== RUNE_PROTOCOL_VERSION
+  ) {
+    const version = payload && typeof payload === "object" && !Array.isArray(payload)
+      ? (payload as Partial<ProtocolResponse>).protocol_version
+      : undefined;
+    const actual = version === undefined ? "missing" : String(version);
+    throw new RuneCliError(
+      `rune core/adapter protocol mismatch: adapter requires ${RUNE_PROTOCOL_VERSION}, core returned ${actual}. Upgrade one side.`,
+      stdout,
+      "",
+    );
+  }
+  return payload as T;
+}
+
+export async function callRuneJson<T extends ProtocolResponse>(directory: string, args: string[]): Promise<T> {
   const fullArgs = [...args, "--json", "--path", directory];
   try {
     const { stdout } = await execFileAsync(RUNE_CLI_PATH, fullArgs, {
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
     });
-    return JSON.parse(stdout) as T;
+    return parseRuneJson<T>(stdout);
   } catch (err: unknown) {
     const execErr = err as { stdout?: string; stderr?: string; message: string };
     throw new RuneCliError(
@@ -80,7 +105,7 @@ export interface ScopeForScope {
   notes: ScopeForNote[];
 }
 
-export interface ScopeForResult {
+export interface ScopeForResult extends ProtocolResponse {
   path: string;
   scopes: ScopeForScope[];
 }
@@ -103,7 +128,7 @@ export interface HardBootstrapDecision {
   content: string;
 }
 
-export interface HardBootstrapResult {
+export interface HardBootstrapResult extends ProtocolResponse {
   mode: "hard";
   constraints: HardBootstrapConstraint[];
   decisions: HardBootstrapDecision[];
@@ -130,7 +155,7 @@ export interface SoftBootstrapDecision {
   content: string;
 }
 
-export interface SoftBootstrapResult {
+export interface SoftBootstrapResult extends ProtocolResponse {
   mode: "soft";
   project_name: string | null;
   working_tree_fresh: boolean | null;
@@ -149,7 +174,7 @@ export async function bootstrapSoft(directory: string): Promise<SoftBootstrapRes
   return callRuneJson<SoftBootstrapResult>(directory, ["bootstrap", "--mode", "soft"]);
 }
 
-export interface ProposeResult {
+export interface ProposeResult extends ProtocolResponse {
   proposal_id: string;
   record_id: string;
   status: string;
@@ -228,7 +253,7 @@ export interface NoteAddArgs {
   expires_at?: string;
 }
 
-export interface NoteAddResult {
+export interface NoteAddResult extends ProtocolResponse {
   id: string;
   category: string;
 }
@@ -264,7 +289,7 @@ export async function noteAdd(directory: string, args: NoteAddArgs): Promise<Not
 export async function changedFilesFromGitStatus(directory: string): Promise<string[]> {
   const { stdout } = await execFileAsync(
     "git", ["-c", "core.quotePath=false", "-C", directory, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    { encoding: "utf-8" },
+    { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 },
   );
   const paths: string[] = [];
   const entries = stdout.split("\0");

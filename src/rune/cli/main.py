@@ -8,7 +8,6 @@ business logic lives here (ARCHITECTURE.md §5).
 from __future__ import annotations
 
 import json as json_module
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -44,6 +43,7 @@ from rune.core.project import (
     find_repo_root,
     init_project,
 )
+from rune.core.protocol import PROTOCOL_VERSION
 from rune.core.retrieval.check import check as core_check
 from rune.core.retrieval.context import build_hard_bootstrap, build_soft_bootstrap
 from rune.core.retrieval.scope_for import scope_for as core_scope_for
@@ -73,6 +73,7 @@ from rune.core.storage.models import (
 from rune.core.storage.sqlite.materialize import (
     CacheUnusableError,
     CanonicalConflictError,
+    connect_for_read,
 )
 from rune.core.update import run_update
 
@@ -147,7 +148,7 @@ def status(
     path = path or Path.cwd()
     try:
         layout = _require_layout(path)
-    except (NotAGitRepoError, _MissingLayoutError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
@@ -163,6 +164,7 @@ def status(
         "last_indexed_tree_hash": project_status.last_indexed_tree_hash,
         "last_indexed_at": project_status.last_indexed_at,
         "cache_exists": project_status.cache_exists,
+        "cache_usable": project_status.cache_usable,
         "files_indexed": project_status.files_indexed,
         "symbols_indexed": project_status.symbols_indexed,
         "working_tree_fresh": project_status.working_tree_fresh,
@@ -171,6 +173,7 @@ def status(
         "files_deleted": project_status.files_deleted,
     }
     cache_exists = project_status.cache_exists
+    cache_usable = project_status.cache_usable
     file_count = project_status.files_indexed
     symbol_count = project_status.symbols_indexed
     is_fresh = project_status.working_tree_fresh
@@ -179,13 +182,14 @@ def status(
     deleted_count = project_status.files_deleted
 
     if json_output:
-        typer.echo(json_module.dumps(payload, indent=2))
+        typer.echo(json_module.dumps({"protocol_version": PROTOCOL_VERSION, **payload}, indent=2))
         return
 
     typer.echo(f"Project: {payload['name']} ({payload['project_id']})")
     typer.echo(f"Last indexed head: {payload['last_indexed_head'] or '(none)'}")
     typer.echo(f"Last indexed tree hash: {payload['last_indexed_tree_hash'] or '(none)'}")
-    typer.echo(f"Cache: {'present' if cache_exists else 'missing'}")
+    cache_state = "usable" if cache_usable else ("unusable" if cache_exists else "missing")
+    typer.echo(f"Cache: {cache_state}")
     typer.echo(f"Files indexed: {file_count}")
     typer.echo(f"Symbols indexed: {symbol_count}")
     typer.echo(f"Working tree: {'fresh' if is_fresh else 'modified since last index'}")
@@ -402,7 +406,7 @@ def scope_suggest(
         locked_files = {
             file_path for scope in scopes_file.scopes if scope.locked for file_path in scope.members.files
         }
-        conn = sqlite3.connect(str(layout.memory_db))
+        conn = connect_for_read(layout)
         try:
             symbol_files = dict(conn.execute("SELECT symbol_id, file FROM symbols"))
             locked_files.update(
@@ -416,7 +420,7 @@ def scope_suggest(
             candidates = suggest_from_paths(files, locked_files) + suggest_from_graph(conn, locked_files)
         finally:
             conn.close()
-    except (NotAGitRepoError, _MissingLayoutError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
@@ -494,18 +498,21 @@ def decision_propose(
     _validate_actor(created_by, "--created-by")
     try:
         layout = _scope_layout(path)
+        config = load_config(layout.config_path)
         proposal = core_propose(
             layout, type=RecordType.decision, record_id=record_id, content=content,
             rationale=rationale, scopes=scopes, files=files, symbols=symbols,
             critical=critical, source_document=source_document, source_section=source_section,
             created_by=created_by,
+            redact_secrets=config.security.redact_secrets,
         )
     except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
         typer.echo(json_module.dumps(
-            {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
+            {"protocol_version": PROTOCOL_VERSION, "proposal_id": proposal.proposal_id,
+             "record_id": record_id, "status": "pending"}
         ))
         return
     typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
@@ -572,19 +579,22 @@ def constraint_propose(
     _validate_actor(created_by, "--created-by")
     try:
         layout = _scope_layout(path)
+        config = load_config(layout.config_path)
         proposal = core_propose(
             layout, type=RecordType.constraint, record_id=record_id, content=content,
             rationale=rationale, scopes=scopes, files=files, symbols=symbols,
             severity=severity, persistence_mode=persistence_mode, expires_at=expires_at,
             source_document=source_document, source_section=source_section,
             machine_check_hint=machine_check_hint, created_by=created_by,
+            redact_secrets=config.security.redact_secrets,
         )
     except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
         typer.echo(json_module.dumps(
-            {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
+            {"protocol_version": PROTOCOL_VERSION, "proposal_id": proposal.proposal_id,
+             "record_id": record_id, "status": "pending"}
         ))
         return
     typer.echo(f"Proposed {proposal.proposal_id} (record_id={record_id}, pending approval)")
@@ -659,7 +669,9 @@ def note_add_cmd(
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
-        typer.echo(json_module.dumps({"id": note.id, "category": note.category.value}))
+        typer.echo(json_module.dumps(
+            {"protocol_version": PROTOCOL_VERSION, "id": note.id, "category": note.category.value}
+        ))
         return
     typer.echo(f"Added note {note.id} ({note.category.value})")
 
@@ -772,7 +784,11 @@ def proposal_approve(
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     try:
-        _, memory_rev = core_approve(_scope_layout(path), proposal_id, resolved_by=by)
+        layout = _scope_layout(path)
+        config = load_config(layout.config_path)
+        _, memory_rev = core_approve(
+            layout, proposal_id, resolved_by=by, redact_secrets=config.security.redact_secrets
+        )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
     except (
@@ -825,6 +841,7 @@ def proposal_edit(
     becomes `edited`, not `approved`)."""
     try:
         layout = _scope_layout(path)
+        config = load_config(layout.config_path)
         proposal = get_current_proposal(layout, proposal_id)
         updates: dict = {}
         if content is not None:
@@ -853,8 +870,11 @@ def proposal_edit(
             updates["machine_check_hint"] = machine_check_hint
         edited_payload = proposal.payload.model_copy(update=updates)
         _, memory_rev = core_approve(
-            layout, proposal_id, resolved_by=by, edited_payload=edited_payload
+            layout, proposal_id, resolved_by=by, edited_payload=edited_payload,
+            redact_secrets=config.security.redact_secrets,
         )
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
         ProposalAlreadyResolvedError, _ProposalValidationError,
@@ -885,11 +905,11 @@ def search(
     if json_output:
         typer.echo(
             json_module.dumps(
-                [
+                {"protocol_version": PROTOCOL_VERSION, "results": [
                     {"kind": r.kind, "rank": r.rank, "id": r.id, "text": r.text,
-                     "status": r.status, "warning": r.warning, "revision": r.revision}
+                      "status": r.status, "warning": r.warning, "revision": r.revision}
                     for r in results
-                ],
+                ]},
                 indent=2,
             )
         )
@@ -918,6 +938,7 @@ def check(
         typer.echo(
             json_module.dumps(
                 {
+                    "protocol_version": PROTOCOL_VERSION,
                     "changed_files": result.changed_files,
                     "affected_scope_ids": result.affected_scope_ids,
                     "constraints": [
@@ -962,6 +983,7 @@ def scope_for_cmd(
         typer.echo(
             json_module.dumps(
                 {
+                    "protocol_version": PROTOCOL_VERSION,
                     "path": file_path,
                     "scopes": [
                         {
@@ -1060,7 +1082,7 @@ def bootstrap(
         raise typer.Exit(code=1) from exc
 
     if json_output:
-        typer.echo(json_module.dumps(payload, indent=2))
+        typer.echo(json_module.dumps({"protocol_version": PROTOCOL_VERSION, **payload}, indent=2))
         return
 
     if mode == "hard":

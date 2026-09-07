@@ -75,10 +75,17 @@ def scope_for(layout: RuneLayout, path: str) -> list[ScopeForScope]:
         return []
     conn = connect_for_read(layout)
     try:
+        # A scope can include a file directly or include one of its symbols.
+        # Both forms make touching the owning file an activation event.
         scope_rows = conn.execute(
-            "SELECT s.id, s.name, s.description FROM scope_files sf "
-            "JOIN scopes s ON s.id = sf.scope_id WHERE sf.file = ? ORDER BY s.id",
-            (path,),
+            "SELECT s.id, s.name, s.description FROM scopes s "
+            "WHERE EXISTS (SELECT 1 FROM scope_files sf "
+            "              WHERE sf.scope_id = s.id AND sf.file = ?) "
+            "   OR EXISTS (SELECT 1 FROM scope_symbols ss "
+            "              JOIN symbols sym ON sym.symbol_id = ss.symbol_id "
+            "              WHERE ss.scope_id = s.id AND sym.file = ?) "
+            "ORDER BY s.id",
+            (path, path),
         ).fetchall()
 
         results: list[ScopeForScope] = []

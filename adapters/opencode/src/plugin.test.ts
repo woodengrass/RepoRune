@@ -9,6 +9,7 @@ import type { HardBootstrapResult, ScopeForResult, SoftBootstrapResult } from ".
 
 function fakeClient(overrides: Partial<RuneClient> = {}): RuneClient {
   const hard: HardBootstrapResult = {
+    protocol_version: 1,
     mode: "hard",
     constraints: [{ record_id: "no-bare-except", severity: "MUST", content: "no bare except", source_document: null, source_section: null }],
     decisions: [],
@@ -17,6 +18,7 @@ function fakeClient(overrides: Partial<RuneClient> = {}): RuneClient {
     overflow: false,
   };
   const soft: SoftBootstrapResult = {
+    protocol_version: 1,
     mode: "soft",
     project_name: "demo",
     working_tree_fresh: true,
@@ -30,6 +32,7 @@ function fakeClient(overrides: Partial<RuneClient> = {}): RuneClient {
   };
   return {
     scopeFor: async (_directory, path) => ({
+      protocol_version: 1,
       path,
       scopes: [{
         scope_id: "app", name: "App", description: "", summary: null, summary_status: null,
@@ -92,6 +95,7 @@ test("compaction rehydrates the system context with a freshly re-fetched hard bo
     bootstrapHard: async () => {
       hardCallCount += 1;
       return {
+        protocol_version: 1,
         mode: "hard",
         constraints: [{
           record_id: hardCallCount === 1 ? "rule-v1" : "rule-v2",
@@ -193,6 +197,32 @@ test("a partial title marker remains a normal request", async () => {
   await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, output);
   assert.match(output.system[0], /rune-context/);
   assert.match(output.system[0], /Project: demo/);
+});
+
+test("system.transform fails open when the host supplies a non-array system field", async () => {
+  const warnings: Record<string, unknown>[] = [];
+  const hooks = createRuneHooks("/repo", fakeClient(), {
+    warningLog: async (_message, extra) => { warnings.push(extra); },
+  });
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  await hooks["experimental.chat.system.transform"]!(
+    { sessionID: "s1", model: {} as never },
+    { system: "invalid host value" } as never,
+  );
+
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].hook, "experimental.chat.system.transform");
+});
+
+test("session.deleted releases its Rune session state", async () => {
+  const hooks = createRuneHooks("/repo", fakeClient());
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "s1" } as never } } });
+
+  const output = { system: [] as string[] };
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, output);
+  assert.deepEqual(output.system, []);
 });
 
 test("Rune project detection only enables directories with a .rune directory", async () => {

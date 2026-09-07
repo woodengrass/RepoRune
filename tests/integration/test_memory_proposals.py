@@ -55,6 +55,17 @@ def test_propose_and_list_pending(git_repo: Path) -> None:
     assert pending[0].proposal_id == proposal.proposal_id
 
 
+def test_proposal_text_is_redacted_before_canonical_write(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    proposal = propose(
+        layout, type=RecordType.decision, record_id="secret-handling",
+        content="Rotate sk-abcdefghijklmnopqrstuvwx1234 immediately.",
+    )
+
+    assert "sk-abcdefghijklmnopqrstuvwx1234" not in proposal.payload.content
+    assert "[REDACTED]" in proposal.payload.content
+
+
 def test_propose_decision_with_severity_is_rejected() -> None:
     class _FakeLayout:
         proposals_jsonl = None

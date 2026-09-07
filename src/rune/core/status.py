@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from rune.core.config import load_config
 from rune.core.hashing import working_tree_fingerprint
-from rune.core.index.scanner import diff_against_previous, scan_files
+from rune.core.index.scanner import diff_against_previous, scan_files_with_issues
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model
 from rune.core.storage.models import ProjectFile
@@ -28,6 +28,7 @@ class ProjectStatus:
     last_indexed_tree_hash: str | None
     last_indexed_at: str | None
     cache_exists: bool
+    cache_usable: bool
     files_indexed: int
     symbols_indexed: int
     working_tree_fresh: bool
@@ -51,6 +52,7 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
     file_count = symbol_count = 0
     previous_hashes: dict[str, str] = {}
     cache_exists = layout.memory_db.exists()
+    cache_usable = False
     if cache_exists:
         # `connect_for_read` (not a raw `sqlite3.connect`), same as
         # `rune search`/`check`/`bootstrap` -- a 0-byte or truncated
@@ -69,6 +71,7 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
                 file_count = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
                 symbol_count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
                 previous_hashes = dict(conn.execute("SELECT path, content_hash FROM files"))
+                cache_usable = True
             finally:
                 conn.close()
 
@@ -76,16 +79,21 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
     modified_count = added_count = deleted_count = 0
     try:
         config = load_config(layout.config_path)
-        scanned = scan_files(layout.repo_root, config.index)
+        scan_result = scan_files_with_issues(layout.repo_root, config.index)
+        scanned = scan_result.files
         current_tree_hash = working_tree_fingerprint({f.path: f.content_hash for f in scanned})
         changeset = diff_against_previous(scanned, previous_hashes)
         modified_count = len(changeset.modified)
         added_count = len(changeset.added)
-        deleted_count = len(changeset.deleted_paths)
+        deleted_count = len(set(changeset.deleted_paths) - set(scan_result.unreadable_paths))
     except Exception:  # noqa: BLE001 - status must never crash on a scan hiccup
         current_tree_hash = None
 
-    is_fresh = current_tree_hash is not None and current_tree_hash == project.last_indexed_tree_hash
+    is_fresh = (
+        cache_usable
+        and current_tree_hash is not None
+        and current_tree_hash == project.last_indexed_tree_hash
+    )
 
     return ProjectStatus(
         project_id=project.project_id,
@@ -94,6 +102,7 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
         last_indexed_tree_hash=project.last_indexed_tree_hash,
         last_indexed_at=project.last_indexed_at,
         cache_exists=cache_exists,
+        cache_usable=cache_usable,
         files_indexed=file_count,
         symbols_indexed=symbol_count,
         working_tree_fresh=is_fresh,

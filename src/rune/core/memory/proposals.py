@@ -20,6 +20,7 @@ from rune.core.memory.records import current_by, current_by_record_id
 from rune.core.memory.records import refresh_cache as _refresh_cache
 from rune.core.project import RuneLayout, utc_now_iso
 from rune.core.scopes.model import load_scopes
+from rune.core.semantic.redaction import redact_text
 from rune.core.storage.canonical import append_jsonl, read_jsonl, validated_copy
 from rune.core.storage.models import (
     MemoryRevision,
@@ -119,6 +120,7 @@ def propose(
     source_section: str | None = None,
     machine_check_hint: str | None = None,
     created_by: Literal["agent", "human"] = "agent",
+    redact_secrets: bool = True,
 ) -> Proposal:
     """Writes a `revision=1`, `status=pending` Proposal. Validated against
     the same shape rules `approve()` will re-check -- failing fast here
@@ -128,6 +130,12 @@ def propose(
     """
     _validate_payload_shape(type, severity, persistence_mode, expires_at, critical, machine_check_hint)
     now = utc_now_iso()
+    if redact_secrets:
+        content = redact_text(content)
+        rationale = redact_text(rationale)
+        source_document = redact_text(source_document) if source_document is not None else None
+        source_section = redact_text(source_section) if source_section is not None else None
+        machine_check_hint = redact_text(machine_check_hint) if machine_check_hint is not None else None
     try:
         payload = MemoryRevision(
             record_id=record_id,
@@ -255,6 +263,7 @@ def approve(
     *,
     resolved_by: str,
     edited_payload: MemoryRevision | None = None,
+    redact_secrets: bool = True,
 ) -> tuple[Proposal, MemoryRevision]:
     """Approves (or, with `edited_payload`, edits-then-approves) a pending
     proposal: appends the proposal's own `resolved`/`edited` revision AND,
@@ -318,6 +327,20 @@ def approve(
         payload.type, payload.severity, payload.persistence_mode, payload.expires_at,
         payload.critical, payload.machine_check_hint,
     )
+    if redact_secrets:
+        payload = validated_copy(
+            payload,
+            {
+                "content": redact_text(payload.content),
+                "rationale": redact_text(payload.rationale),
+                "source_document": redact_text(payload.source_document)
+                if payload.source_document is not None else None,
+                "source_section": redact_text(payload.source_section)
+                if payload.source_section is not None else None,
+                "machine_check_hint": redact_text(payload.machine_check_hint)
+                if payload.machine_check_hint is not None else None,
+            },
+        )
 
     now = utc_now_iso()
     source_hashes: dict[str, str] = {}

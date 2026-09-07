@@ -20,6 +20,7 @@ def test_init_then_status_json_reports_zero_modified(git_repo: Path) -> None:
     result = runner.invoke(app, ["status", "--path", str(git_repo), "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
+    assert payload["protocol_version"] == 1
     assert payload["files_indexed"] == 1
     assert payload["working_tree_fresh"] is True
     assert payload["files_modified"] == 0
@@ -46,6 +47,25 @@ def test_status_reports_modified_added_and_deleted_counts(git_repo: Path) -> Non
     assert payload["files_deleted"] == 1
 
 
+def test_status_does_not_count_an_unreadable_indexed_file_as_deleted(git_repo: Path, monkeypatch) -> None:
+    import rune.core.index.scanner as scanner_module
+
+    (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+    real_hash = scanner_module.content_hash_of_file
+
+    def failing_hash(path: Path) -> str:
+        if path.name == "a.py":
+            raise PermissionError("simulated sharing violation")
+        return real_hash(path)
+
+    monkeypatch.setattr(scanner_module, "content_hash_of_file", failing_hash)
+    result = runner.invoke(app, ["status", "--path", str(git_repo), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["files_deleted"] == 0
+
+
 def test_status_survives_a_corrupt_memory_db(git_repo: Path) -> None:
     """Relayed review, reproduced by hand: `compute_status` used a raw
     `sqlite3.connect` (not `connect_for_read`, unlike `rune search`/
@@ -62,8 +82,10 @@ def test_status_survives_a_corrupt_memory_db(git_repo: Path) -> None:
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["cache_exists"] is True
+    assert payload["cache_usable"] is False
     assert payload["files_indexed"] == 0
     assert payload["symbols_indexed"] == 0
+    assert payload["working_tree_fresh"] is False
 
 
 def test_update_then_status_reports_fresh_again(git_repo: Path) -> None:
@@ -229,8 +251,9 @@ def test_search_json_output_includes_revision_field(git_repo: Path) -> None:
     result = runner.invoke(app, ["search", "postgresql", "--json", "--path", str(git_repo)])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
-    assert len(payload) == 1
-    assert payload[0]["revision"] == 1
+    assert payload["protocol_version"] == 1
+    assert len(payload["results"]) == 1
+    assert payload["results"][0]["revision"] == 1
 
 
 def test_note_update_cli_exposes_scopes_files_symbols_and_expiry(git_repo: Path) -> None:
@@ -301,6 +324,7 @@ def test_scope_for_cli_json_round_trip(git_repo: Path) -> None:
     result = runner.invoke(app, ["scope-for", "a.py", "--json", "--path", str(git_repo)])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
+    assert payload["protocol_version"] == 1
     assert payload["path"] == "a.py"
     assert [s["scope_id"] for s in payload["scopes"]] == ["core"]
 
@@ -318,6 +342,7 @@ def test_bootstrap_cli_hard_and_soft_json_round_trip(git_repo: Path) -> None:
     result = runner.invoke(app, ["bootstrap", "--mode", "hard", "--json", "--path", str(git_repo)])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
+    assert payload["protocol_version"] == 1
     assert payload["mode"] == "hard"
     assert payload["constraints"] == []
     assert payload["overflow"] is False
@@ -325,6 +350,7 @@ def test_bootstrap_cli_hard_and_soft_json_round_trip(git_repo: Path) -> None:
     result = runner.invoke(app, ["bootstrap", "--mode", "soft", "--json", "--path", str(git_repo)])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
+    assert payload["protocol_version"] == 1
     assert payload["mode"] == "soft"
     assert payload["project_name"] is not None
 
@@ -346,7 +372,12 @@ def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
     ])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
-    assert payload == {"proposal_id": payload["proposal_id"], "record_id": "d1", "status": "pending"}
+    assert payload == {
+        "protocol_version": 1,
+        "proposal_id": payload["proposal_id"],
+        "record_id": "d1",
+        "status": "pending",
+    }
 
     result = runner.invoke(app, [
         "constraint", "propose", "c1", "--content", "no bare except", "--severity", "MUST",
@@ -354,7 +385,12 @@ def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
     ])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
-    assert payload == {"proposal_id": payload["proposal_id"], "record_id": "c1", "status": "pending"}
+    assert payload == {
+        "protocol_version": 1,
+        "proposal_id": payload["proposal_id"],
+        "record_id": "c1",
+        "status": "pending",
+    }
 
     result = runner.invoke(app, [
         "note", "add", "--category", "pitfall", "--content", "watch this", "--why-persist", "bit us once",
@@ -362,4 +398,5 @@ def test_decision_constraint_note_propose_json_output(git_repo: Path) -> None:
     ])
     assert result.exit_code == 0, result.output
     payload = json_module.loads(result.output)
+    assert payload["protocol_version"] == 1
     assert payload["category"] == "pitfall"

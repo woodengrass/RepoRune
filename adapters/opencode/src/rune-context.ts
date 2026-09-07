@@ -98,6 +98,7 @@ export class RuneSessionContext {
         }
         for (const c of scope.constraints) {
           lines.push(`- [${c.severity}] ${c.record_id}: ${c.content}`);
+          if (c.warning) lines.push(`  WARNING [${c.status}]: ${c.warning}`);
         }
         for (const n of scope.notes) {
           lines.push(`- note [${n.category}]: ${n.content}`);
@@ -138,8 +139,8 @@ export function renderSoftBootstrap(soft: SoftBootstrapResult): string {
  * rune-marked region if `render()` was already called once for this
  * system array (so re-rendering never grows the array or duplicates
  * content), otherwise appends to the last existing entry, or creates the
- * sole entry if `system` is empty. Deliberately never *pushes a new array
- * element* once one already exists: confirmed with the user that some
+ * sole entry if `system` is empty. Deliberately never creates a second
+ * array element once one already exists: confirmed with the user that some
  * OpenAI-compatible providers reject a request carrying more than one
  * system-role message, so every rune injection has to live inside a
  * single existing system entry, not as an additional one.

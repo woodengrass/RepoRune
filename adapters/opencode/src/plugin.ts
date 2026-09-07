@@ -55,6 +55,7 @@ export interface RuneClient {
 
 interface RuneHookOptions {
   acceptanceLog?: (message: string, extra: Record<string, unknown>) => Promise<void>;
+  warningLog?: (message: string, extra: Record<string, unknown>) => Promise<void>;
   acceptanceSentinel?: string;
 }
 
@@ -75,6 +76,7 @@ export function createRuneHooks(
 ): Hooks {
   const sessions = new Map<string, RuneSessionContext>();
   const activatedPaths = new Map<string, Set<string>>();
+  const warnedHooks = new Set<string>();
   let systemTransformCount = 0;
 
   const logAcceptance = async (message: string, extra: Record<string, unknown>): Promise<void> => {
@@ -86,14 +88,25 @@ export function createRuneHooks(
   };
 
   const failOpen = async (hook: string, error: unknown, extra: Record<string, unknown> = {}): Promise<void> => {
+    const errorType = error instanceof Error ? error.name : typeof error;
     try {
       await logAcceptance("hook.error", {
         hook,
-        error_type: error instanceof Error ? error.name : typeof error,
+        error_type: errorType,
         ...extra,
       });
     } catch {
       // Observability must never make an injection hook block the host.
+    }
+    if (!warnedHooks.has(hook)) {
+      warnedHooks.add(hook);
+      try {
+        await options.warningLog?.("Rune hook failed open; context injection was skipped", {
+          hook, error_type: errorType, ...extra,
+        });
+      } catch {
+        // Logging failures must not escape a fail-open hook.
+      }
     }
   };
 
@@ -156,6 +169,9 @@ export function createRuneHooks(
       } catch (error) {
         await failOpen("bootstrap.hard", error, { session_id: event.properties.sessionID });
       }
+    } else if (event.type === "session.deleted") {
+      sessions.delete(event.properties.info.id);
+      activatedPaths.delete(event.properties.info.id);
     }
   }
 
@@ -165,7 +181,9 @@ export function createRuneHooks(
         event_type: event.type,
         session_id: event.type === "session.created"
           ? event.properties.info.id
-          : "sessionID" in event.properties ? event.properties.sessionID : undefined,
+          : "sessionID" in event.properties
+            ? (event.properties as { sessionID: string }).sessionID
+            : undefined,
         event_property_keys: Object.keys(event.properties),
         event_info_keys: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
           ? Object.keys(event.properties.info)
@@ -220,15 +238,18 @@ export function createRuneHooks(
       if (!input.sessionID) return;
       const ctx = sessions.get(input.sessionID);
       if (!ctx) return; // no session.created seen yet for this id -- nothing to inject
-      if (output.system.some((entry) => entry.includes(TITLE_GENERATION_SYSTEM_MARKER))) {
-        await logAcceptance("experimental.chat.system.transform", {
-          session_id: input.sessionID,
-          title_generation: true,
-          rune_block_present: output.system.some((entry) => entry.includes("<!-- rune-context:start -->")),
-        });
-        return;
-      }
       try {
+        if (!Array.isArray(output.system)) {
+          throw new TypeError("host supplied a non-array output.system");
+        }
+        if (output.system.some((entry) => entry.includes(TITLE_GENERATION_SYSTEM_MARKER))) {
+          await logAcceptance("experimental.chat.system.transform", {
+            session_id: input.sessionID,
+            title_generation: true,
+            rune_block_present: output.system.some((entry) => entry.includes("<!-- rune-context:start -->")),
+          });
+          return;
+        }
         const beforeLength = output.system.length;
         const context = options.acceptanceSentinel
           ? `${ctx.render()}\n\n[RUNE_HOST_ACCEPTANCE_TEST]\n${options.acceptanceSentinel}` : ctx.render();
@@ -427,19 +448,28 @@ export const RunePlugin: Plugin = async (input: PluginInput): Promise<Hooks> => 
     });
   }
   const enabled = directory !== null && await isRuneProject(directory);
-  await logAcceptance("plugin.loaded", {
-    enabled,
-    directory: directory ?? "unrecognized",
-    worktree: input.worktree,
-    opencode_plugin_api: "classic-hooks",
-    node: process.version,
-    platform: process.platform,
-    fallback_used: false,
-  });
+  try {
+    await logAcceptance("plugin.loaded", {
+      enabled,
+      directory: directory ?? "unrecognized",
+      worktree: input.worktree,
+      opencode_plugin_api: "classic-hooks",
+      node: process.version,
+      platform: process.platform,
+      fallback_used: false,
+    });
+  } catch {
+    // Plugin diagnostics must not prevent the plugin from loading.
+  }
   if (!enabled || directory === null) return {};
 
   return createRuneHooks(directory, defaultRuneClient, {
     acceptanceLog: logAcceptance,
+    warningLog: async (message, extra) => {
+      await input.client.app.log({
+        body: { service: "rune-opencode", level: "warn", message, extra },
+      });
+    },
     acceptanceSentinel: acceptance ? "RUNE_SENTINEL_7A91F" : undefined,
   });
 };

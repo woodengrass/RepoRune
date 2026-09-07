@@ -34,6 +34,25 @@ def test_check_no_changes_returns_empty(python_simple_repo: Path) -> None:
     assert result.changed_files == []
 
 
+def test_check_does_not_treat_an_unreadable_file_as_deleted(
+    python_simple_repo: Path, monkeypatch
+) -> None:
+    import rune.core.index.scanner as scanner_module
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    real_hash = scanner_module.content_hash_of_file
+
+    def failing_hash(path: Path) -> str:
+        if path.name == "services.py":
+            raise PermissionError("simulated sharing violation")
+        return real_hash(path)
+
+    monkeypatch.setattr(scanner_module, "content_hash_of_file", failing_hash)
+
+    assert check(layout).changed_files == []
+
+
 def test_check_surfaces_constraint_for_modified_scope(python_simple_repo: Path) -> None:
     layout = init_project(python_simple_repo)
     run_update(layout, full=True)
@@ -218,3 +237,34 @@ def test_check_finds_constraint_bound_to_a_symbol_in_a_changed_file(python_simpl
 
     result = check(layout)
     assert [c.record_id for c in result.constraints] == ["c1"]
+
+
+def test_check_matches_a_symbol_only_scope(python_simple_repo: Path) -> None:
+    import sqlite3
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    conn = sqlite3.connect(str(layout.memory_db))
+    symbol_id = conn.execute(
+        "SELECT symbol_id FROM symbols WHERE qualified_name = 'UserService.get_user'"
+    ).fetchone()[0]
+    conn.close()
+    write_json_model(
+        layout.scopes_json,
+        ScopesFile(scopes=[
+            Scope(id="service", name="Service", source=ScopeSource.human,
+                  members=ScopeMembers(symbols=[symbol_id])),
+        ]),
+    )
+    proposal = propose(
+        layout, type=RecordType.constraint, record_id="c1", content="must validate input",
+        severity=Severity.should, persistence_mode=PersistenceMode.persistent, scopes=["service"],
+    )
+    approve(layout, proposal.proposal_id, resolved_by="alice")
+    run_update(layout, full=True)
+
+    services = python_simple_repo / "app" / "services.py"
+    services.write_text(services.read_text(encoding="utf-8") + "\n# x\n", encoding="utf-8")
+    result = check(layout)
+    assert result.affected_scope_ids == ["service"]
+    assert [constraint.record_id for constraint in result.constraints] == ["c1"]

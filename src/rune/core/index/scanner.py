@@ -78,7 +78,13 @@ class ScannedFile:
     mtime: float
 
 
-def scan_files(repo_root: Path, index_config: IndexConfig) -> list[ScannedFile]:
+@dataclass(frozen=True)
+class ScanResult:
+    files: list[ScannedFile]
+    unreadable_paths: list[str]
+
+
+def scan_files_with_issues(repo_root: Path, index_config: IndexConfig) -> ScanResult:
     """Walks `repo_root`, returns every file that matches `include` and
     not `exclude`, and whose extension maps to a supported language
     (LANGUAGE_BY_EXTENSION) — unsupported files are not part of the code
@@ -88,6 +94,7 @@ def scan_files(repo_root: Path, index_config: IndexConfig) -> list[ScannedFile]:
     exclude_patterns = [_glob_to_regex(p) for p in index_config.exclude]
 
     results: list[ScannedFile] = []
+    unreadable_paths: list[str] = []
     for dirpath, dirnames, filenames in os.walk(repo_root):
         dirnames[:] = [d for d in dirnames if d not in _ALWAYS_PRUNED_DIR_NAMES]
         for filename in filenames:
@@ -100,19 +107,33 @@ def scan_files(repo_root: Path, index_config: IndexConfig) -> list[ScannedFile]:
                 continue
             if any(p.match(rel_posix) for p in exclude_patterns):
                 continue
-            stat = absolute_path.stat()
-            results.append(
-                ScannedFile(
-                    path=rel_posix,
-                    absolute_path=absolute_path,
-                    language=language,
-                    content_hash=content_hash_of_file(absolute_path),
-                    git_blob_hash=git_blob_hash(repo_root, absolute_path),
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
+            try:
+                stat = absolute_path.stat()
+                results.append(
+                    ScannedFile(
+                        path=rel_posix,
+                        absolute_path=absolute_path,
+                        language=language,
+                        content_hash=content_hash_of_file(absolute_path),
+                        git_blob_hash=git_blob_hash(repo_root, absolute_path),
+                        size=stat.st_size,
+                        mtime=stat.st_mtime,
+                    )
                 )
-            )
-    return results
+            except OSError:
+                # The path was present while walking but could not be read
+                # or stat'ed. Keep an older indexed version alive rather
+                # than falsely treating it as a deletion.
+                unreadable_paths.append(rel_posix)
+    return ScanResult(files=results, unreadable_paths=sorted(unreadable_paths))
+
+
+def scan_files(repo_root: Path, index_config: IndexConfig) -> list[ScannedFile]:
+    """Compatibility wrapper for callers that only need successfully read
+    files. `run_update` consumes `scan_files_with_issues` to preserve an
+    existing index during transient filesystem failures.
+    """
+    return scan_files_with_issues(repo_root, index_config).files
 
 
 @dataclass(frozen=True)

@@ -182,6 +182,14 @@ def _discard_cache_file(db_path: Path) -> None:
         (db_path.parent / (db_path.name + suffix)).unlink(missing_ok=True)
 
 
+def discard_cache(layout: RuneLayout) -> None:
+    """Removes every derived-cache file after a failed post-commit
+    canonical write. The next update or rebuild derives a fresh cache from
+    source and canonical state instead of exposing an ahead-of-source DB.
+    """
+    _discard_cache_file(layout.memory_db)
+
+
 def _ensure_compatible_cache_schema(
     layout: RuneLayout, conn: sqlite3.Connection
 ) -> sqlite3.Connection:
