@@ -1,12 +1,11 @@
 # RepoRune (rune) — 交接文件
 
-最後更新：2026-09-07，Milestone 7 真實 OpenCode host 驗收第一輪已完成（OpenCode／plugin `1.18.29`、
-Windows、host Node `v24.3.0`、`coreloop/gpt-5.6`）：正式 adapter 成功載入，`system.transform` context
-真的被模型看見，`read`/`apply_patch` args shape 已觀察；已修正 host 絕對 Windows path 必須轉為 Rune
-repo-relative path、非 Rune repo silent no-op、`apply_patch` 的 `*** Move to:` marker。soft/title 策略採
-使用者確認的完整 title system-prompt marker compatibility rule；`session.prompt({noReply:true})` 已真實
-證實會產生額外 assistant turn，未接入。**M7 仍未完成**：尚待真實 `write`/`edit`/`bash`、custom tools、
-compaction、跨 session isolation 與完整 marker-strategy smoke test。後續 artifact 調查已證明 `[object Object]`
+最後更新：2026-09-07，Milestone 7 真實 OpenCode host 驗收已完成（OpenCode／plugin `1.18.29`、
+Windows、host Node `v24.3.0`、OpenRouter `nvidia/nemotron-3-super-120b-a12b:free`）：正式 adapter 成功載入，
+`system.transform` context 真的被模型看見；global/scoped MUST、`read`/`apply_patch` path、bash post-change scope
+activation、三個 custom tools、跨 session isolation 與 `session.compacted` 後 rehydrate 均已真實驗證。soft/title
+策略採使用者確認的完整 title system-prompt marker compatibility rule；`session.prompt({noReply:true})` 已真實
+證實會產生額外 assistant turn，未接入。後續 artifact 調查已證明 `[object Object]`
 不是 stale artifact 或 runtime `directory` object：OpenCode 對 configured entry 的**每個 function export**當作 plugin
 factory；直接設定 `dist/plugin.js` 時，unit-test helper `createRuneHooks` 被錯誤執行，input object 被當成 directory。
 改由唯一 default export 的 `dist/host-entry.js` wrapper 載入後，fresh `opencode run --print-logs` 顯示新 fingerprint、
@@ -357,7 +356,7 @@ connected-components 產生候選，沒有重新解析來源檔。CLI 已提供
 | 4. Scopes | ✅ 完成 | Scope CRUD、一次性 heuristic/graph suggestions、import-only incremental auto-assignment |
 | 5. Semantic worker | ✅ 完成 | provider/redaction/validation/worker、真實 API 驗證過 |
 | 6. Policies & Memory | ✅ 完成 | Decision/Constraint/Note 生命週期、proposal 流程、staleness/orphan 偵測、FTS5 + 八層排序 search、`rune check`、CLI 子命令 |
-| 7. OpenCode Adapter | 🚧 真實 host 驗收進行中 | 已完成正式 host、path、bash/scope smoke；尚待 custom tools、isolation、title/soft 與 compaction。 |
+| 7. OpenCode Adapter | ✅ 完成 | 正式 host 驗收：注入、path、bash/scope、custom tools、isolation、title/soft 與 compaction。 |
 | 8. MCP + Polish | ❌ 未開始 | MCP server、doctor、打包 |
 
 **303 個 Python 測試全綠，`ruff check` 全綠。** 每個 commit 都是在這個狀態下才 push 的，沒有已知的

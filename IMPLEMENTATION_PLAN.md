@@ -2101,7 +2101,7 @@ staleness 語意或 agent-injection 語意——全部是既有已定案行為�
 資料」「memory.db 永遠可以安全丟棄重建」「崩潰重試不該重複寫入」「CLI 選項要能做到 help 文字說的
 事」）的正確性修復，不是新設計決策，因此本輪未修改 ARCHITECTURE.md/DATA_MODEL.md。
 
-### Milestone 7 真實 OpenCode host 驗收（第一輪，進行中）
+### Milestone 7 真實 OpenCode host 驗收（完成）
 
 154. **觀察到的 host contract 與最小修正**：在 OpenCode `1.18.29`、`@opencode-ai/plugin` `1.18.29`、
      Windows host Node `v24.3.0`、`coreloop/gpt-5.6`，temporary Rune-enabled git repo 成功載入正式 adapter。
@@ -2118,9 +2118,12 @@ staleness 語意或 agent-injection 語意——全部是既有已定案行為�
      discriminator 優先替換。`session.prompt({noReply:true})` 真 host 測試仍產生額外 assistant turn，故不接
      production fallback。新增 title/soft、partial marker、path normalisation、Move marker、`.rune` no-op tests；
      TypeScript `npm test`（含 tsc）26 tests 全綠。
-156. **仍待完成，不得標記 M7 完成**：host build agent 未暴露獨立 `write`/`edit` tool，不能假稱已驗證；仍需
-     驗收 bash post-change、custom tools、compaction、session isolation，以及以 title marker 策略重跑完整
-     host smoke test，最後跑全量 Python/TypeScript verification。
+156. **真 host acceptance 完成**：使用者以 OpenRouter `nvidia/nemotron-3-super-120b-a12b:free` 在新的
+     Rune fixture 重跑驗收。正式 plugin 載入後，read 啟用 scoped MUST、獨立 session 只收到 global MUST，
+     證明 state isolation；`note_add`、`decision_propose`、`constraint_propose` 都寫入 canonical 並回傳
+     protocol-versioned 結果；UI compact 後 global 與已啟用 scope rule 都仍重新注入。free provider 偶發
+     502 overload，但 OpenCode retry 後完成，非 adapter failure。host 沒有獨立 write/edit tool，故以真實
+     `apply_patch` path validation 作為該 host surface 的覆蓋；M7 可標記完成。
 157. **Artifact / duplicate-plugin 根因與最小修正**：fresh `opencode run --print-logs` 證明 host 每次建立新 instance，
      project config 唯一 local file entry，沒有 Rune npm/cache entry；雖有三個既存 `opencode.exe` process，fresh run 不 reuse
      它們。source 與 `dist/plugin.js` 都含 fingerprint `directory-normalization-host-debug-20260907-a` 和
