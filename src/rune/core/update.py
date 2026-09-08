@@ -231,7 +231,7 @@ def _close_provider(provider: ModelProvider | None) -> None:
         close()
 
 
-def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float | str]:
+def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float | str | None]:
     config = load_config(layout.config_path)
     repo_root = layout.repo_root
     now = utc_now_iso()
@@ -522,7 +522,7 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     )
     notes_override = [*existing_notes, *new_note_revisions] if new_note_revisions else None
 
-    stats = rebuild_cache(
+    stats: dict[str, int | float | str | None] = rebuild_cache(
         layout,
         code_index=CodeIndexData(files=new_files, symbols=new_symbols, edges=new_edges),
         scopes_override=updated_scopes_file,

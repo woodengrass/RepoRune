@@ -9,6 +9,7 @@ import pytest
 from rune.core.project import init_project
 from rune.core.storage.canonical import append_jsonl, write_json_model
 from rune.core.storage.models import (
+    Actor,
     IndexedFile,
     IndexedFileStatus,
     MemoryRevision,
@@ -320,7 +321,7 @@ def test_proposal_rebuild_cache_round_trip(git_repo: Path) -> None:
         record_id="new-decision",
         payload=payload,
         status=ProposalStatus.pending,
-        created_by="agent",
+        created_by=Actor.agent.value,
         created_at="2026-01-01T00:00:00Z",
     )
     append_jsonl(layout.proposals_jsonl, proposal)
@@ -352,7 +353,7 @@ def test_proposal_approval_appends_revision_and_current_updates(git_repo: Path) 
     pending = Proposal(
         proposal_id="p1", revision=1, type=RecordType.decision,
         record_id="new-decision", payload=payload, status=ProposalStatus.pending,
-        created_by="agent", created_at="2026-01-01T00:00:00Z",
+        created_by=Actor.agent.value, created_at="2026-01-01T00:00:00Z",
     )
     approved = pending.model_copy(update={
         "revision": 2,

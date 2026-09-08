@@ -13,7 +13,7 @@ from rune.core.memory.notes import (
 )
 from rune.core.project import init_project
 from rune.core.storage.canonical import read_jsonl
-from rune.core.storage.models import Note, NoteCategory, NoteStatus, RevisionAuthor
+from rune.core.storage.models import Actor, Note, NoteCategory, NoteStatus, RevisionAuthor
 from rune.core.update import run_update
 
 
@@ -58,7 +58,7 @@ def test_note_update_appends_revision_carrying_forward_untouched_fields(git_repo
         layout, category=NoteCategory.pitfall, content="original", why_persist="why",
         importance=0.8,
     )
-    updated = note_update(layout, note.id, content="revised", source="human")
+    updated = note_update(layout, note.id, content="revised", source=Actor.human)
     assert updated.revision == 2
     assert updated.content == "revised"
     assert updated.why_persist == "why"  # untouched, carried forward

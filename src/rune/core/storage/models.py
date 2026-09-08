@@ -27,7 +27,11 @@ def _validate_iso8601_utc(value: str) -> str:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise ValueError(f"not a valid ISO-8601 timestamp: {value!r}") from exc
-    if parsed.tzinfo is None or parsed.utcoffset().total_seconds() != 0:
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"timestamp must be UTC (zero offset): {value!r}")
+    offset = parsed.utcoffset()
+    assert offset is not None  # guaranteed by the check above
+    if offset.total_seconds() != 0:
         raise ValueError(f"timestamp must be UTC (zero offset): {value!r}")
     return value
 
@@ -68,6 +72,22 @@ class RevisionAuthor(str, Enum):
     human = "human"
     system_staleness = "system:staleness"
     system_lifecycle = "system:lifecycle"
+
+
+class Actor(str, Enum):
+    """Who initiated a propose/note action: the only two values a caller
+    (human or agent) can legitimately claim. Distinct from `RevisionAuthor`,
+    which additionally covers the two `system:*` values a caller must never
+    pass in -- those are reserved for `core.memory.staleness`-appended
+    lifecycle revisions. A single shared enum (instead of ad-hoc
+    `Literal["agent", "human"]` annotations plus hand-written validators in
+    CLI/MCP) so the type checker, not a runtime string comparison,
+    enforces the boundary: `Actor(value)` raises `ValueError` on anything
+    else, and callers convert to `RevisionAuthor` explicitly.
+    """
+
+    agent = "agent"
+    human = "human"
 
 
 # --------------------------------------------------------------------------

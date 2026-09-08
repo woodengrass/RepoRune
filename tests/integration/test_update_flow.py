@@ -399,6 +399,7 @@ def test_failed_rebuild_cache_does_not_leave_partial_scope_auto_assignment(
 
     assert layout.scopes_json.read_text(encoding="utf-8") == scopes_before
     scopes_after = read_json_model(layout.scopes_json, ScopesFile)
+    assert scopes_after is not None  # init_project always writes a valid scopes.json
     assert scopes_after.scopes[0].members.files == ["app/services.py"]  # not app/new.py
 
 
@@ -455,6 +456,7 @@ def test_last_indexed_tree_hash_changes_when_content_changes(python_simple_repo:
     from rune.core.storage.models import ProjectFile
 
     first = read_json_model(project_after_first.project_json, ProjectFile)
+    assert first is not None  # init_project always writes a valid project.json
     assert first.last_indexed_tree_hash is not None
 
     (python_simple_repo / "app" / "main.py").write_text(
@@ -463,6 +465,7 @@ def test_last_indexed_tree_hash_changes_when_content_changes(python_simple_repo:
     )
     run_update(layout, full=False)
     second = read_json_model(project_after_first.project_json, ProjectFile)
+    assert second is not None
     assert second.last_indexed_tree_hash != first.last_indexed_tree_hash
 
 

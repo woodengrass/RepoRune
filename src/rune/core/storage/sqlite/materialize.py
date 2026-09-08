@@ -24,7 +24,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-
 from urllib.parse import quote
 
 from rune.core.project import RuneLayout
@@ -733,7 +732,7 @@ def rebuild_cache(
     decisions_override: list[MemoryRevision] | None = None,
     constraints_override: list[MemoryRevision] | None = None,
     notes_override: list[Note] | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | float | str | None]:
     """Fully rebuilds memory.db from canonical files (and, from Milestone 2
     on, the caller-supplied `code_index`). Zero LLM calls, zero network.
     Returns a small stats dict for `rune rebuild-cache`/`rune update`

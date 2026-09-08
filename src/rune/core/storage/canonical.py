@@ -8,6 +8,7 @@ atomically, which is simplest and still crash-safe for our write volume.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -37,10 +38,14 @@ def atomic_write_text(path: Path, content: str) -> None:
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
     except BaseException:
-        try:
+        # Only the temp-file cleanup is safe to suppress unconditionally:
+        # `atomic_write_text` must never fail because a leftover temp file
+        # couldn't be removed (the original write error, or success, is
+        # what the caller must see). `update.py`'s identical-looking
+        # try/except around `discard_cache` is a deliberate best-effort
+        # cache invalidation, not this pattern, and keeps its own comment.
+        with contextlib.suppress(OSError):
             os.unlink(tmp_name)
-        except OSError:
-            pass
         raise
 
 
@@ -64,7 +69,7 @@ def write_json_model(path: Path, model: BaseModel) -> None:
     atomic_write_text(path, content)
 
 
-def validated_copy[ModelT: BaseModel](model: ModelT, updates: dict) -> ModelT:
+def validated_copy[ModelT: BaseModel](model: ModelT, updates: dict[str, object]) -> ModelT:
     """`model.model_copy(update=updates)` writes `updates` straight into
     `__dict__` and skips every validator -- Pydantic v2 documents this
     explicitly. That's fine for updates a caller can't get wrong (e.g. a
@@ -110,7 +115,7 @@ def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[M
     return records
 
 
-def append_jsonl(path: Path, model: BaseModel) -> None:
+def append_jsonl[T: BaseModel](path: Path, model: T) -> None:
     """Appends one record. V1 single-writer assumption: implemented as
     read full file + rewrite atomically, not a raw O_APPEND write, so a
     crash mid-write can never leave a half-written line.
@@ -122,7 +127,7 @@ def append_jsonl(path: Path, model: BaseModel) -> None:
     atomic_write_text(path, existing + new_line)
 
 
-def append_jsonl_many(path: Path, models: list[BaseModel]) -> None:
+def append_jsonl_many[T: BaseModel](path: Path, models: list[T]) -> None:
     """Appends multiple records as a single atomic write. Callers that need
     to append N records from one logical operation (e.g. `core.update`
     appending every scope's new `ScopeSummary` revision after one

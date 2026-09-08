@@ -11,7 +11,6 @@ in-place edit.
 from __future__ import annotations
 
 import uuid
-from typing import Literal
 
 from pydantic import ValidationError
 
@@ -23,6 +22,7 @@ from rune.core.scopes.model import load_scopes
 from rune.core.semantic.redaction import redact_text
 from rune.core.storage.canonical import append_jsonl, read_jsonl, validated_copy
 from rune.core.storage.models import (
+    Actor,
     MemoryRevision,
     PersistenceMode,
     Proposal,
@@ -109,9 +109,9 @@ def propose(
     record_id: str,
     content: str,
     rationale: str = "",
-    scopes: list[str] = (),
-    files: list[str] = (),
-    symbols: list[str] = (),
+    scopes: list[str] | None = None,
+    files: list[str] | None = None,
+    symbols: list[str] | None = None,
     severity: Severity | None = None,
     persistence_mode: PersistenceMode | None = None,
     expires_at: str | None = None,
@@ -119,7 +119,7 @@ def propose(
     source_document: str | None = None,
     source_section: str | None = None,
     machine_check_hint: str | None = None,
-    created_by: Literal["agent", "human"] = "agent",
+    created_by: Actor = Actor.agent,
     redact_secrets: bool = True,
 ) -> Proposal:
     """Writes a `revision=1`, `status=pending` Proposal. Validated against
@@ -130,6 +130,9 @@ def propose(
     """
     _validate_payload_shape(type, severity, persistence_mode, expires_at, critical, machine_check_hint)
     now = utc_now_iso()
+    resolved_scopes = sorted(set(scopes or ()))
+    resolved_files = sorted(set(files or ()))
+    resolved_symbols = sorted(set(symbols or ()))
     if redact_secrets:
         content = redact_text(content)
         rationale = redact_text(rationale)
@@ -147,9 +150,9 @@ def propose(
             status=RecordStatus.active,  # placeholder, same reason
             content=content,
             rationale=rationale,
-            scopes=sorted(set(scopes)),
-            files=sorted(set(files)),
-            symbols=sorted(set(symbols)),
+            scopes=resolved_scopes,
+            files=resolved_files,
+            symbols=resolved_symbols,
             severity=severity,
             persistence_mode=persistence_mode,
             expires_at=expires_at,
@@ -157,7 +160,7 @@ def propose(
             source_document=source_document,
             source_section=source_section,
             machine_check_hint=machine_check_hint,
-            created_by=RevisionAuthor.agent if created_by == "agent" else RevisionAuthor.human,
+            created_by=RevisionAuthor(created_by.value),
             created_at=now,
         )
     except ValidationError as exc:
@@ -174,7 +177,7 @@ def propose(
         record_id=record_id,
         payload=payload,
         status=ProposalStatus.pending,
-        created_by=created_by,
+        created_by=created_by.value,
         created_at=now,
     )
     append_jsonl(layout.proposals_jsonl, proposal)
@@ -394,7 +397,7 @@ def approve(
     created_by = (
         RevisionAuthor.human
         if edited_payload is not None
-        else (RevisionAuthor.agent if proposal.created_by == "agent" else RevisionAuthor.human)
+        else RevisionAuthor(proposal.created_by)
     )
     new_memory_revision = validated_copy(
         payload,

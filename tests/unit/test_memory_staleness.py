@@ -29,25 +29,29 @@ _NOW = "2026-01-02T00:00:00Z"
 
 def _decision(
     record_id: str = "d1", status: RecordStatus = RecordStatus.active,
-    scopes: list[str] = (), files: list[str] = (), symbols: list[str] = (),
+    scopes: list[str] | None = None, files: list[str] | None = None,
+    symbols: list[str] | None = None,
 ) -> MemoryRevision:
     return MemoryRevision(
         record_id=record_id, revision=1, type=RecordType.decision, status=status,
-        content="use postgres", scopes=list(scopes), files=list(files), symbols=list(symbols),
+        content="use postgres", scopes=list(scopes or ()), files=list(files or ()),
+        symbols=list(symbols or ()),
         created_by=RevisionAuthor.human, created_at="2026-01-01T00:00:00Z",
     )
 
 
 def _constraint(
     record_id: str = "c1", status: RecordStatus = RecordStatus.active,
-    scopes: list[str] = (), files: list[str] = (), symbols: list[str] = (),
+    scopes: list[str] | None = None, files: list[str] | None = None,
+    symbols: list[str] | None = None,
     persistence_mode: PersistenceMode = PersistenceMode.persistent,
     source_hashes: dict[str, str] | None = None, scope_hashes: dict[str, str] | None = None,
     expires_at: str | None = None,
 ) -> MemoryRevision:
     return MemoryRevision(
         record_id=record_id, revision=1, type=RecordType.constraint, status=status,
-        content="no bare except", scopes=list(scopes), files=list(files), symbols=list(symbols),
+        content="no bare except", scopes=list(scopes or ()), files=list(files or ()),
+        symbols=list(symbols or ()),
         severity=Severity.must, persistence_mode=persistence_mode,
         source_hashes=source_hashes or {}, scope_hashes=scope_hashes or {}, expires_at=expires_at,
         created_by=RevisionAuthor.human, created_at="2026-01-01T00:00:00Z",
@@ -56,12 +60,13 @@ def _constraint(
 
 def _note(
     note_id: str = "n1", status: NoteStatus = NoteStatus.active,
-    scopes: list[str] = (), files: list[str] = (), symbols: list[str] = (),
+    scopes: list[str] | None = None, files: list[str] | None = None,
+    symbols: list[str] | None = None,
     source_hashes: dict[str, str] | None = None, expires_at: str | None = None,
 ) -> Note:
     return Note(
         id=note_id, revision=1, category=NoteCategory.observation, content="c", why_persist="w",
-        scopes=list(scopes), files=list(files), symbols=list(symbols),
+        scopes=list(scopes or ()), files=list(files or ()), symbols=list(symbols or ()),
         source=RevisionAuthor.agent, created_at="2026-01-01T00:00:00Z",
         last_verified_at="2026-01-01T00:00:00Z", expires_at=expires_at,
         source_hashes=source_hashes or {}, status=status,

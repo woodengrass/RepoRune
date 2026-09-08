@@ -42,4 +42,22 @@ extend-exclude = ["tests/integration/fixtures"]
 # declaring options/arguments — not the mutable-default footgun the rule
 # exists for. Ignore it repo-wide rather than sprinkling noqa on every
 # CLI parameter.
-ignore = ["B008"]
+#
+# UP042 (str+Enum -> StrEnum) is intentionally NOT enabled: pydantic v2
+# validates a `str, Enum` member's `.value` (the plain string) while a
+# `StrEnum` member stringifies to "ClassName.member" under `str()`/f-strings
+# (confirmed by hand), so switching would silently change CLI output,
+# canonical JSONL content, and SQLite text columns.
+ignore = ["B008", "UP042"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+exclude = ["tests/integration/fixtures/**"]
+
+[[tool.ty.overrides]]
+include = ["src/rune/core/index/treesitter.py"]
+
+[tool.ty.overrides.rules]
+unresolved-attribute = "ignore"

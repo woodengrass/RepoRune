@@ -287,6 +287,7 @@ def test_health_check_config_error_when_api_key_env_var_missing(monkeypatch) -> 
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     health, primary, _fallback = check_semantic_health(SemanticConfig(enabled=True, model="a-real-model"))
     assert health.status is SemanticHealthStatus.config_error
+    assert health.message is not None
     assert "OPENROUTER_API_KEY" in health.message
     assert primary is None
 
@@ -695,6 +696,9 @@ class FakeProvider:
         self._responses = list(responses)
         self.prompts_seen: list[str] = []
 
+    def probe(self) -> None:
+        return None
+
     def complete(self, *, system_prompt: str, user_prompt: str, max_tokens: int) -> ProviderResponse:
         self.prompts_seen.append(user_prompt)
         item = self._responses.pop(0)
@@ -896,6 +900,9 @@ def test_refresh_falls_back_to_pricing_estimate_when_provider_reports_no_cost() 
 
     class _NoCostProvider:
         model = "no-cost-model"
+
+        def probe(self) -> None:
+            return None
 
         def complete(self, *, system_prompt, user_prompt, max_tokens):
             return ProviderResponse(

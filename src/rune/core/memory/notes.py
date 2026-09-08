@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Literal
 
 from pydantic import ValidationError
 
@@ -21,6 +20,7 @@ from rune.core.scopes.model import load_scopes
 from rune.core.semantic.redaction import redact_text
 from rune.core.storage.canonical import append_jsonl, read_jsonl, validated_copy
 from rune.core.storage.models import (
+    Actor,
     Note,
     NoteCategory,
     NotesConfig,
@@ -105,14 +105,14 @@ def note_add(
     category: NoteCategory,
     content: str,
     why_persist: str,
-    scopes: list[str] = (),
-    files: list[str] = (),
-    symbols: list[str] = (),
+    scopes: list[str] | None = None,
+    files: list[str] | None = None,
+    symbols: list[str] | None = None,
     importance: float = 0.5,
     confidence: float = 0.5,
-    evidence: list[str] = (),
+    evidence: list[str] | None = None,
     expires_at: str | None = None,
-    source: Literal["agent", "human"] = "agent",
+    source: Actor = Actor.agent,
     redact_secrets: bool = True,
 ) -> Note:
     """Writes a brand-new Note (`revision=1`). `source_hashes` is
@@ -129,13 +129,19 @@ def note_add(
     result`) -- an explicit caller-supplied value always wins.
     """
     now = utc_now_iso()
+    resolved_scopes = list(scopes) if scopes is not None else []
+    resolved_files = list(files) if files is not None else []
+    resolved_symbols = list(symbols) if symbols is not None else []
+    resolved_evidence = list(evidence) if evidence is not None else []
     source_hashes: dict[str, str] = {}
-    if scopes or files or symbols:
+    if resolved_scopes or resolved_files or resolved_symbols:
         file_hashes, symbol_owning_file = _validate_references(
-            layout, list(scopes), list(files), list(symbols)
+            layout, resolved_scopes, resolved_files, resolved_symbols
         )
-        if files or symbols:
-            source_hashes = compute_source_hashes(list(files), list(symbols), file_hashes, symbol_owning_file)
+        if resolved_files or resolved_symbols:
+            source_hashes = compute_source_hashes(
+                resolved_files, resolved_symbols, file_hashes, symbol_owning_file
+            )
 
     if expires_at is None:
         config = load_config(layout.config_path)
@@ -148,13 +154,13 @@ def note_add(
             category=category,
             content=_redact(content, enabled=redact_secrets),
             why_persist=_redact(why_persist, enabled=redact_secrets),
-            scopes=sorted(set(scopes)),
-            files=sorted(set(files)),
-            symbols=sorted(set(symbols)),
+            scopes=sorted(set(resolved_scopes)),
+            files=sorted(set(resolved_files)),
+            symbols=sorted(set(resolved_symbols)),
             importance=importance,
             confidence=confidence,
-            source=RevisionAuthor.agent if source == "agent" else RevisionAuthor.human,
-            evidence=[_redact(e, enabled=redact_secrets) for e in evidence],
+            source=RevisionAuthor(source.value),
+            evidence=[_redact(e, enabled=redact_secrets) for e in resolved_evidence],
             created_at=now,
             last_verified_at=now,
             expires_at=expires_at,
@@ -196,7 +202,7 @@ def note_update(
     confidence: float | None = None,
     expires_at: str | None = None,
     clear_expires_at: bool = False,
-    source: Literal["agent", "human"] = "agent",
+    source: Actor = Actor.agent,
     redact_secrets: bool = True,
     recompute_source_hashes: bool = False,
 ) -> Note:
@@ -254,7 +260,7 @@ def note_update(
 
     updates: dict = {
         "revision": current.revision + 1,
-        "source": RevisionAuthor.agent if source == "agent" else RevisionAuthor.human,
+        "source": RevisionAuthor(source.value),
         "last_verified_at": now,
         "scopes": sorted(set(new_scopes)),
         "files": sorted(set(new_files)),

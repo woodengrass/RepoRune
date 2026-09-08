@@ -14,9 +14,10 @@ from rune.core.memory.proposals import (
     propose,
     reject,
 )
-from rune.core.project import init_project
+from rune.core.project import RuneLayout, init_project
 from rune.core.storage.canonical import read_jsonl
 from rune.core.storage.models import (
+    Actor,
     MemoryRevision,
     PersistenceMode,
     Proposal,
@@ -45,7 +46,7 @@ def test_propose_and_list_pending(git_repo: Path) -> None:
     proposal = propose(
         layout, type=RecordType.decision, record_id="use-postgres",
         content="Use PostgreSQL for the primary datastore.",
-        rationale="Team already knows it well.", created_by="agent",
+        rationale="Team already knows it well.", created_by=Actor.agent,
     )
     assert proposal.status is ProposalStatus.pending
     assert proposal.revision == 1
@@ -67,31 +68,27 @@ def test_proposal_text_is_redacted_before_canonical_write(git_repo: Path) -> Non
 
 
 def test_propose_decision_with_severity_is_rejected() -> None:
-    class _FakeLayout:
-        proposals_jsonl = None
-
     with pytest.raises(ProposalValidationError):
         propose(
-            _FakeLayout(), type=RecordType.decision, record_id="d1", content="c",
+            RuneLayout(repo_root=Path("/nonexistent")),
+            type=RecordType.decision, record_id="d1", content="c",
             severity=Severity.must,
         )
 
 
 def test_propose_constraint_without_severity_is_rejected() -> None:
-    class _FakeLayout:
-        proposals_jsonl = None
-
     with pytest.raises(ProposalValidationError):
-        propose(_FakeLayout(), type=RecordType.constraint, record_id="c1", content="c")
+        propose(
+            RuneLayout(repo_root=Path("/nonexistent")),
+            type=RecordType.constraint, record_id="c1", content="c",
+        )
 
 
 def test_propose_temporary_constraint_without_expires_at_is_rejected() -> None:
-    class _FakeLayout:
-        proposals_jsonl = None
-
     with pytest.raises(ProposalValidationError):
         propose(
-            _FakeLayout(), type=RecordType.constraint, record_id="c1", content="c",
+            RuneLayout(repo_root=Path("/nonexistent")),
+            type=RecordType.constraint, record_id="c1", content="c",
             severity=Severity.must, persistence_mode=PersistenceMode.temporary,
         )
 
@@ -100,7 +97,7 @@ def test_approve_decision_writes_active_revision_and_resolves_proposal(git_repo:
     layout = init_project(git_repo)
     proposal = propose(
         layout, type=RecordType.decision, record_id="use-postgres",
-        content="Use PostgreSQL.", created_by="agent",
+        content="Use PostgreSQL.", created_by=Actor.agent,
     )
     resolved, memory_rev = approve(layout, proposal.proposal_id, resolved_by="alice")
 
@@ -141,11 +138,10 @@ def test_reject_does_not_write_to_decisions_jsonl(git_repo: Path) -> None:
 
 
 def test_approve_nonexistent_proposal_raises() -> None:
-    class _FakeLayout:
-        proposals_jsonl = Path("/nonexistent/proposals.jsonl")
+    layout = RuneLayout(repo_root=Path("/nonexistent"))
 
     with pytest.raises(ProposalNotFoundError):
-        approve(_FakeLayout(), "nope", resolved_by="alice")
+        approve(layout, "nope", resolved_by="alice")
 
 
 def test_approve_source_bound_constraint_computes_source_hashes_from_index(
@@ -477,13 +473,13 @@ def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(g
     real_append = proposals_module.append_jsonl
     call_count = {"n": 0}
 
-    def flaky_append(path, model):
+    def flaky_append(path: Path, model: Proposal) -> None:
         call_count["n"] += 1
         if call_count["n"] == 2:  # the proposals.jsonl resolution write
             raise OSError("simulated crash between the two canonical writes")
         return real_append(path, model)
 
-    proposals_module.append_jsonl = flaky_append
+    proposals_module.append_jsonl = flaky_append  # type: ignore[assignment]
     try:
         with pytest.raises(OSError):
             approve(layout, proposal.proposal_id, resolved_by="alice")
@@ -519,13 +515,13 @@ def test_reapproving_after_a_crash_with_a_different_by_does_not_duplicate(git_re
     real_append = proposals_module.append_jsonl
     call_count = {"n": 0}
 
-    def flaky_append(path, model):
+    def flaky_append(path: Path, model: Proposal) -> None:
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise OSError("simulated crash between the two canonical writes")
         return real_append(path, model)
 
-    proposals_module.append_jsonl = flaky_append
+    proposals_module.append_jsonl = flaky_append  # type: ignore[assignment]
     try:
         with pytest.raises(OSError):
             approve(layout, proposal.proposal_id, resolved_by="alice")
@@ -611,11 +607,9 @@ def test_edited_payload_critical_true_on_constraint_is_rejected(git_repo: Path) 
 
 
 def test_machine_check_hint_on_decision_proposal_is_rejected() -> None:
-    class _FakeLayout:
-        proposals_jsonl = None
-
     with pytest.raises(ProposalValidationError):
         propose(
-            _FakeLayout(), type=RecordType.decision, record_id="d1", content="c",
+            RuneLayout(repo_root=Path("/nonexistent")),
+            type=RecordType.decision, record_id="d1", content="c",
             machine_check_hint="ruff",
         )

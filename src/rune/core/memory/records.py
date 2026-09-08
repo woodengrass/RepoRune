@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from rune.core.memory.revisions import current_revision
+from rune.core.memory.revisions import _Revisioned, current_revision
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_jsonl
 from rune.core.storage.models import MemoryRevision, Note, RecordType
@@ -20,7 +20,7 @@ from rune.core.storage.sqlite.materialize import (
 )
 
 
-def _group_by_id[T](records: list[T], id_field: str) -> dict[str, list[T]]:
+def _group_by_id[T: _Revisioned](records: list[T], id_field: str) -> dict[str, list[T]]:
     """Groups by logical id, rejecting a duplicate (id, revision) pair
     the same way `materialize._group_current_by_id` already does.
 
@@ -47,7 +47,7 @@ def _group_by_id[T](records: list[T], id_field: str) -> dict[str, list[T]]:
     return {record_id: list(by_revision.values()) for record_id, by_revision in grouped.items()}
 
 
-def current_by[T](records: list[T], id_field: str) -> dict[str, T]:
+def current_by[T: _Revisioned](records: list[T], id_field: str) -> dict[str, T]:
     """{logical id: current revision}, current = max(revision) regardless
     of status (DATA_MODEL.md §3) -- callers apply visibility separately.
     Generic over `MemoryRevision`/`Note`/`Proposal` -- all three share
@@ -74,7 +74,9 @@ class RecordNotFoundError(Exception):
     pass
 
 
-def _get_record[T](revisions_for_id: list[T], record_label: str, *, include_history: bool) -> tuple[T, list[T] | None]:
+def _get_record[T: _Revisioned](
+    revisions_for_id: list[T], record_label: str, *, include_history: bool
+) -> tuple[T, list[T] | None]:
     if not revisions_for_id:
         raise RecordNotFoundError(f"no such {record_label}")
     current = current_revision(revisions_for_id)
