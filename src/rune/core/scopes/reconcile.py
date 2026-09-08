@@ -60,14 +60,11 @@ caller-supplied `since` ref (the merge base, or any pre-merge commit) via
   `scopes.json` at `since` -- i.e. introduced by commits between `since`
   and `HEAD` (which includes the merge commit itself), not a
   working-tree diff and not "every file that ever changed."
-- "auto-inferred" = restricted to unlocked, non-human-source scopes (the
-  same `_is_protected` proxy the deleted-target loop above already uses)
-  -- a human adding a membership via `rune scope edit`/`create` does so
-  in its own separate commit, so it is naturally excluded from "what
-  changed between `since` and `HEAD` in `scopes.json`" without needing
-  per-membership provenance in the schema (DATA_MODEL.md §9's still-open
-  gap is irrelevant here: this doesn't need to know *when* or *how* an
-  existing membership was created, only what a specific merge added).
+ - "auto-inferred" is approximated by restricting this check to unlocked,
+   non-human-source scopes (the same `_is_protected` proxy the deleted-target
+   loop uses). Per-membership provenance does not exist, so this cannot prove
+   that a newly-added membership was actually auto-assigned; it deliberately
+   reports REVIEW rather than changing any existing membership.
 
 A merge-affected membership that still uniquely resolves to the same
 scope under the merged graph is left alone (no entry). One that no longer

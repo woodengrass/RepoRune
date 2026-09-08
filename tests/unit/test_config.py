@@ -73,6 +73,13 @@ def test_load_config_rejects_non_positive_note_ttl(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_load_config_rejects_non_positive_reconcile_churn_threshold(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[scopes]\nreconcile_large_churn_threshold = 0\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
 def test_load_config_rejects_unknown_top_level_field(tmp_path: Path) -> None:
     """A typo'd or stray top-level key must be a loud error, not silently
     ignored — otherwise a misspelled config section (e.g. `[rune]` instead

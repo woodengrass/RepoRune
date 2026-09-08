@@ -27,6 +27,12 @@ from rune.core.update import run_update
 from rune.mcp import server
 
 
+def test_mcp_sdk_server_import_is_available() -> None:
+    from mcp.server.mcpserver import MCPServer
+
+    assert MCPServer is not None
+
+
 def test_rune_status_reports_index_size(python_simple_repo: Path) -> None:
     layout = init_project(python_simple_repo)
     run_update(layout, full=True)
@@ -149,6 +155,28 @@ def test_scope_for_requires_a_selector(python_simple_repo: Path) -> None:
     init_project(python_simple_repo)
     with pytest.raises(ValueError):
         server.rune_scope_for(path=str(python_simple_repo))
+
+
+def test_scope_for_rejects_both_selectors(python_simple_repo: Path) -> None:
+    init_project(python_simple_repo)
+    with pytest.raises(ValueError, match="exactly one"):
+        server.rune_scope_for(file_path="app/services.py", symbol="UserService", path=str(python_simple_repo))
+
+
+@pytest.mark.parametrize(
+    ("call", "message"),
+    [
+        (lambda repo: server.rune_search(query="x", limit=-1, path=str(repo)), "limit"),
+        (lambda repo: server.rune_symbol_search(query="x", limit=-1, path=str(repo)), "limit"),
+        (lambda repo: server.rune_related_context(query="x", max_items=-1, path=str(repo)), "max_items"),
+        (lambda repo: server.rune_search(query="x", kinds=["invalid"], path=str(repo)), "kinds"),
+        (lambda repo: server.rune_related_context(query="x", include=["invalid"], path=str(repo)), "include"),
+    ],
+)
+def test_mcp_validates_retrieval_inputs(python_simple_repo: Path, call, message: str) -> None:
+    init_project(python_simple_repo)
+    with pytest.raises(ValueError, match=message):
+        call(python_simple_repo)
 
 
 def test_constraint_propose_rejects_invalid_severity(python_simple_repo: Path) -> None:

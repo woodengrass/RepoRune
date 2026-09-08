@@ -5,6 +5,7 @@ from pathlib import Path
 
 import tomli_w
 
+from rune.core import doctor
 from rune.core.doctor import CheckLevel, run_doctor
 from rune.core.project import init_project
 
@@ -59,3 +60,17 @@ def test_doctor_never_raises_on_corrupt_cache(git_repo: Path) -> None:
     report = run_doctor(layout)
     assert _check(report, "cache").level == CheckLevel.error
     assert not report.healthy
+
+
+def test_doctor_continues_after_an_unexpected_check_failure(git_repo: Path, monkeypatch) -> None:
+    layout = init_project(git_repo)
+
+    def broken_treesitter(_checks) -> None:
+        raise RuntimeError("unexpected parser failure")
+
+    monkeypatch.setattr(doctor, "_check_treesitter", broken_treesitter)
+    report = run_doctor(layout)
+
+    assert _check(report, "tree_sitter_parsers").level == CheckLevel.error
+    assert "unexpected parser failure" in _check(report, "tree_sitter_parsers").message
+    assert _check(report, "canonical_schema_versions").level == CheckLevel.ok

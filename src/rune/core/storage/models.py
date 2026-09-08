@@ -469,7 +469,7 @@ class ScopesConfig(StrictModel):
     §4.4 point 5), not a warning like `must_count_warn_threshold` above.
     """
 
-    reconcile_large_churn_threshold: int = 20
+    reconcile_large_churn_threshold: int = Field(default=20, gt=0)
 
 
 class RuneConfig(StrictModel):

@@ -476,6 +476,7 @@ def test_scope_reconcile_cli_json_auto_apply_and_review(git_repo: Path) -> None:
     assert payload["applied"] is True
     assert payload["suspicious_churn"] is False
     assert payload["auto_count"] == 1
+    assert payload["changed_count"] == 1
     assert payload["review_count"] == 1
 
     entries_by_target = {e["target"]: e for e in payload["entries"]}
@@ -492,6 +493,15 @@ def test_scope_reconcile_cli_json_auto_apply_and_review(git_repo: Path) -> None:
     scopes = load_scopes(RuneLayout(git_repo)).scopes
     app_scope = next(s for s in scopes if s.id == "app")
     assert "app/new.py" in app_scope.members.files
+    from rune.core.storage.sqlite.materialize import connect_for_read
+
+    conn = connect_for_read(RuneLayout(git_repo))
+    try:
+        assert conn.execute(
+            "SELECT 1 FROM scope_files WHERE scope_id = 'app' AND file = 'app/new.py'"
+        ).fetchone()
+    finally:
+        conn.close()
 
     # Re-running is idempotent: app/new.py is no longer "unassigned", so
     # it drops out of the reconcile entirely; orphan.py is still REVIEW.
@@ -599,6 +609,24 @@ def test_scope_reconcile_before_cache_exists_fails_cleanly(git_repo: Path) -> No
     RuneLayout(git_repo).memory_db.unlink()  # `rune init` already ran a full update; remove it
     result = runner.invoke(app, ["scope", "reconcile", "--path", str(git_repo)])
     assert result.exit_code == 1
+
+
+def test_scope_reconcile_rejects_unusable_cache(git_repo: Path) -> None:
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    RuneLayout(git_repo).memory_db.write_bytes(b"not sqlite")
+    result = runner.invoke(app, ["scope", "reconcile", "--path", str(git_repo)])
+    assert result.exit_code == 1
+
+
+def test_note_add_handles_invalid_config(git_repo: Path) -> None:
+    assert runner.invoke(app, ["init", "--path", str(git_repo)]).exit_code == 0
+    (git_repo / ".rune" / "config.toml").write_text("not valid [toml", encoding="utf-8")
+    result = runner.invoke(app, [
+        "note", "add", "--category", "pitfall", "--content", "x", "--why-persist", "x",
+        "--path", str(git_repo),
+    ])
+    assert result.exit_code == 1
+    assert "invalid TOML" in result.output
 
 
 def _git_commit_all(repo: Path, message: str) -> str:

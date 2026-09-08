@@ -125,6 +125,21 @@ _KNOWN_ERRORS = (
     ValueError,
 )
 
+_SEARCH_KINDS = frozenset({"decision", "constraint", "note", "semantic"})
+
+
+def _validate_nonnegative(value: int, field_name: str) -> None:
+    if value < 0:
+        raise ValueError(f"{field_name} must be greater than or equal to 0")
+
+
+def _validate_choices(values: list[str] | None, allowed: frozenset[str], field_name: str) -> None:
+    if values is None:
+        return
+    unknown = sorted(set(values) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {field_name}: {', '.join(unknown)}")
+
 
 def _tool(fn):
     """Registers `fn` as an MCP tool (`mcp.tool()`) wrapped so any
@@ -231,6 +246,8 @@ def rune_search(
     order). `kinds`, if given, restricts to a subset of "decision",
     "constraint", "note", "semantic". `include_history=True` also returns
     non-current/superseded revisions -- default is current+visible only."""
+    _validate_nonnegative(limit, "limit")
+    _validate_choices(kinds, _SEARCH_KINDS, "kinds")
     layout = _layout(path)
     results = core_search(
         layout, query, history=include_history, limit=limit,
@@ -258,6 +275,7 @@ def rune_symbol_search(
     """Structured symbol lookup by name/qualified_name/kind/owning file,
     optionally combined with a full-text `query` over qualified_name +
     signature. All given filters must match (AND)."""
+    _validate_nonnegative(limit, "limit")
     layout = _layout(path)
     results = core_symbol_search(
         layout, query=query, name=name, qualified_name=qualified_name,
@@ -272,8 +290,8 @@ def rune_scope_for(file_path: str | None = None, symbol: str | None = None, path
     defined in) belongs to, each with its semantic summary and its
     current+visible MUST/SHOULD constraints and Notes -- exactly one of
     `file_path`/`symbol` is required."""
-    if not file_path and not symbol:
-        raise ValueError("one of file_path or symbol is required")
+    if bool(file_path) == bool(symbol):
+        raise ValueError("exactly one of file_path or symbol is required")
     layout = _layout(path)
     resolved_path, results = resolve_scope_for(layout, path=file_path, symbol=symbol)
     return {
@@ -360,6 +378,12 @@ def rune_related_context(
     `file_path`/`symbol`/`query` is required. `include` restricts to a
     subset of scopes/constraints/decisions/notes/semantic/symbols;
     `max_items` caps each bucket independently."""
+    _validate_nonnegative(max_items, "max_items")
+    _validate_choices(
+        include,
+        frozenset({"scopes", "constraints", "decisions", "notes", "semantic", "symbols"}),
+        "include buckets",
+    )
     layout = _layout(path)
     result = core_related_context(
         layout, path=file_path, symbol=symbol, query=query,

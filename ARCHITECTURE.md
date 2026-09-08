@@ -372,10 +372,9 @@ worktree merge 是最主要的觸發場景，見第 16 節，但規則本身不�
 - **`--full`**：逐筆列出包含 `KEEP` 在內的完整分類（供人工稽核目前每一筆 membership 的狀態），但**永遠
   不寫入**，即使有 `AUTO`-eligible 的高信心單一候選也只回報、不套用——這與 §4.4 point 4「Full
   reconciliation 輸出只能是 candidate/proposal/diff」一致，理由見決策記錄第 169 條。
-- **未實作的部分（誠實記錄，見決策記錄第 170 條）**：不會重新驗證*已經是*某 scope 成員的檔案，在合併
-  之後是否仍然唯一滿足 high-confidence 規則——這需要 per-membership provenance（DATA_MODEL §9 的
-  future/V2）才能安全地做，否則等於對整個 `scopes.json` 既有內容重新分類一遍，違反「Scope 是穩定、
-  漸進累積的 project knowledge」這條 §4.4 開頭的核心原則。
+- **`--since <ref>` 的限制**：它只重新檢查指定 ref 之後加入、且位於 unlocked/non-human scope 的檔案
+  membership；沒有 per-membership provenance，無法證明該 membership 真的是 AUTO 所寫，也不重新分類
+  其他既有 membership。任何不再唯一符合的結果只會列為 `REVIEW`，絕不自動移動或移除。
 
 **Merge/integration worktree 的具體使用流程**（銜接第 16.4 節「integration worktree 的角色」，第 6 步
 「執行最終的 scope reconciliation」在此展開）：

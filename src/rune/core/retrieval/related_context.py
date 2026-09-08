@@ -86,6 +86,12 @@ def related_context(
     """
     if not path and not symbol and not query:
         raise RelatedContextValidationError("at least one of path, symbol, or query is required")
+    if max_items < 0:
+        raise RelatedContextValidationError("max_items must be greater than or equal to 0")
+    if include is not None:
+        unknown = sorted(include - _ALL_BUCKETS)
+        if unknown:
+            raise RelatedContextValidationError(f"unknown include bucket(s): {', '.join(unknown)}")
     wanted = include if include is not None else _ALL_BUCKETS
 
     scopes: dict[str, RelatedScope] = {}

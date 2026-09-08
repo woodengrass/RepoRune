@@ -37,6 +37,7 @@ from rune.core.memory.records import (
     load_current_constraints,
     load_current_decisions,
     load_current_notes,
+    refresh_cache,
 )
 from rune.core.project import (
     AlreadyInitializedError,
@@ -538,6 +539,10 @@ def scope_reconcile(
         if not layout.memory_db.exists():
             _err(f"{layout.memory_db} does not exist yet. Run `rune update` first.")
             raise typer.Exit(code=1)
+        # Refuse to write canonical membership against a cache that cannot
+        # be read; reconcile must never treat an unusable index as empty.
+        conn = connect_for_read(layout)
+        conn.close()
         config = load_config(layout.config_path)
         result, updated_scopes_file = core_reconcile(
             layout, full=full, since=since,
@@ -545,7 +550,10 @@ def scope_reconcile(
         )
         if updated_scopes_file is not None:
             save_scopes(layout, updated_scopes_file)
-    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, InvalidRefError) as exc:
+            refresh_cache(layout)
+    except CanonicalConflictError as exc:
+        _handle_cache_refresh_failure(exc)
+    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, ConfigError, InvalidRefError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
@@ -559,6 +567,7 @@ def scope_reconcile(
                     "applied": result.applied,
                     "suspicious_churn": result.suspicious_churn,
                     "auto_count": result.auto_count,
+                    "changed_count": sum(entry.applied for entry in result.entries),
                     "review_count": result.review_count,
                     "keep_count": result.keep_count,
                     "broken_count": result.broken_count,
@@ -675,7 +684,7 @@ def decision_propose(
             created_by=created_by,
             redact_secrets=config.security.redact_secrets,
         )
-    except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, ConfigError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
@@ -757,7 +766,7 @@ def constraint_propose(
             machine_check_hint=machine_check_hint, created_by=created_by,
             redact_secrets=config.security.redact_secrets,
         )
-    except (NotAGitRepoError, _MissingLayoutError, _ProposalValidationError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, ConfigError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
@@ -834,7 +843,7 @@ def note_add_cmd(
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
-    except (NotAGitRepoError, _MissingLayoutError, NoteValidationError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, ConfigError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     if json_output:
@@ -903,7 +912,7 @@ def note_update_cmd(
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
-    except (NotAGitRepoError, _MissingLayoutError, NoteNotFoundError, NoteValidationError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError, ConfigError, NoteNotFoundError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     typer.echo(f"{note_id} updated to rev{updated.revision} [{updated.status.value}]")
@@ -962,7 +971,7 @@ def proposal_approve(
         _handle_cache_refresh_failure(exc)
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
-        ProposalAlreadyResolvedError, _ProposalValidationError,
+        ProposalAlreadyResolvedError, ConfigError, _ProposalValidationError,
     ) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1046,7 +1055,7 @@ def proposal_edit(
         _handle_cache_refresh_failure(exc)
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
-        ProposalAlreadyResolvedError, _ProposalValidationError,
+        ProposalAlreadyResolvedError, ConfigError, _ProposalValidationError,
     ) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc

@@ -71,8 +71,8 @@ rune check                             # working-tree diff -> affected scopes ->
 rune bootstrap --mode hard             # global MUST rules + critical decisions
 ```
 
-Every read command accepts `--json` for machine-readable output (a stable
-`protocol_version` field on every payload).
+Commands that expose `--json` emit machine-readable output with a stable
+`protocol_version` field on every payload; not every command supports JSON.
 
 ## Platform Notes
 

@@ -81,14 +81,23 @@ class DoctorReport:
 
 def run_doctor(layout: RuneLayout) -> DoctorReport:
     checks: list[DoctorCheck] = []
-    checks.append(_check_git())
-    config = _check_config(layout, checks)
-    _check_treesitter(checks)
-    _check_canonical_schema_versions(layout, checks)
-    _check_cache_and_freshness(layout, checks)
+    def safely(name: str, check):
+        try:
+            return check()
+        except Exception as exc:  # noqa: BLE001 - doctor must isolate every check failure.
+            checks.append(DoctorCheck(name, CheckLevel.error, f"check failed: {exc}"))
+            return None
+
+    git_check = safely("git", _check_git)
+    if git_check is not None:
+        checks.append(git_check)
+    config = safely("config", lambda: _check_config(layout, checks))
+    safely("tree_sitter_parsers", lambda: _check_treesitter(checks))
+    safely("canonical_schema_versions", lambda: _check_canonical_schema_versions(layout, checks))
+    safely("cache", lambda: _check_cache_and_freshness(layout, checks))
     if config is not None:
-        _check_provider_setup(config, checks)
-        _check_bootstrap_governance(layout, config, checks)
+        safely("semantic_provider", lambda: _check_provider_setup(config, checks))
+        safely("bootstrap_governance", lambda: _check_bootstrap_governance(layout, config, checks))
     return DoctorReport(checks=checks)
 
 

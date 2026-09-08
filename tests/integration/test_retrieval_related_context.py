@@ -90,6 +90,33 @@ def test_related_context_max_items_caps_each_bucket(python_simple_repo: Path) ->
     assert len(result.symbols) <= 1
 
 
+@pytest.mark.parametrize("max_items", [-1, -10])
+def test_related_context_rejects_negative_max_items(python_simple_repo: Path, max_items: int) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    with pytest.raises(RelatedContextValidationError, match="max_items"):
+        related_context(layout, path="app/services.py", max_items=max_items)
+
+
+def test_related_context_rejects_unknown_include_bucket(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    with pytest.raises(RelatedContextValidationError, match="unknown include"):
+        related_context(layout, path="app/services.py", include={"unknown"})
+
+
+def test_related_context_allows_zero_max_items(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    result = related_context(layout, path="app/services.py", max_items=0)
+    assert result.scopes == []
+    assert result.constraints == []
+    assert result.decisions == []
+    assert result.notes == []
+    assert result.semantic == []
+    assert result.symbols == []
+
+
 def test_related_context_by_query_reports_real_constraint_severity(python_simple_repo: Path) -> None:
     """A review pass caught this by hand: an earlier version guessed a
     query-derived constraint's severity from its `search()` rank instead

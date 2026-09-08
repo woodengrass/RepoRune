@@ -212,10 +212,60 @@ They must remain thin `--json` CLI adapters over existing core retrieval
 functions. The previous deferment of `scope-read` is superseded by this
 decision.
 
-## Remaining Findings Outside This Sequence
+## Open Questions Requiring Design
 
-The following remain separately tracked: ConfigError command handling, Windows
-Unicode output, read-only SQLite creation, provider cost coercion, negative
-limits, check query batching, HTTP client closure, marker escaping, session
-bootstrap race, bash activation cap, endpoint JSON validation, NTFS case
-handling, src-layout import resolution, and parser traversal consistency.
+The following are deliberately separated from sections 1-9: they are real
+follow-up problems, but do not yet have an approved implementation design.
+
+### Scope Reconcile Zero-Evidence Review Flood
+
+Decide whether zero-evidence entries should be capped, aggregated by directory,
+count toward suspicious churn, or excluded through a generated/ignored-file
+policy. A display cap alone prevents terminal noise but does not decide the
+governance meaning of omitted entries.
+
+### Merge Revalidation Before Merge Base
+
+`scope reconcile --since` cannot necessarily revalidate branch-local AUTO
+assignments that landed before the supplied merge base. Decide between broader
+revalidation of affected/all AUTO memberships and a future provenance model
+that records assignment ref/tree/evidence metadata.
+
+### CLI/MCP Contract Governance
+
+Decide the paired contract-test policy for equivalent CLI `--json` and MCP
+tools: shared semantic fields, allowed interface-specific fields, fixture
+matrix ownership, and compatibility/versioning rules.
+
+### MCP Workspace and Path Security
+
+Decide the trust boundary for agent-driven MCP paths. The server should define
+trusted workspace roots at startup; without explicit configuration, allow only
+the startup directory's Rune repository. A future configuration may provide an
+explicit allowlist:
+
+```toml
+[mcp]
+allowed_roots = ["C:/work/project-a", "C:/work/project-b"]
+```
+
+Every tool path must be made absolute and resolved before checking that its Rune
+repository root is within an allowed root. The policy must reject symlink or
+junction escapes, avoid disclosing filesystem metadata for rejected paths, and
+separate read roots from write roots if multi-repository access is allowed.
+
+## Remaining Simple Findings
+
+The following remain separately tracked and are not part of sections 1-9:
+
+- ConfigError command handling for write commands such as note/propose/approve.
+- Negative limits outside `search` and `symbol_search`, notably
+  `related_context.max_items` and its CLI/MCP boundaries.
+- src-layout absolute import resolution.
+- Parser traversal consistency for top-level Python conditional/try/with blocks.
+
+The following were resolved in the reliability pass and are intentionally not
+listed as pending: Windows Unicode output, read-only SQLite creation, provider
+cost coercion, check query batching, HTTP client closure, marker escaping,
+session bootstrap race, bash activation cap, endpoint JSON validation, and
+NTFS case handling.
