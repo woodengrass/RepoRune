@@ -39,6 +39,7 @@ const TITLE_GENERATION_SYSTEM_MARKER =
   "You are a title generator. You output ONLY a thread title. Nothing else.";
 const RUNE_PLUGIN_BUILD = "directory-normalization-host-debug-20260907-a";
 const MAX_BASH_SCOPE_ACTIVATIONS = 100;
+export const MAX_SESSION_ADMISSIONS = 1024;
 
 /**
  * The subset of rune-cli.ts this module calls, factored out as an
@@ -77,6 +78,7 @@ export function createRuneHooks(
 ): Hooks {
   const sessions = new Map<string, RuneSessionContext>();
   const activatedPaths = new Map<string, Set<string>>();
+  const activatingPaths = new Map<string, Map<string, Promise<void>>>();
   const initializing = new Map<string, Promise<void>>();
   const warnedHooks = new Set<string>();
   let systemTransformCount = 0;
@@ -86,6 +88,28 @@ export function createRuneHooks(
       await options.acceptanceLog?.(message, extra);
     } catch {
       // Acceptance logging is diagnostic only.
+    }
+  };
+
+  const warnSessionAdmissionCapped = async (sessionID: string): Promise<void> => {
+    const details = {
+      hook: "session.admission",
+      session_id: sessionID,
+      active_sessions: sessions.size,
+      max_sessions: MAX_SESSION_ADMISSIONS,
+      remediation: "Reload the Rune OpenCode plugin to release session-local state; no sessions were evicted.",
+    };
+    await logAcceptance("session-admission.capped", details);
+    const warningKey = "session-admission.capped";
+    if (warnedHooks.has(warningKey)) return;
+    warnedHooks.add(warningKey);
+    try {
+      await options.warningLog?.(
+        "Rune session state limit reached; context injection is disabled for this session",
+        details,
+      );
+    } catch {
+      // Logging failures must not escape a fail-open hook.
     }
   };
 
@@ -112,9 +136,10 @@ export function createRuneHooks(
     }
   };
 
-  const getSession = (sessionID: string): RuneSessionContext => {
+  const admitSession = (sessionID: string): RuneSessionContext | null => {
     let ctx = sessions.get(sessionID);
     if (!ctx) {
+      if (sessions.size >= MAX_SESSION_ADMISSIONS) return null;
       ctx = new RuneSessionContext();
       sessions.set(sessionID, ctx);
     }
@@ -122,8 +147,9 @@ export function createRuneHooks(
   };
 
   async function seedHardBootstrap(sessionID: string): Promise<void> {
+    if (!sessions.has(sessionID)) return;
     const hard = await client.bootstrapHard(directory);
-    getSession(sessionID).setHardBootstrap(hard);
+    sessions.get(sessionID)?.setHardBootstrap(hard);
   }
 
   async function activateScopesForPath(sessionID: string, path: string): Promise<void> {
@@ -136,14 +162,41 @@ export function createRuneHooks(
       });
       return;
     }
+    const sessionContext = admitSession(sessionID);
+    if (!sessionContext) {
+      await warnSessionAdmissionCapped(sessionID);
+      return;
+    }
     const seenPaths = activatedPaths.get(sessionID) ?? new Set<string>();
     if (seenPaths.has(scopePath)) return;
-    const result = await client.scopeFor(directory, scopePath);
-    seenPaths.add(scopePath);
-    activatedPaths.set(sessionID, seenPaths);
-    const ctx = getSession(sessionID);
-    for (const scope of result.scopes) {
-      ctx.addActiveScope(scope);
+    const pendingPaths = activatingPaths.get(sessionID) ?? new Map<string, Promise<void>>();
+    const pending = pendingPaths.get(scopePath);
+    if (pending) {
+      await pending;
+      return;
+    }
+
+    const activation = (async (): Promise<void> => {
+      const result = await client.scopeFor(directory, scopePath);
+      if (sessions.get(sessionID) !== sessionContext) return;
+      const currentSeenPaths = activatedPaths.get(sessionID) ?? new Set<string>();
+      currentSeenPaths.add(scopePath);
+      activatedPaths.set(sessionID, currentSeenPaths);
+      for (const scope of result.scopes) {
+        sessionContext.addActiveScope(scope);
+      }
+    })();
+    pendingPaths.set(scopePath, activation);
+    activatingPaths.set(sessionID, pendingPaths);
+    try {
+      await activation;
+    } finally {
+      if (pendingPaths.get(scopePath) === activation) {
+        pendingPaths.delete(scopePath);
+      }
+      if (pendingPaths.size === 0 && activatingPaths.get(sessionID) === pendingPaths) {
+        activatingPaths.delete(sessionID);
+      }
     }
   }
 
@@ -157,7 +210,7 @@ export function createRuneHooks(
       }
       try {
         const soft = await client.bootstrapSoft(directory);
-        getSession(sessionID).enqueuePendingEvent(renderSoftBootstrap(soft));
+        sessions.get(sessionID)?.enqueuePendingEvent(renderSoftBootstrap(soft));
       } catch (error) {
         await failOpen("bootstrap.soft", error, { session_id: sessionID });
       }
@@ -174,39 +227,65 @@ export function createRuneHooks(
     } else if (event.type === "session.deleted") {
       sessions.delete(event.properties.info.id);
       activatedPaths.delete(event.properties.info.id);
+      activatingPaths.delete(event.properties.info.id);
+      initializing.delete(event.properties.info.id);
     }
   }
 
+  function enqueueInitialization(sessionID: string, operation: () => Promise<void>): Promise<void> {
+    const previous = initializing.get(sessionID) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(operation);
+    initializing.set(sessionID, next);
+    const clear = (): void => {
+      if (initializing.get(sessionID) === next) initializing.delete(sessionID);
+    };
+    next.then(clear, clear);
+    return next;
+  }
+
+  const logEvent = (event: Event): Promise<void> => logAcceptance("event", {
+    event_type: event.type,
+    session_id: event.type === "session.created"
+      ? event.properties.info.id
+      : "sessionID" in event.properties
+        ? (event.properties as { sessionID: string }).sessionID
+        : undefined,
+    event_property_keys: Object.keys(event.properties),
+    event_info_keys: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+      ? Object.keys(event.properties.info)
+      : [],
+    event_role: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+      ? (event.properties.info as { role?: unknown }).role
+      : undefined,
+    event_agent: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
+      ? (event.properties.info as { agent?: unknown }).agent
+      : undefined,
+  });
+
   return {
     event: async ({ event }) => {
-      await logAcceptance("event", {
-        event_type: event.type,
-        session_id: event.type === "session.created"
-          ? event.properties.info.id
-          : "sessionID" in event.properties
-            ? (event.properties as { sessionID: string }).sessionID
-            : undefined,
-        event_property_keys: Object.keys(event.properties),
-        event_info_keys: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
-          ? Object.keys(event.properties.info)
-          : [],
-        event_role: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
-          ? (event.properties.info as { role?: unknown }).role
-          : undefined,
-        event_agent: "info" in event.properties && event.properties.info && typeof event.properties.info === "object"
-          ? (event.properties.info as { agent?: unknown }).agent
-          : undefined,
-      });
-      try {
-        if (event.type === "session.created") {
-          const sessionID = event.properties.info.id;
-          getSession(sessionID); // Make the session visible before async bootstrap work.
-          const initialization = handleEvent(event);
-          initializing.set(sessionID, initialization);
-          await initialization;
-        } else {
-          await handleEvent(event);
+      let operation: Promise<void>;
+      if (event.type === "session.created") {
+        const sessionID = event.properties.info.id;
+        if (!admitSession(sessionID)) {
+          await logEvent(event);
+          await warnSessionAdmissionCapped(sessionID);
+          return;
         }
+        // Register the gate before the first await so a concurrent transform
+        // cannot observe a session without waiting for its bootstrap.
+        operation = enqueueInitialization(sessionID, () => handleEvent(event));
+      } else if (event.type === "session.compacted") {
+        const sessionID = event.properties.sessionID;
+        operation = sessions.has(sessionID)
+          ? enqueueInitialization(sessionID, () => handleEvent(event))
+          : Promise.resolve();
+      } else {
+        operation = handleEvent(event);
+      }
+      await logEvent(event);
+      try {
+        await operation;
       } catch (error) {
         await failOpen("event", error, { event_type: event.type });
       }

@@ -90,7 +90,10 @@ def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[M
     if not path.exists():
         return []
     records: list[ModelT] = []
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CanonicalReadError(f"cannot read canonical file {path}: {exc}") from exc
     for line_no, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line:

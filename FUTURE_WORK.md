@@ -254,18 +254,26 @@ repository root is within an allowed root. The policy must reject symlink or
 junction escapes, avoid disclosing filesystem metadata for rejected paths, and
 separate read roots from write roots if multi-repository access is allowed.
 
+### Windows CLI Wrapper Support
+
+The OpenCode adapter currently supports a real executable such as
+`rune.exe` through Node's `execFile`. `.cmd` and `.bat` wrappers are
+intentionally deferred until release preparation, when their Windows process
+invocation and argument-escaping policy can be designed and acceptance-tested.
+
 ## Remaining Simple Findings
 
 The following remain separately tracked and are not part of sections 1-9:
 
-- ConfigError command handling for write commands such as note/propose/approve.
-- Negative limits outside `search` and `symbol_search`, notably
-  `related_context.max_items` and its CLI/MCP boundaries.
 - src-layout absolute import resolution.
 - Parser traversal consistency for top-level Python conditional/try/with blocks.
 
 The following were resolved in the reliability pass and are intentionally not
-listed as pending: Windows Unicode output, read-only SQLite creation, provider
-cost coercion, check query batching, HTTP client closure, marker escaping,
-session bootstrap race, bash activation cap, endpoint JSON validation, and
-NTFS case handling.
+listed as pending: canonical-read error mapping in CLI/MCP, URI-safe read-only
+SQLite paths and connection cleanup, strict provider response usage/cost
+validation, negative retrieval-limit handling, `--since` Git-history error
+classification, Windows Unicode output, read-only SQLite creation, check query
+batching, HTTP client closure, marker escaping, session bootstrap ordering and
+cleanup, same-path in-flight scope deduplication, session admission bounding
+without eviction, bash activation cap, endpoint JSON validation, and NTFS case
+handling.

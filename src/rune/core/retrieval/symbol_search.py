@@ -50,10 +50,10 @@ def symbol_search(
     filter at all narrows the result -- callers wanting "everything" can
     pass no filters, bounded by `limit`.
     """
-    if not layout.memory_db.exists():
-        return []
     if limit < 0:
         raise ValueError("limit must be non-negative")
+    if not layout.memory_db.exists():
+        return []
     conn = connect_for_read(layout)
     try:
         clauses: list[str] = []

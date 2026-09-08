@@ -41,6 +41,14 @@ def test_rune_status_reports_index_size(python_simple_repo: Path) -> None:
     assert result["working_tree_fresh"] is True
 
 
+def test_rune_status_maps_corrupt_project_json_to_value_error(python_simple_repo: Path) -> None:
+    layout = init_project(python_simple_repo)
+    layout.project_json.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot read canonical file"):
+        server.rune_status(path=str(python_simple_repo))
+
+
 def test_rune_doctor_flags_missing_semantic_model(python_simple_repo: Path) -> None:
     init_project(python_simple_repo)
     result = server.rune_doctor(path=str(python_simple_repo))

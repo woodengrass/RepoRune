@@ -8,6 +8,7 @@ import {
   createRuneHooks,
   findRuneProjectDirectory,
   isRuneProject,
+  MAX_SESSION_ADMISSIONS,
   pathForScopeLookup,
   pluginDirectoryPath,
   type RuneClient,
@@ -295,4 +296,129 @@ test("bash post-hook activates changed scopes without blocking the bash call", a
   const output = await fireSystemTransform(hooks, "s1");
   assert.match(output[0], /prefer repository pattern/);
   assert.equal(scopeCalls, 1);
+});
+
+test("concurrent tool calls for the same path share one scope lookup", async () => {
+  let scopeCalls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const hooks = createRuneHooks("/repo", fakeClient({
+    scopeFor: async (_directory, path) => {
+      scopeCalls += 1;
+      await gate;
+      return fakeClient().scopeFor("/repo", path);
+    },
+  }));
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  const first = hooks["tool.execute.before"]!(
+    { tool: "read", sessionID: "s1", callID: "c1" },
+    { args: { filePath: "app/services.py" } },
+  );
+  const second = hooks["tool.execute.before"]!(
+    { tool: "read", sessionID: "s1", callID: "c2" },
+    { args: { filePath: "app/services.py" } },
+  );
+  release();
+  await Promise.all([first, second]);
+
+  assert.equal(scopeCalls, 1);
+});
+
+test("session bootstrap is registered before an awaited event diagnostic", async () => {
+  let release!: () => void;
+  let eventLogStarted!: () => void;
+  const eventLogReady = new Promise<void>((resolve) => { eventLogStarted = resolve; });
+  const eventLogGate = new Promise<void>((resolve) => { release = resolve; });
+  const hooks = createRuneHooks("/repo", fakeClient(), {
+    acceptanceLog: async (message) => {
+      if (message === "event") {
+        eventLogStarted();
+        await eventLogGate;
+      }
+    },
+  });
+
+  const created = hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  await eventLogReady;
+  const outputPromise = fireSystemTransform(hooks, "s1");
+  let transformed = false;
+  void outputPromise.then(() => { transformed = true; });
+  await Promise.resolve();
+  assert.equal(transformed, false);
+
+  release();
+  await Promise.all([created, outputPromise]);
+});
+
+test("deleting a session while bootstrap is pending does not recreate its state", async () => {
+  let release!: () => void;
+  const bootstrapGate = new Promise<void>((resolve) => { release = resolve; });
+  const hooks = createRuneHooks("/repo", fakeClient({
+    bootstrapHard: async () => {
+      await bootstrapGate;
+      return fakeClient().bootstrapHard("/repo");
+    },
+  }));
+
+  const created = hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  await Promise.resolve();
+  const deleted = hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "s1" } as never } } });
+  await deleted;
+  release();
+  await created;
+
+  const output = { system: [] as string[] };
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, output);
+  assert.deepEqual(output.system, []);
+});
+
+test("deleting a session while scope activation is pending does not recreate its state", async () => {
+  let release!: () => void;
+  let scopeStarted!: () => void;
+  const scopeStartedReady = new Promise<void>((resolve) => { scopeStarted = resolve; });
+  const scopeGate = new Promise<void>((resolve) => { release = resolve; });
+  const hooks = createRuneHooks("/repo", fakeClient({
+    scopeFor: async (directory, path) => {
+      scopeStarted();
+      await scopeGate;
+      return fakeClient().scopeFor(directory, path);
+    },
+  }));
+
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+  const activation = hooks["tool.execute.before"]!(
+    { tool: "read", sessionID: "s1", callID: "c1" },
+    { args: { filePath: "app/services.py" } },
+  );
+  await scopeStartedReady;
+  await hooks.event!({ event: { type: "session.deleted", properties: { info: { id: "s1" } as never } } });
+  release();
+  await activation;
+
+  const output = { system: [] as string[] };
+  await hooks["experimental.chat.system.transform"]!({ sessionID: "s1", model: {} as never }, output);
+  assert.deepEqual(output.system, []);
+});
+
+test("session admission cap fails open without evicting existing state", async () => {
+  let hardCalls = 0;
+  const warnings: Record<string, unknown>[] = [];
+  const hooks = createRuneHooks("/repo", fakeClient({
+    bootstrapHard: async () => {
+      hardCalls += 1;
+      return fakeClient().bootstrapHard("/repo");
+    },
+  }), {
+    warningLog: async (_message, extra) => { warnings.push(extra); },
+  });
+
+  for (let index = 0; index < MAX_SESSION_ADMISSIONS + 1; index += 1) {
+    await hooks.event!({ event: { type: "session.created", properties: { info: { id: `s${index}` } as never } } });
+  }
+
+  assert.equal(hardCalls, MAX_SESSION_ADMISSIONS);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].max_sessions, MAX_SESSION_ADMISSIONS);
+  assert.match(String(warnings[0].remediation), /Reload/);
 });

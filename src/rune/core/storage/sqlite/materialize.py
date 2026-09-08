@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+from urllib.parse import quote
+
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model, read_jsonl
 from rune.core.storage.models import (
@@ -126,8 +128,11 @@ def connect_for_read(layout: RuneLayout) -> sqlite3.Connection:
     error, and points at `rune rebuild-cache` to fix it.
     """
     try:
-        conn = sqlite3.connect(f"file:{layout.memory_db.as_posix()}?mode=ro", uri=True)
-    except sqlite3.OperationalError as exc:
+        # URI-escape the path while preserving separators and a Windows drive
+        # colon. Otherwise `#` and `?` in a repository path become URI syntax.
+        db_uri_path = quote(layout.memory_db.as_posix(), safe="/:")
+        conn = sqlite3.connect(f"file:{db_uri_path}?mode=ro", uri=True)
+    except (sqlite3.Error, ValueError) as exc:
         raise CacheUnusableError(
             f"{layout.memory_db} is missing or isn't a usable cache ({exc}). "
             "Run `rune rebuild-cache` to regenerate it."
@@ -136,7 +141,7 @@ def connect_for_read(layout: RuneLayout) -> sqlite3.Connection:
     try:
         row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
         stored_version = int(row[0]) if row is not None else None
-    except sqlite3.DatabaseError as exc:
+    except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
         conn.close()
         raise CacheUnusableError(
             f"{layout.memory_db} exists but isn't a usable cache ({exc}). "

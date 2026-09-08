@@ -13,6 +13,7 @@ whether a response is "good enough", it just reports what came back.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -58,10 +59,35 @@ class ProviderResponse:
     # config.pricing's estimate (ARCHITECTURE.md §11, DATA_MODEL.md §7).
 
 
+def _parse_usage_count(usage: dict[object, object], field_name: str) -> int:
+    value = usage.get(field_name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ProviderError(f"malformed usage {field_name}: expected a non-negative integer")
+    return value
+
+
+def _parse_usage_cost(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ProviderError("malformed usage cost: boolean is not a number")
+    if not isinstance(value, (int, float, str)):
+        raise ProviderError(f"malformed usage cost: {value!r}")
+    try:
+        cost = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ProviderError(f"malformed usage cost: {value!r}") from exc
+    if not math.isfinite(cost) or cost < 0:
+        raise ProviderError(f"malformed usage cost: {value!r}")
+    return cost
+
+
 class ModelProvider(Protocol):
     model: str
 
     def complete(self, *, system_prompt: str, user_prompt: str, max_tokens: int) -> ProviderResponse: ...
+
+    def probe(self) -> None: ...
 
 
 class OpenAICompatibleProvider:
@@ -136,12 +162,21 @@ class OpenAICompatibleProvider:
 
         try:
             data = resp.json()
-            message = data["choices"][0]["message"]
-            content = message["content"]
-            usage = data.get("usage") or {}
-        except (KeyError, IndexError, ValueError) as exc:
+        except ValueError as exc:
             raise ProviderError(f"malformed response shape: {exc}") from exc
 
+        if not isinstance(data, dict):
+            raise ProviderError("malformed response shape: response body must be an object")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ProviderError("malformed response shape: choices must be a non-empty array")
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            raise ProviderError("malformed response shape: choices[0] must be an object")
+        message = first_choice.get("message")
+        if not isinstance(message, dict) or "content" not in message:
+            raise ProviderError("malformed response shape: choices[0].message must contain content")
+        content = message["content"]
         if content is None:
             # A "thinking" model (e.g. qwen3.8-flash) burned the entire
             # max_tokens budget on the `reasoning` field before it ever got
@@ -154,15 +189,19 @@ class OpenAICompatibleProvider:
                 "exhausted by reasoning tokens before any output; increase "
                 "max_tokens for reasoning-capable models"
             )
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderError("provider returned empty or non-string content")
 
-        try:
-            cost = None if usage.get("cost") is None else float(usage["cost"])
-        except (TypeError, ValueError) as exc:
-            raise ProviderError(f"malformed usage cost: {usage.get('cost')!r}") from exc
+        usage = data.get("usage")
+        if usage is None:
+            usage = {}
+        if not isinstance(usage, dict):
+            raise ProviderError("malformed response usage: usage must be an object")
+        cost = _parse_usage_cost(usage.get("cost"))
         return ProviderResponse(
             content=content,
-            input_tokens=int(usage.get("prompt_tokens", 0)),
-            output_tokens=int(usage.get("completion_tokens", 0)),
+            input_tokens=_parse_usage_count(usage, "prompt_tokens"),
+            output_tokens=_parse_usage_count(usage, "completion_tokens"),
             cost=cost,
         )
 

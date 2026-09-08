@@ -92,12 +92,17 @@ from rune.core.scopes.model import (
     load_scopes,
     member_files_by_unlocked_scope,
 )
+from rune.core.storage.canonical import CanonicalReadError
 from rune.core.storage.models import Edge, ScopesFile, ScopeSource
 from rune.core.storage.sqlite.materialize import read_current_code_index
 
 
 class InvalidRefError(Exception):
     pass
+
+
+class GitHistoryReadError(Exception):
+    """Raised when a valid ref cannot be read reliably from Git history."""
 
 
 class ReconcileClassification(str, Enum):
@@ -151,21 +156,46 @@ def _scopes_json_at_ref(layout: RuneLayout, ref: str) -> ScopesFile | None:
     a real commit -- a typo'd ref must fail loudly, not be silently
     treated as "the file didn't exist there yet".
     """
-    verify = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-        cwd=layout.repo_root, capture_output=True, text=True, check=False,
-    )
+    try:
+        verify = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=layout.repo_root, capture_output=True, text=True, check=False,
+        )
+    except OSError as exc:
+        raise GitHistoryReadError(f"cannot inspect git ref {ref!r}: {exc}") from exc
     if verify.returncode != 0:
         raise InvalidRefError(f"{ref!r} is not a valid git ref in this repository.")
 
     rel_path = layout.scopes_json.relative_to(layout.repo_root).as_posix()
-    result = subprocess.run(
-        ["git", "show", f"{ref}:{rel_path}"],
-        cwd=layout.repo_root, capture_output=True, text=True, encoding="utf-8", check=False,
-    )
-    if result.returncode != 0:
+    try:
+        tree = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", ref, "--", rel_path],
+            cwd=layout.repo_root, capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+    except OSError as exc:
+        raise GitHistoryReadError(f"cannot inspect {rel_path!r} at git ref {ref!r}: {exc}") from exc
+    if tree.returncode != 0:
+        detail = tree.stderr.strip() or f"git exited with status {tree.returncode}"
+        raise GitHistoryReadError(f"cannot inspect {rel_path!r} at git ref {ref!r}: {detail}")
+    if not tree.stdout.strip():
         return None
-    return ScopesFile.model_validate_json(result.stdout)
+
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{ref}:{rel_path}"],
+            cwd=layout.repo_root, capture_output=True, text=True, encoding="utf-8", check=False,
+        )
+    except OSError as exc:
+        raise GitHistoryReadError(f"cannot read {rel_path!r} at git ref {ref!r}: {exc}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"git exited with status {result.returncode}"
+        raise GitHistoryReadError(f"cannot read {rel_path!r} at git ref {ref!r}: {detail}")
+    try:
+        return ScopesFile.model_validate_json(result.stdout)
+    except (TypeError, ValueError) as exc:
+        raise CanonicalReadError(
+            f"cannot read historical canonical file {rel_path} at git ref {ref!r}: {exc}"
+        ) from exc
 
 
 def _merge_affected_entries(

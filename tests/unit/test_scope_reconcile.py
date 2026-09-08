@@ -8,8 +8,10 @@ import pytest
 from rune.core.project import init_project
 from rune.core.scopes.model import load_scopes, save_scopes
 from rune.core.scopes.reconcile import (
+    GitHistoryReadError,
     InvalidRefError,
     ReconcileClassification,
+    _scopes_json_at_ref,
     reconcile,
 )
 from rune.core.storage.models import (
@@ -519,3 +521,28 @@ def test_since_invalid_ref_raises(git_repo: Path) -> None:
     layout = _setup(git_repo, scopes_file, ["app/services.py"])
     with pytest.raises(InvalidRefError):
         reconcile(layout, full=False, since="not-a-real-ref-at-all")
+
+
+def test_since_does_not_treat_git_history_read_failure_as_missing_file(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    reconcile_module = importlib.import_module("rune.core.scopes.reconcile")
+    layout = _setup(
+        git_repo,
+        ScopesFile(scopes=[]),
+        [],
+    )
+
+    def fake_run(args, **_kwargs):
+        if args[1] == "rev-parse":
+            return subprocess.CompletedProcess(args, 0, stdout="HEAD\n", stderr="")
+        if args[1] == "ls-tree":
+            return subprocess.CompletedProcess(args, 0, stdout=".rune/scopes.json\n", stderr="")
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr(reconcile_module.subprocess, "run", fake_run)
+
+    with pytest.raises(GitHistoryReadError, match="cannot read"):
+        _scopes_json_at_ref(layout, "HEAD")

@@ -82,7 +82,9 @@ from rune.core.retrieval.scope_read import scope_read as core_scope_read
 from rune.core.retrieval.search import search as core_search
 from rune.core.retrieval.symbol_search import symbol_search as core_symbol_search
 from rune.core.status import compute_status
+from rune.core.storage.canonical import CanonicalReadError
 from rune.core.storage.models import (
+    Actor,
     NoteCategory,
     NoteStatus,
     PersistenceMode,
@@ -90,6 +92,7 @@ from rune.core.storage.models import (
     Severity,
 )
 from rune.core.storage.sqlite.materialize import CacheUnusableError
+from rune.core.storage.schema_versions import UnknownSchemaVersionError
 
 mcp = MCPServer(
     name="rune",
@@ -115,6 +118,8 @@ _KNOWN_ERRORS = (
     NotAGitRepoError,
     _MissingLayoutError,
     CacheUnusableError,
+    CanonicalReadError,
+    UnknownSchemaVersionError,
     ConfigError,
     ScopeNotFoundError,
     RecordNotFoundError,
@@ -167,9 +172,15 @@ def _layout(path: str | None) -> RuneLayout:
     return layout
 
 
-def _validate_actor(value: str, field_name: str) -> None:
-    if value not in ("agent", "human"):
-        raise ValueError(f"{field_name} must be 'agent' or 'human', got {value!r}")
+def _validate_actor(value: str, field_name: str) -> Actor:
+    """Narrow an MCP `created_by`/`source` string to `Actor`, raising
+    `ValueError` (which the `@_tool` wrapper surfaces as a tool error) on
+    anything else. Mirrors the CLI's `_validate_actor` -- core takes
+    `Actor`, never a raw string, so unvalidated input can't reach it."""
+    try:
+        return Actor(value)
+    except ValueError:
+        raise ValueError(f"{field_name} must be 'agent' or 'human', got {value!r}") from None
 
 
 def _constraint_dict(c: Any) -> dict[str, Any]:
@@ -489,14 +500,14 @@ def rune_decision_propose(
 ) -> dict[str, Any]:
     """Propose a new Decision. Sits pending until a human runs `rune
     proposal approve` -- this tool never approves its own proposal."""
-    _validate_actor(created_by, "created_by")
+    actor = _validate_actor(created_by, "created_by")
     layout = _layout(path)
     config = load_config(layout.config_path)
     proposal = core_propose(
         layout, type=RecordType.decision, record_id=record_id, content=content,
         rationale=rationale, scopes=scopes or [], files=files or [], symbols=symbols or [],
         critical=critical, source_document=source_document, source_section=source_section,
-        created_by=created_by, redact_secrets=config.security.redact_secrets,
+        created_by=actor, redact_secrets=config.security.redact_secrets,
     )
     return {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
 
@@ -522,7 +533,7 @@ def rune_constraint_propose(
     proposal approve` -- a Global MUST Constraint must never be approved
     by the agent that proposed it; `source_hashes`/`scope_hashes` are
     computed automatically at approval time, never supplied here."""
-    _validate_actor(created_by, "created_by")
+    actor = _validate_actor(created_by, "created_by")
     layout = _layout(path)
     config = load_config(layout.config_path)
     proposal = core_propose(
@@ -530,7 +541,7 @@ def rune_constraint_propose(
         rationale=rationale, scopes=scopes or [], files=files or [], symbols=symbols or [],
         severity=Severity(severity), persistence_mode=PersistenceMode(persistence_mode),
         expires_at=expires_at, source_document=source_document, source_section=source_section,
-        machine_check_hint=machine_check_hint, created_by=created_by,
+        machine_check_hint=machine_check_hint, created_by=actor,
         redact_secrets=config.security.redact_secrets,
     )
     return {"proposal_id": proposal.proposal_id, "record_id": record_id, "status": "pending"}
@@ -553,14 +564,14 @@ def rune_note_add(
 ) -> dict[str, Any]:
     """Add a new Note. No approval gate -- writes immediately, through the
     same redaction/schema/lifecycle rules the CLI/OpenCode adapter use."""
-    _validate_actor(source, "source")
+    actor = _validate_actor(source, "source")
     layout = _layout(path)
     config = load_config(layout.config_path)
     note = core_note_add(
         layout, category=NoteCategory(category), content=content, why_persist=why_persist,
         scopes=scopes or [], files=files or [], symbols=symbols or [],
         importance=importance, confidence=confidence, evidence=evidence or [],
-        expires_at=expires_at, source=source, redact_secrets=config.security.redact_secrets,
+        expires_at=expires_at, source=actor, redact_secrets=config.security.redact_secrets,
     )
     return {"id": note.id, "category": note.category.value, "revision": note.revision}
 
@@ -585,7 +596,7 @@ def rune_note_update(
     """Append a new revision to an existing Note -- verify/archive/re-scope
     it, or clear a field by passing an empty list for evidence/scopes/
     files/symbols. Fields not given are carried forward unchanged."""
-    _validate_actor(source, "source")
+    actor = _validate_actor(source, "source")
     layout = _layout(path)
     config = load_config(layout.config_path)
     updated = core_note_update(
@@ -593,7 +604,7 @@ def rune_note_update(
         status=NoteStatus(status) if status else None,
         evidence=evidence, scopes=scopes, files=files, symbols=symbols,
         importance=importance, confidence=confidence, expires_at=expires_at,
-        source=source, redact_secrets=config.security.redact_secrets,
+        source=actor, redact_secrets=config.security.redact_secrets,
         recompute_source_hashes=recompute_source_hashes,
     )
     return {"id": updated.id, "revision": updated.revision, "status": updated.status.value}

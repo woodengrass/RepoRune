@@ -68,14 +68,18 @@ from rune.core.scopes.model import (
     update_scope,
 )
 from rune.core.scopes.reconcile import InvalidRefError
+from rune.core.scopes.reconcile import GitHistoryReadError
 from rune.core.scopes.reconcile import reconcile as core_reconcile
 from rune.core.status import compute_status
+from rune.core.storage.canonical import CanonicalReadError
 from rune.core.storage.models import (
+    Actor,
     NoteCategory,
     NoteStatus,
     PersistenceMode,
     RecordType,
     Scope,
+    ScopeMembers,
     ScopeSource,
     Severity,
 )
@@ -84,6 +88,7 @@ from rune.core.storage.sqlite.materialize import (
     CanonicalConflictError,
     connect_for_read,
 )
+from rune.core.storage.schema_versions import UnknownSchemaVersionError
 from rune.core.update import run_update
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -154,6 +159,9 @@ def init(
 
     try:
         stats = run_update(layout, full=True)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
@@ -176,6 +184,9 @@ def status(
 
     try:
         project_status = compute_status(layout)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except ConfigError as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -243,6 +254,9 @@ def update(
 
     try:
         stats = run_update(layout, full=False)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
@@ -285,6 +299,9 @@ def rebuild_cache_cmd(
 
     try:
         stats = run_update(layout, full=True)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
@@ -348,6 +365,9 @@ def scope_list(
     """List canonical scopes and their membership."""
     try:
         scopes = load_scopes(_scope_layout(path)).scopes
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -375,6 +395,9 @@ def scope_create(
     ) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     _print_scope(scope)
 
 
@@ -399,6 +422,9 @@ def scope_edit(
     except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     _print_scope(scope)
 
 
@@ -406,6 +432,9 @@ def _set_scope_lock(path: Path | None, scope_id: str, locked: bool) -> None:
     try:
         scope = set_scope_locked(_scope_layout(path), scope_id, locked)
     except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     _print_scope(scope)
@@ -442,6 +471,9 @@ def scope_delete(
             raise typer.Abort()
         delete_scope(layout, scope_id)
     except (NotAGitRepoError, _MissingLayoutError, ScopeNotFoundError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     typer.echo(f"Deleted scope {scope_id!r}.")
@@ -485,6 +517,9 @@ def scope_suggest(
             candidates = suggest_from_paths(files, locked_files) + suggest_from_graph(conn, locked_files)
         finally:
             conn.close()
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -501,7 +536,7 @@ def scope_suggest(
                     id=scope_id,
                     name=candidate.name,
                     source=ScopeSource.model,
-                    members={"files": list(candidate.files)},
+                    members=ScopeMembers(files=list(candidate.files)),
                 )
             )
             used_ids.add(scope_id)
@@ -547,19 +582,22 @@ def scope_reconcile(
         conn = connect_for_read(layout)
         conn.close()
         config = load_config(layout.config_path)
+        reconcile_threshold = config.scopes.reconcile_large_churn_threshold
         result, updated_scopes_file = core_reconcile(
             layout, full=full, since=since,
-            large_churn_threshold=config.scopes.reconcile_large_churn_threshold,
+            large_churn_threshold=reconcile_threshold,
         )
         if updated_scopes_file is not None:
             save_scopes(layout, updated_scopes_file)
             refresh_cache(layout)
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError, GitHistoryReadError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, ConfigError, InvalidRefError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
-
     if json_output:
         typer.echo(
             json_module.dumps(
@@ -602,7 +640,7 @@ def scope_reconcile(
     elif result.suspicious_churn:
         typer.secho(
             f"Suspicious churn: {result.auto_count} AUTO-eligible change(s) exceed the "
-            f"configured threshold ({config.scopes.reconcile_large_churn_threshold}). "
+            f"configured threshold ({reconcile_threshold}). "
             "No changes were written -- review required.",
             fg=typer.colors.YELLOW,
         )
@@ -636,8 +674,15 @@ _CONSTRAINT_VISIBLE = {"active", "review_required", "stale"}
 _NOTE_VISIBLE = {"active", "stale"}
 
 
-def _validate_actor(value: str, option: str) -> None:
-    if value not in ("agent", "human"):
+def _validate_actor(value: str, option: str) -> Actor:
+    """Narrow a CLI `--created-by`/`--source` string to `Actor`, failing
+    with exit code 1 on anything else. The core `propose`/`note_add`/
+    `note_update` functions take `Actor` (not `str`), so the type checker
+    itself enforces that every CLI call site passes through this gate --
+    an unvalidated string can never reach them."""
+    try:
+        return Actor(value)
+    except ValueError:
         _err(f"{option} must be 'agent' or 'human', got {value!r}")
         raise typer.Exit(code=1)
 
@@ -676,7 +721,7 @@ def decision_propose(
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Propose a new Decision. Sits pending until `rune proposal approve`."""
-    _validate_actor(created_by, "--created-by")
+    actor = _validate_actor(created_by, "--created-by")
     try:
         layout = _scope_layout(path)
         config = load_config(layout.config_path)
@@ -684,9 +729,12 @@ def decision_propose(
             layout, type=RecordType.decision, record_id=record_id, content=content,
             rationale=rationale, scopes=scopes, files=files, symbols=symbols,
             critical=critical, source_document=source_document, source_section=source_section,
-            created_by=created_by,
+            created_by=actor,
             redact_secrets=config.security.redact_secrets,
         )
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, ConfigError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -707,6 +755,9 @@ def decision_list(
     """List current Decisions."""
     try:
         current = load_current_decisions(_scope_layout(path))
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -728,6 +779,9 @@ def decision_deactivate(
         updated = core_deactivate(_scope_layout(path), RecordType.decision, record_id, by=by)
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -757,7 +811,7 @@ def constraint_propose(
     """Propose a new Constraint. Sits pending until `rune proposal approve` --
     source_hashes/scope_hashes are computed automatically at approval time,
     never entered by hand."""
-    _validate_actor(created_by, "--created-by")
+    actor = _validate_actor(created_by, "--created-by")
     try:
         layout = _scope_layout(path)
         config = load_config(layout.config_path)
@@ -766,9 +820,12 @@ def constraint_propose(
             rationale=rationale, scopes=scopes, files=files, symbols=symbols,
             severity=severity, persistence_mode=persistence_mode, expires_at=expires_at,
             source_document=source_document, source_section=source_section,
-            machine_check_hint=machine_check_hint, created_by=created_by,
+            machine_check_hint=machine_check_hint, created_by=actor,
             redact_secrets=config.security.redact_secrets,
         )
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, ConfigError, _ProposalValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -789,6 +846,9 @@ def constraint_list(
     """List current Constraints."""
     try:
         current = load_current_constraints(_scope_layout(path))
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -811,6 +871,9 @@ def constraint_deactivate(
         updated = core_deactivate(_scope_layout(path), RecordType.constraint, record_id, by=by)
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, RecordNotFoundError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -834,18 +897,21 @@ def note_add_cmd(
     path: Path = typer.Option(None, "--path", help="Directory inside the target repo (default: cwd)."),
 ) -> None:
     """Add a new Note. No approval gate -- writes immediately."""
-    _validate_actor(source, "--source")
+    actor = _validate_actor(source, "--source")
     try:
         layout = _scope_layout(path)
         config = load_config(layout.config_path)
         note = core_note_add(
             layout, category=category, content=content, why_persist=why_persist,
             scopes=scopes, files=files, symbols=symbols, importance=importance,
-            confidence=confidence, evidence=evidence, expires_at=expires_at, source=source,
+            confidence=confidence, evidence=evidence, expires_at=expires_at, source=actor,
             redact_secrets=config.security.redact_secrets,
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, ConfigError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -892,7 +958,7 @@ def note_update_cmd(
 ) -> None:
     """Update a Note -- appends a new revision, carrying forward every
     field not explicitly overridden."""
-    _validate_actor(source, "--source")
+    actor = _validate_actor(source, "--source")
     try:
         layout = _scope_layout(path)
         config = load_config(layout.config_path)
@@ -909,12 +975,15 @@ def note_update_cmd(
             files=(files or ([] if clear_files else None)),
             symbols=(symbols or ([] if clear_symbols else None)),
             importance=importance, confidence=confidence,
-            expires_at=expires_at, clear_expires_at=clear_expires_at, source=source,
+            expires_at=expires_at, clear_expires_at=clear_expires_at, source=actor,
             redact_secrets=config.security.redact_secrets,
             recompute_source_hashes=recompute_source_hashes,
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, ConfigError, NoteNotFoundError, NoteValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -928,6 +997,9 @@ def note_list(
 ) -> None:
     try:
         current = load_current_notes(_scope_layout(path))
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -947,6 +1019,9 @@ def proposal_list(
     """List pending proposals -- what's waiting for `[A]pprove`/`[R]eject`/`[E]dit`."""
     try:
         proposals = list_pending_proposals(_scope_layout(path))
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -972,6 +1047,9 @@ def proposal_approve(
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
         ProposalAlreadyResolvedError, ConfigError, _ProposalValidationError,
@@ -991,6 +1069,9 @@ def proposal_reject(
 ) -> None:
     try:
         core_reject(_scope_layout(path), proposal_id, resolved_by=by)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError, ProposalAlreadyResolvedError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1056,6 +1137,9 @@ def proposal_edit(
         )
     except CanonicalConflictError as exc:
         _handle_cache_refresh_failure(exc)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (
         NotAGitRepoError, _MissingLayoutError, ProposalNotFoundError,
         ProposalAlreadyResolvedError, ConfigError, _ProposalValidationError,
@@ -1080,6 +1164,12 @@ def search(
     try:
         layout = _require_layout(path or Path.cwd())
         results = core_search(layout, query, history=history, limit=limit)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1112,6 +1202,9 @@ def check(
     try:
         layout = _require_layout(path or Path.cwd())
         result = core_check(layout)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1157,6 +1250,9 @@ def scope_for_cmd(
     try:
         layout = _require_layout(path or Path.cwd())
         results = core_scope_for(layout, file_path)
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1224,6 +1320,12 @@ def symbol_search_cmd(
             layout, query=query, name=name, qualified_name=qualified_name,
             kind=kind, path=symbol_path, limit=limit,
         )
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1273,6 +1375,9 @@ def related_context_cmd(
             layout, path=context_path, symbol=symbol, query=query,
             include=set(include) or None, max_items=max_items,
         )
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError, RelatedContextValidationError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1310,8 +1415,10 @@ def related_context_cmd(
         typer.echo(json_module.dumps(payload, indent=2))
         return
     for key in ("scopes", "constraints", "decisions", "notes", "symbols"):
-        typer.echo(f"{key}: {len(payload[key])}")
-        for item in payload[key]:
+        bucket = payload[key]
+        assert isinstance(bucket, list)  # payload above builds every bucket as a list
+        typer.echo(f"{key}: {len(bucket)}")
+        for item in bucket:
             label = item.get("record_id") or item.get("scope_id") or item.get("id") or item.get("qualified_name")
             typer.echo(f"  {label}")
 
@@ -1371,6 +1478,9 @@ def bootstrap(
                 "budget_tokens": soft.budget_tokens,
                 "overflow": soft.overflow,
             }
+    except (CanonicalReadError, UnknownSchemaVersionError) as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
@@ -1386,9 +1496,15 @@ def bootstrap(
                 f"{payload['budget_tokens']} budget -- no rule was dropped, raise "
                 f"bootstrap.hard_budget_tokens or trim the global MUST set"
             )
-        for c in payload["constraints"]:
+        hard_constraints = payload["constraints"]
+        assert isinstance(hard_constraints, list)  # payload above builds this bucket as dicts
+        for c in hard_constraints:
+            assert isinstance(c, dict)
             typer.echo(f"[MUST] {c['record_id']}: {c['content']}")
-        for d in payload["decisions"]:
+        hard_decisions = payload["decisions"]
+        assert isinstance(hard_decisions, list)  # payload above builds this bucket as dicts
+        for d in hard_decisions:
+            assert isinstance(d, dict)
             typer.echo(f"[critical decision] {d['record_id']}: {d['content']}")
     else:
         typer.echo(f"Project: {payload['project_name'] or '(unknown)'}")
@@ -1396,10 +1512,16 @@ def bootstrap(
             f"Working tree: {'fresh' if payload['working_tree_fresh'] else 'modified/unknown'} "
             f"({payload['files_indexed']} files, {payload['symbols_indexed']} symbols indexed)"
         )
-        for s in payload["scopes"]:
+        soft_scopes = payload["scopes"]
+        assert isinstance(soft_scopes, list)  # payload above builds this bucket as dicts
+        for s in soft_scopes:
+            assert isinstance(s, dict)
             summary = f" -- {s['summary']}" if s["summary"] else ""
             typer.echo(f"  scope {s['scope_id']} ({s['name']}){summary}")
-        for d in payload["decisions"]:
+        soft_decisions = payload["decisions"]
+        assert isinstance(soft_decisions, list)  # payload above builds this bucket as dicts
+        for d in soft_decisions:
+            assert isinstance(d, dict)
             typer.echo(f"  decision {d['record_id']}: {d['content']}")
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from rune.cli.main import app
-from rune.core.project import RuneLayout
+from rune.core.project import RuneLayout, init_project
 from rune.core.scopes.model import load_scopes, save_scopes
 from rune.core.storage.models import Scope, ScopeMembers, ScopesFile, ScopeSource
 
@@ -27,6 +27,30 @@ def test_init_then_status_json_reports_zero_modified(git_repo: Path) -> None:
     assert payload["files_modified"] == 0
     assert payload["files_added"] == 0
     assert payload["files_deleted"] == 0
+
+
+def test_status_maps_corrupt_project_json_to_clean_cli_error(git_repo: Path) -> None:
+    layout = RuneLayout(git_repo)
+    init_project(git_repo)
+    layout.project_json.write_text("{not-json", encoding="utf-8")
+
+    result = runner.invoke(app, ["status", "--path", str(git_repo)])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "cannot read canonical file" in result.output
+
+
+def test_search_and_symbol_search_map_negative_limits_to_clean_cli_errors(git_repo: Path) -> None:
+    init_project(git_repo)
+    for args in (
+        ["search", "query", "--limit", "-1", "--path", str(git_repo)],
+        ["symbol-search", "--query", "query", "--limit", "-1", "--path", str(git_repo)],
+    ):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "non-negative" in result.output
 
 
 def test_scope_create_rejects_invalid_id_without_traceback(git_repo: Path) -> None:
