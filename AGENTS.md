@@ -693,6 +693,13 @@ Always consider:
 
 A default implementation known to fail on Windows is not acceptable.
 
+Text files written by tooling or scripts must be UTF-8 without BOM with LF
+line endings, matching the existing repo convention. PowerShell's default
+file-writing cmdlets (`Add-Content`, `Set-Content`, `Out-File`) emit CRLF
+(and, on Windows PowerShell 5.1, a UTF-8 BOM) — never use them to write or
+modify repo files. Prefer the file-editing tools or Python with explicit
+`encoding="utf-8"` and `newline="\n"`.
+
 ## 31. Assertions and mocking
 
 Use precise assertions.
