@@ -9,3 +9,4 @@ dist/
 token.env
 node_modules/
 .claude/
+.idea/
