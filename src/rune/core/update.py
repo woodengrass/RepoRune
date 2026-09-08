@@ -225,6 +225,12 @@ def _append_semantic_log(layout: RuneLayout, lines: list[str]) -> None:
             f.write(f"{utc_now_iso()} {line}\n")
 
 
+def _close_provider(provider: ModelProvider | None) -> None:
+    close = getattr(provider, "close", None)
+    if callable(close):
+        close()
+
+
 def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float | str]:
     config = load_config(layout.config_path)
     repo_root = layout.repo_root
@@ -413,56 +419,60 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
     possibly_stale_revisions: list[ScopeSummary] = []
     if not full:
         primary_provider, fallback_provider, semantic_health = _build_semantic_providers(config)
-        if primary_provider is not None:
-            refresh_result = run_semantic_refresh(
-                repo_root=repo_root,
-                scopes=scopes_for_semantic,
-                current_summaries=current_summaries,
-                file_hashes={f.path: f.content_hash for f in new_files},
-                symbols=new_symbols,
-                primary_provider=primary_provider,
-                fallback_provider=fallback_provider,
-                max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
-                max_tokens_per_call=config.semantic.max_tokens,
-                pricing=config.pricing,
-                redact_secrets=config.security.redact_secrets,
-            )
-            new_semantic_revisions.extend(refresh_result.new_revisions)
-            semantic_local_log = refresh_result.local_log_lines
-            semantic_metrics_summary = aggregate_metrics(refresh_result.metrics)
-            if refresh_result.attempted_scope_ids:
-                # Only recorded when at least one scope was actually
-                # attempted this run — an all-fresh run with nothing to
-                # refresh has no meaningful "success rate" to report and
-                # would otherwise flood this history table with empty rows
-                # on every single `rune update`.
-                semantic_run_metrics_record = SemanticRunMetricsRecord(
-                    run_at=now,
-                    provider=config.semantic.provider,
-                    model=config.semantic.model,
-                    scopes_attempted=len(refresh_result.attempted_scope_ids),
-                    schema_success_rate=semantic_metrics_summary["schema_success_rate"],
-                    reference_strip_rate=semantic_metrics_summary["reference_strip_rate"],
-                    fallback_rate=semantic_metrics_summary["fallback_rate"],
-                    provider_error_rate=semantic_metrics_summary["provider_error_rate"],
-                    total_cost=semantic_metrics_summary["cost"],
-                    total_latency_seconds=semantic_metrics_summary["latency_seconds"],
+        try:
+            if primary_provider is not None:
+                refresh_result = run_semantic_refresh(
+                    repo_root=repo_root,
+                    scopes=scopes_for_semantic,
+                    current_summaries=current_summaries,
+                    file_hashes={f.path: f.content_hash for f in new_files},
+                    symbols=new_symbols,
+                    primary_provider=primary_provider,
+                    fallback_provider=fallback_provider,
+                    max_input_tokens_per_run=config.semantic.budget.max_input_tokens_per_run,
+                    max_tokens_per_call=config.semantic.max_tokens,
+                    pricing=config.pricing,
+                    redact_secrets=config.security.redact_secrets,
                 )
-        else:
-            # No provider usable this run at all -- disabled, a Step 1
-            # config error, or a failed Step 2 startup probe
-            # (ARCHITECTURE.md §4.5). DATA_MODEL.md §2.4: a scope whose
-            # member files changed since its last real summary must not
-            # keep silently reporting fresh/stale against content that no
-            # longer matches, so it gets a possibly_stale marker instead.
-            possibly_stale_revisions = mark_possibly_stale(
-                scopes_for_semantic,
-                current_summaries,
-                {f.path: f.content_hash for f in new_files},
-                new_symbols,
-                now,
-            )
-            new_semantic_revisions.extend(possibly_stale_revisions)
+                new_semantic_revisions.extend(refresh_result.new_revisions)
+                semantic_local_log = refresh_result.local_log_lines
+                semantic_metrics_summary = aggregate_metrics(refresh_result.metrics)
+                if refresh_result.attempted_scope_ids:
+                    # Only recorded when at least one scope was actually
+                    # attempted this run — an all-fresh run with nothing to
+                    # refresh has no meaningful "success rate" to report and
+                    # would otherwise flood this history table with empty rows
+                    # on every single `rune update`.
+                    semantic_run_metrics_record = SemanticRunMetricsRecord(
+                        run_at=now,
+                        provider=config.semantic.provider,
+                        model=config.semantic.model,
+                        scopes_attempted=len(refresh_result.attempted_scope_ids),
+                        schema_success_rate=semantic_metrics_summary["schema_success_rate"],
+                        reference_strip_rate=semantic_metrics_summary["reference_strip_rate"],
+                        fallback_rate=semantic_metrics_summary["fallback_rate"],
+                        provider_error_rate=semantic_metrics_summary["provider_error_rate"],
+                        total_cost=semantic_metrics_summary["cost"],
+                        total_latency_seconds=semantic_metrics_summary["latency_seconds"],
+                    )
+            else:
+                # No provider usable this run at all -- disabled, a Step 1
+                # config error, or a failed Step 2 startup probe
+                # (ARCHITECTURE.md §4.5). DATA_MODEL.md §2.4: a scope whose
+                # member files changed since its last real summary must not
+                # keep silently reporting fresh/stale against content that no
+                # longer matches, so it gets a possibly_stale marker instead.
+                possibly_stale_revisions = mark_possibly_stale(
+                    scopes_for_semantic,
+                    current_summaries,
+                    {f.path: f.content_hash for f in new_files},
+                    new_symbols,
+                    now,
+                )
+                new_semantic_revisions.extend(possibly_stale_revisions)
+        finally:
+            _close_provider(primary_provider)
+            _close_provider(fallback_provider)
 
     if new_semantic_revisions:
         semantic_override = [*existing_semantic, *new_semantic_revisions]

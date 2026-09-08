@@ -55,6 +55,18 @@ def test_scan_files_detects_language_by_extension(tmp_path: Path) -> None:
     assert results == {"a.py": "python", "b.ts": "typescript", "c.js": "javascript"}
 
 
+def test_scan_files_uses_case_insensitive_globs_extensions_and_pruning_on_ntfs(tmp_path: Path, monkeypatch) -> None:
+    import rune.core.index.scanner as scanner_module
+
+    _write(tmp_path / "SRC" / "APP.PY")
+    _write(tmp_path / "NODE_MODULES" / "pkg" / "SKIP.JS")
+    monkeypatch.setattr(scanner_module, "_is_case_insensitive_filesystem", lambda: True)
+
+    results = scan_files(tmp_path, IndexConfig(include=["src/**"], exclude=[]))
+
+    assert [result.path for result in results] == ["SRC/APP.PY"]
+
+
 def test_scan_files_reports_an_unreadable_source_without_aborting(tmp_path: Path, monkeypatch) -> None:
     import rune.core.index.scanner as scanner_module
 

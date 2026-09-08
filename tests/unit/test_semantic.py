@@ -137,6 +137,22 @@ def test_provider_raises_on_transport_error() -> None:
         provider.complete(system_prompt="s", user_prompt="u", max_tokens=10)
 
 
+def test_provider_closes_only_the_client_it_created(monkeypatch) -> None:
+    created = _client(lambda request: httpx.Response(200))
+    injected = _client(lambda request: httpx.Response(200))
+    monkeypatch.setattr(httpx, "Client", lambda **kwargs: created)
+    owned = OpenAICompatibleProvider(base_url="https://example.invalid/v1", api_key="k", model="m")
+    owned.close()
+    assert owned._client.is_closed
+
+    provider = OpenAICompatibleProvider(
+        base_url="https://example.invalid/v1", api_key="k", model="m", client=injected
+    )
+    provider.close()
+    assert not injected.is_closed
+    injected.close()
+
+
 def test_provider_sends_configured_reasoning_payload() -> None:
     """Config-driven reasoning control (added after confirming by hand
     against the real OpenRouter API that {"effort": ...}/{"enabled": False}/

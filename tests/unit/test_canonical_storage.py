@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from rune.core.storage.canonical import (
+    CanonicalReadError,
     append_jsonl,
     atomic_write_text,
     read_json_model,
@@ -37,6 +38,20 @@ def test_read_json_model_refuses_unknown_future_schema_version(tmp_path: Path) -
     )
     with pytest.raises(UnknownSchemaVersionError):
         read_json_model(path, ProjectFile)
+
+
+def test_read_json_model_wraps_invalid_json_in_domain_error(tmp_path: Path) -> None:
+    path = tmp_path / "project.json"
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(CanonicalReadError, match="cannot read canonical file"):
+        read_json_model(path, ProjectFile)
+
+
+def test_read_jsonl_wraps_invalid_record_in_domain_error(tmp_path: Path) -> None:
+    path = tmp_path / "things.jsonl"
+    path.write_text('{"project_id":"missing required fields"}\n', encoding="utf-8")
+    with pytest.raises(CanonicalReadError, match=r"things.jsonl:1"):
+        read_jsonl(path, ProjectFile)
 
 
 def test_atomic_write_leaves_no_tmp_file_behind(tmp_path: Path) -> None:

@@ -15,7 +15,14 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from rune.core.storage.schema_versions import check_schema_version
+from rune.core.storage.schema_versions import (
+    UnknownSchemaVersionError,
+    check_schema_version,
+)
+
+
+class CanonicalReadError(Exception):
+    """A canonical file exists but cannot safely be read or validated."""
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -41,10 +48,15 @@ def read_json_model[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> M
     """Returns None if the file doesn't exist (caller decides the default)."""
     if not path.exists():
         return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    schema_version = data.get("schema_version", 1)
-    check_schema_version(str(path), schema_version)
-    return model_cls.model_validate(data)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        schema_version = data.get("schema_version", 1)
+        check_schema_version(str(path), schema_version)
+        return model_cls.model_validate(data)
+    except UnknownSchemaVersionError:
+        raise
+    except Exception as exc:
+        raise CanonicalReadError(f"cannot read canonical file {path}: {exc}") from exc
 
 
 def write_json_model(path: Path, model: BaseModel) -> None:
@@ -83,10 +95,15 @@ def read_jsonl[ModelT: BaseModel](path: Path, model_cls: type[ModelT]) -> list[M
         line = line.strip()
         if not line:
             continue
-        data = json.loads(line)
-        schema_version = data.get("schema_version", 1)
-        check_schema_version(f"{path}:{line_no}", schema_version)
-        records.append(model_cls.model_validate(data))
+        try:
+            data = json.loads(line)
+            schema_version = data.get("schema_version", 1)
+            check_schema_version(f"{path}:{line_no}", schema_version)
+            records.append(model_cls.model_validate(data))
+        except UnknownSchemaVersionError:
+            raise
+        except Exception as exc:
+            raise CanonicalReadError(f"cannot read canonical file {path}:{line_no}: {exc}") from exc
     return records
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from rune.core.config import load_config
+from rune.core.config import ConfigError, load_config
 from rune.core.hashing import working_tree_fingerprint
 from rune.core.index.scanner import diff_against_previous, scan_files_with_issues
 from rune.core.project import RuneLayout
@@ -86,6 +86,8 @@ def compute_status(layout: RuneLayout) -> ProjectStatus | None:
         modified_count = len(changeset.modified)
         added_count = len(changeset.added)
         deleted_count = len(set(changeset.deleted_paths) - set(scan_result.unreadable_paths))
+    except ConfigError:
+        raise
     except Exception:  # noqa: BLE001 - status must never crash on a scan hiccup
         current_tree_hash = None
 

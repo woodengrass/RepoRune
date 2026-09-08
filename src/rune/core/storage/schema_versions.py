@@ -22,5 +22,7 @@ class UnknownSchemaVersionError(Exception):
 
 
 def check_schema_version(file_label: str, schema_version: int) -> None:
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version < 1:
+        raise UnknownSchemaVersionError(file_label, schema_version)
     if schema_version > CURRENT_SCHEMA_VERSION:
         raise UnknownSchemaVersionError(file_label, schema_version)

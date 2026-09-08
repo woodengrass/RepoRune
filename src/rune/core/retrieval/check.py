@@ -23,6 +23,7 @@ from rune.core.storage.sqlite.materialize import connect_for_read
 
 _VISIBLE_CONSTRAINT_STATUSES = {"active", "review_required", "stale"}
 _STATUS_PRIORITY = {"active": 0, "review_required": 1, "stale": 2}
+_SQLITE_BATCH_SIZE = 900
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,11 @@ def _placeholders(n: int) -> str:
     return ",".join("?" * n)
 
 
+def _batches(values: list[str] | set[str]) -> list[list[str]]:
+    ordered = sorted(values)
+    return [ordered[start : start + _SQLITE_BATCH_SIZE] for start in range(0, len(ordered), _SQLITE_BATCH_SIZE)]
+
+
 def check(layout: RuneLayout) -> CheckResult:
     if not layout.memory_db.exists():
         return CheckResult()
@@ -70,14 +76,14 @@ def check(layout: RuneLayout) -> CheckResult:
             return CheckResult()
 
         affected_scope_ids: set[str] = set()
-        for path in changed_files:
+        for paths in _batches(changed_files):
             rows = conn.execute(
-                "SELECT scope_id FROM scope_files WHERE file = ? "
+                f"SELECT scope_id FROM scope_files WHERE file IN ({_placeholders(len(paths))}) "
                 "UNION "
                 "SELECT ss.scope_id FROM scope_symbols ss "
                 "JOIN symbols sym ON sym.symbol_id = ss.symbol_id "
-                "WHERE sym.file = ?",
-                (path, path),
+                f"WHERE sym.file IN ({_placeholders(len(paths))})",
+                [*paths, *paths],
             ).fetchall()
             affected_scope_ids.update(row["scope_id"] for row in rows)
 
@@ -85,12 +91,13 @@ def check(layout: RuneLayout) -> CheckResult:
 
         # Path 1: scope-bound -- a constraint attached to a scope that a
         # changed file belongs to.
-        for scope_id in sorted(affected_scope_ids):
+        for scope_ids in _batches(affected_scope_ids):
             rows = conn.execute(
                 "SELECT r.record_id FROM constraint_scopes cs "
                 "JOIN constraint_records r ON r.record_id = cs.record_id "
-                "WHERE cs.scope_id = ? AND cs.revision = r.current_revision",
-                (scope_id,),
+                f"WHERE cs.scope_id IN ({_placeholders(len(scope_ids))}) "
+                "AND cs.revision = r.current_revision",
+                scope_ids,
             ).fetchall()
             relevant_ids.update(row["record_id"] for row in rows)
 
@@ -102,13 +109,14 @@ def check(layout: RuneLayout) -> CheckResult:
         # changed. Confirmed by hand: a SHOULD-severity, file-bound,
         # scope-less constraint on a changed file returned zero results
         # before this fix.
-        rows = conn.execute(
-            f"SELECT DISTINCT r.record_id FROM constraint_files cf "
-            f"JOIN constraint_records r ON r.record_id = cf.record_id AND cf.revision = r.current_revision "
-            f"WHERE cf.file IN ({_placeholders(len(changed_files))})",
-            changed_files,
-        ).fetchall()
-        relevant_ids.update(row["record_id"] for row in rows)
+        for paths in _batches(changed_files):
+            rows = conn.execute(
+                f"SELECT DISTINCT r.record_id FROM constraint_files cf "
+                f"JOIN constraint_records r ON r.record_id = cf.record_id AND cf.revision = r.current_revision "
+                f"WHERE cf.file IN ({_placeholders(len(paths))})",
+                paths,
+            ).fetchall()
+            relevant_ids.update(row["record_id"] for row in rows)
 
         # Path 3: a constraint bound directly to a symbol whose owning
         # file changed (covers a deleted/modified symbol -- the symbol's
@@ -116,14 +124,15 @@ def check(layout: RuneLayout) -> CheckResult:
         # touched at all, so matching on the owning file's presence in
         # `changed_files` catches both "symbol content changed" and
         # "symbol deleted").
-        rows = conn.execute(
-            f"SELECT DISTINCT r.record_id FROM constraint_symbols cs "
-            f"JOIN constraint_records r ON r.record_id = cs.record_id AND cs.revision = r.current_revision "
-            f"JOIN symbols sym ON sym.symbol_id = cs.symbol_id "
-            f"WHERE sym.file IN ({_placeholders(len(changed_files))})",
-            changed_files,
-        ).fetchall()
-        relevant_ids.update(row["record_id"] for row in rows)
+        for paths in _batches(changed_files):
+            rows = conn.execute(
+                f"SELECT DISTINCT r.record_id FROM constraint_symbols cs "
+                f"JOIN constraint_records r ON r.record_id = cs.record_id AND cs.revision = r.current_revision "
+                f"JOIN symbols sym ON sym.symbol_id = cs.symbol_id "
+                f"WHERE sym.file IN ({_placeholders(len(paths))})",
+                paths,
+            ).fetchall()
+            relevant_ids.update(row["record_id"] for row in rows)
 
         # Global MUST constraints (scopes == []) are relevant to any
         # change, not just ones touching a specific scope/file -- confirmed
@@ -143,28 +152,34 @@ def check(layout: RuneLayout) -> CheckResult:
         relevant_ids.update(row["record_id"] for row in rows)
 
         constraints: list[RelevantConstraint] = []
-        for record_id in relevant_ids:
-            row = conn.execute(
-                "SELECT v.content, v.severity, v.status FROM constraint_records r "
+        for record_ids in _batches(relevant_ids):
+            rows = conn.execute(
+                "SELECT r.record_id, v.content, v.severity, v.status FROM constraint_records r "
                 "JOIN constraint_revisions v "
                 "  ON v.record_id = r.record_id AND v.revision = r.current_revision "
-                "WHERE r.record_id = ?",
-                (record_id,),
-            ).fetchone()
-            if row["status"] not in _VISIBLE_CONSTRAINT_STATUSES:
-                continue
-            scope_rows = conn.execute(
-                "SELECT cs.scope_id FROM constraint_scopes cs "
-                "JOIN constraint_records r ON r.record_id = cs.record_id "
-                "WHERE cs.record_id = ? AND cs.revision = r.current_revision",
-                (record_id,),
+                f"WHERE r.record_id IN ({_placeholders(len(record_ids))})",
+                record_ids,
             ).fetchall()
-            constraints.append(
-                RelevantConstraint(
-                    record_id=record_id, content=row["content"], severity=row["severity"],
-                    status=row["status"], scope_ids=sorted(s["scope_id"] for s in scope_rows),
+            scope_rows = conn.execute(
+                "SELECT cs.record_id, cs.scope_id FROM constraint_scopes cs "
+                "JOIN constraint_records r ON r.record_id = cs.record_id "
+                f"WHERE cs.record_id IN ({_placeholders(len(record_ids))}) "
+                "AND cs.revision = r.current_revision",
+                record_ids,
+            ).fetchall()
+            scope_ids_by_record: dict[str, list[str]] = {}
+            for scope_row in scope_rows:
+                scope_ids_by_record.setdefault(scope_row["record_id"], []).append(scope_row["scope_id"])
+            for row in rows:
+                if row["status"] not in _VISIBLE_CONSTRAINT_STATUSES:
+                    continue
+                record_id = row["record_id"]
+                constraints.append(
+                    RelevantConstraint(
+                        record_id=record_id, content=row["content"], severity=row["severity"],
+                        status=row["status"], scope_ids=sorted(scope_ids_by_record.get(record_id, [])),
+                    )
                 )
-            )
 
         # MUST first, then by status (an active constraint is the normal
         # case; review_required/stale need a human's attention sooner

@@ -52,6 +52,8 @@ def symbol_search(
     """
     if not layout.memory_db.exists():
         return []
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
     conn = connect_for_read(layout)
     try:
         clauses: list[str] = []

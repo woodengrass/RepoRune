@@ -150,7 +150,12 @@ export function mergeRuneBlock(system: string[], block: string): void {
   if (block.length === 0 && !hasExistingMarker) {
     return;
   }
-  const wrapped = `${RUNE_BLOCK_START}\n${block}\n${RUNE_BLOCK_END}`;
+  // Rune content is data, never markup: otherwise a stored note or constraint
+  // could close the managed region and persist text outside future replacements.
+  const safeBlock = block
+    .replaceAll(RUNE_BLOCK_START, "&lt;!-- rune-context:start --&gt;")
+    .replaceAll(RUNE_BLOCK_END, "&lt;!-- rune-context:end --&gt;");
+  const wrapped = `${RUNE_BLOCK_START}\n${safeBlock}\n${RUNE_BLOCK_END}`;
   for (let i = 0; i < system.length; i++) {
     const start = system[i].indexOf(RUNE_BLOCK_START);
     if (start === -1) continue;

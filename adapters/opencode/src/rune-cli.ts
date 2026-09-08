@@ -61,6 +61,25 @@ export function parseRuneJson<T extends ProtocolResponse>(stdout: string): T {
   return payload as T;
 }
 
+function requireObject(value: unknown, endpoint: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new RuneCliError(`rune ${endpoint} returned an invalid response shape`, JSON.stringify(value), "");
+  }
+  return value as Record<string, unknown>;
+}
+
+function requireArrayField(value: unknown, field: string, endpoint: string): void {
+  if (!Array.isArray(requireObject(value, endpoint)[field])) {
+    throw new RuneCliError(`rune ${endpoint} returned invalid ${field}`, JSON.stringify(value), "");
+  }
+}
+
+function requireStringField(value: unknown, field: string, endpoint: string): void {
+  if (typeof requireObject(value, endpoint)[field] !== "string") {
+    throw new RuneCliError(`rune ${endpoint} returned invalid ${field}`, JSON.stringify(value), "");
+  }
+}
+
 export async function callRuneJson<T extends ProtocolResponse>(directory: string, args: string[]): Promise<T> {
   const fullArgs = [...args, "--json", "--path", directory];
   try {
@@ -112,7 +131,20 @@ export interface ScopeForResult extends ProtocolResponse {
 
 /** `rune scope-for <filePath> --json --path <directory>`. */
 export async function scopeFor(directory: string, filePath: string): Promise<ScopeForResult> {
-  return callRuneJson<ScopeForResult>(directory, ["scope-for", filePath]);
+  const result = await callRuneJson<ScopeForResult>(directory, ["scope-for", filePath]);
+  return validateScopeForResult(result);
+}
+
+export function validateScopeForResult(result: ScopeForResult): ScopeForResult {
+  requireStringField(result, "path", "scope-for");
+  requireArrayField(result, "scopes", "scope-for");
+  for (const scope of result.scopes) {
+    requireStringField(scope, "scope_id", "scope-for");
+    requireStringField(scope, "name", "scope-for");
+    requireArrayField(scope, "constraints", "scope-for");
+    requireArrayField(scope, "notes", "scope-for");
+  }
+  return result;
 }
 
 export interface HardBootstrapConstraint {
@@ -140,7 +172,10 @@ export interface HardBootstrapResult extends ProtocolResponse {
 /** `rune bootstrap --mode hard --json --path <directory>` (ARCHITECTURE.md
  * §7.3/§7.6). Called on session.created and every session.compacted. */
 export async function bootstrapHard(directory: string): Promise<HardBootstrapResult> {
-  return callRuneJson<HardBootstrapResult>(directory, ["bootstrap", "--mode", "hard"]);
+  const result = await callRuneJson<HardBootstrapResult>(directory, ["bootstrap", "--mode", "hard"]);
+  requireArrayField(result, "constraints", "bootstrap hard");
+  requireArrayField(result, "decisions", "bootstrap hard");
+  return result;
 }
 
 export interface SoftBootstrapScope {
@@ -171,7 +206,10 @@ export interface SoftBootstrapResult extends ProtocolResponse {
 /** `rune bootstrap --mode soft --json --path <directory>` -- called once,
  * on session.created only (ARCHITECTURE.md §7.3: not resent on compaction). */
 export async function bootstrapSoft(directory: string): Promise<SoftBootstrapResult> {
-  return callRuneJson<SoftBootstrapResult>(directory, ["bootstrap", "--mode", "soft"]);
+  const result = await callRuneJson<SoftBootstrapResult>(directory, ["bootstrap", "--mode", "soft"]);
+  requireArrayField(result, "scopes", "bootstrap soft");
+  requireArrayField(result, "decisions", "bootstrap soft");
+  return result;
 }
 
 export interface ProposeResult extends ProtocolResponse {
@@ -203,7 +241,14 @@ export async function decisionPropose(directory: string, args: DecisionProposeAr
   if (args.critical) cliArgs.push("--critical");
   if (args.source_document) cliArgs.push("--source-document", args.source_document);
   if (args.source_section) cliArgs.push("--source-section", args.source_section);
-  return callRuneJson<ProposeResult>(directory, cliArgs);
+  return validateProposeResult(await callRuneJson<ProposeResult>(directory, cliArgs), "decision propose");
+}
+
+export function validateProposeResult(result: ProposeResult, endpoint: string): ProposeResult {
+  requireStringField(result, "proposal_id", endpoint);
+  requireStringField(result, "record_id", endpoint);
+  requireStringField(result, "status", endpoint);
+  return result;
 }
 
 export interface ConstraintProposeArgs {
@@ -237,7 +282,7 @@ export async function constraintPropose(directory: string, args: ConstraintPropo
   if (args.source_document) cliArgs.push("--source-document", args.source_document);
   if (args.source_section) cliArgs.push("--source-section", args.source_section);
   if (args.machine_check_hint) cliArgs.push("--machine-check-hint", args.machine_check_hint);
-  return callRuneJson<ProposeResult>(directory, cliArgs);
+  return validateProposeResult(await callRuneJson<ProposeResult>(directory, cliArgs), "constraint propose");
 }
 
 export interface NoteAddArgs {
@@ -273,7 +318,10 @@ export async function noteAdd(directory: string, args: NoteAddArgs): Promise<Not
   if (args.confidence !== undefined) cliArgs.push("--confidence", String(args.confidence));
   for (const e of args.evidence ?? []) cliArgs.push("--evidence", e);
   if (args.expires_at) cliArgs.push("--expires-at", args.expires_at);
-  return callRuneJson<NoteAddResult>(directory, cliArgs);
+  const result = await callRuneJson<NoteAddResult>(directory, cliArgs);
+  requireStringField(result, "id", "note add");
+  requireStringField(result, "category", "note add");
+  return result;
 }
 
 /** Every file `git status --porcelain` reports as changed (modified,

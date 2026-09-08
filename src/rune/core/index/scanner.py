@@ -39,7 +39,7 @@ LANGUAGE_BY_EXTENSION = {
 }
 
 
-def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+def _glob_to_regex(pattern: str, *, case_sensitive: bool = True) -> re.Pattern[str]:
     """Translates a `**`-aware glob into a regex anchored on a posix
     relative path. `**/` matches zero or more path segments, `**` alone
     matches anything (incl. `/`), `*` matches within one segment, `?`
@@ -64,7 +64,12 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
         else:
             parts.append(re.escape(pattern[i]))
             i += 1
-    return re.compile("^" + "".join(parts) + "$")
+    return re.compile("^" + "".join(parts) + "$", 0 if case_sensitive else re.IGNORECASE)
+
+
+def _is_case_insensitive_filesystem() -> bool:
+    """Windows' normal NTFS behavior is case-insensitive for both paths and extensions."""
+    return os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -90,16 +95,22 @@ def scan_files_with_issues(repo_root: Path, index_config: IndexConfig) -> ScanRe
     (LANGUAGE_BY_EXTENSION) — unsupported files are not part of the code
     index in V1 and are silently skipped here, not an error.
     """
-    include_patterns = [_glob_to_regex(p) for p in index_config.include]
-    exclude_patterns = [_glob_to_regex(p) for p in index_config.exclude]
+    case_insensitive = _is_case_insensitive_filesystem()
+    include_patterns = [_glob_to_regex(p, case_sensitive=not case_insensitive) for p in index_config.include]
+    exclude_patterns = [_glob_to_regex(p, case_sensitive=not case_insensitive) for p in index_config.exclude]
 
     results: list[ScannedFile] = []
     unreadable_paths: list[str] = []
     for dirpath, dirnames, filenames in os.walk(repo_root):
-        dirnames[:] = [d for d in dirnames if d not in _ALWAYS_PRUNED_DIR_NAMES]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if (d.casefold() if case_insensitive else d) not in _ALWAYS_PRUNED_DIR_NAMES
+        ]
         for filename in filenames:
             absolute_path = Path(dirpath) / filename
-            language = LANGUAGE_BY_EXTENSION.get(absolute_path.suffix)
+            suffix = absolute_path.suffix.lower() if case_insensitive else absolute_path.suffix
+            language = LANGUAGE_BY_EXTENSION.get(suffix)
             if language is None:
                 continue
             rel_posix = absolute_path.relative_to(repo_root).as_posix()

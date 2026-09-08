@@ -8,12 +8,13 @@ business logic lives here (ARCHITECTURE.md §5).
 from __future__ import annotations
 
 import json as json_module
+import os
 import sys
 from pathlib import Path
 
 import typer
 
-from rune.core.config import load_config
+from rune.core.config import ConfigError, load_config
 from rune.core.doctor import run_doctor
 from rune.core.memory.notes import NoteNotFoundError, NoteValidationError
 from rune.core.memory.notes import note_add as core_note_add
@@ -96,6 +97,19 @@ proposal_app = typer.Typer(help="Review pending Decision/Constraint proposals.")
 app.add_typer(proposal_app, name="proposal")
 
 
+def _configure_windows_unicode_output() -> None:
+    """Keep CLI text/JSON UTF-8 on legacy Windows console code pages."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_windows_unicode_output()
+
+
 def _err(message: str) -> None:
     typer.secho(message, fg=typer.colors.RED, err=True)
 
@@ -138,7 +152,7 @@ def init(
 
     try:
         stats = run_update(layout, full=True)
-    except CanonicalConflictError as exc:
+    except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -158,7 +172,11 @@ def status(
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
-    project_status = compute_status(layout)
+    try:
+        project_status = compute_status(layout)
+    except ConfigError as exc:
+        _err(str(exc))
+        raise typer.Exit(code=1) from exc
     if project_status is None:
         _err(f"{layout.project_json} is missing or unreadable.")
         raise typer.Exit(code=1)
@@ -223,7 +241,7 @@ def update(
 
     try:
         stats = run_update(layout, full=False)
-    except CanonicalConflictError as exc:
+    except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
 
@@ -265,7 +283,7 @@ def rebuild_cache_cmd(
 
     try:
         stats = run_update(layout, full=True)
-    except CanonicalConflictError as exc:
+    except (CanonicalConflictError, ConfigError) as exc:
         _err(f"canonical conflict detected, cache not rebuilt: {exc}")
         raise typer.Exit(code=1) from exc
 

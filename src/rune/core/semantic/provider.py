@@ -89,6 +89,7 @@ class OpenAICompatibleProvider:
         self.model = model
         self._api_key = api_key
         self._extra_headers = extra_headers or {}
+        self._owns_client = client is None
         self._client = client or httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout)
         self._reasoning = reasoning
         # `reasoning` is an OpenRouter extension (confirmed by hand: {"effort":
@@ -97,7 +98,12 @@ class OpenAICompatibleProvider:
         # for any OpenAI-compatible base_url, but only OpenRouter is confirmed
         # to honor it — an OpenAI-proper endpoint would likely just ignore an
         # unrecognized field, not error, so this is left generic rather than
-        # gated to one subclass.
+            # gated to one subclass.
+
+    def close(self) -> None:
+        """Close the production client without taking ownership of test-injected clients."""
+        if self._owns_client:
+            self._client.close()
 
     def complete(self, *, system_prompt: str, user_prompt: str, max_tokens: int) -> ProviderResponse:
         headers = {"Authorization": f"Bearer {self._api_key}", **self._extra_headers}
@@ -149,11 +155,15 @@ class OpenAICompatibleProvider:
                 "max_tokens for reasoning-capable models"
             )
 
+        try:
+            cost = None if usage.get("cost") is None else float(usage["cost"])
+        except (TypeError, ValueError) as exc:
+            raise ProviderError(f"malformed usage cost: {usage.get('cost')!r}") from exc
         return ProviderResponse(
             content=content,
             input_tokens=int(usage.get("prompt_tokens", 0)),
             output_tokens=int(usage.get("completion_tokens", 0)),
-            cost=usage.get("cost"),
+            cost=cost,
         )
 
     def probe(self) -> None:
@@ -376,6 +386,10 @@ def check_semantic_health(config: SemanticConfig) -> tuple[SemanticHealthCheck, 
             return SemanticHealthCheck(status=SemanticHealthStatus.ok), primary, fallback
         except ProviderError as exc:
             if exc.is_rate_limited:
+                for provider in (primary, fallback):
+                    close = getattr(provider, "close", None)
+                    if callable(close):
+                        close()
                 return (
                     SemanticHealthCheck(
                         status=SemanticHealthStatus.rate_limited,
@@ -385,6 +399,10 @@ def check_semantic_health(config: SemanticConfig) -> tuple[SemanticHealthCheck, 
                     None,
                 )
             last_error = exc
+    for provider in (primary, fallback):
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
     return (
         SemanticHealthCheck(
             status=SemanticHealthStatus.probe_failed,

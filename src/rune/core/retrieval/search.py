@@ -105,6 +105,8 @@ def search(
     exist at all (nothing has been indexed yet, not an error).
     """
     wanted = kinds if kinds is not None else _ALL_KINDS
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
     if not layout.memory_db.exists():
         return []
     conn = connect_for_read(layout)

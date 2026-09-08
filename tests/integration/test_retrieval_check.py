@@ -268,3 +268,20 @@ def test_check_matches_a_symbol_only_scope(python_simple_repo: Path) -> None:
     result = check(layout)
     assert result.affected_scope_ids == ["service"]
     assert [constraint.record_id for constraint in result.constraints] == ["c1"]
+
+
+def test_check_batches_more_than_sqlite_parameter_limit(python_simple_repo: Path) -> None:
+    """Large change sets must not produce a single over-limit IN query or
+    one scope lookup per path."""
+    from rune.core.retrieval.check import _SQLITE_BATCH_SIZE
+
+    layout = init_project(python_simple_repo)
+    run_update(layout, full=True)
+    for index in range(_SQLITE_BATCH_SIZE + 1):
+        path = python_simple_repo / "generated" / f"file_{index}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x = 1\n", encoding="utf-8")
+
+    result = check(layout)
+
+    assert len(result.changed_files) == _SQLITE_BATCH_SIZE + 1

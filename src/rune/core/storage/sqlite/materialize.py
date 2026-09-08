@@ -125,7 +125,13 @@ def connect_for_read(layout: RuneLayout) -> sqlite3.Connection:
     reports the mismatch clearly instead of crashing on a raw sqlite3
     error, and points at `rune rebuild-cache` to fix it.
     """
-    conn = sqlite3.connect(str(layout.memory_db))
+    try:
+        conn = sqlite3.connect(f"file:{layout.memory_db.as_posix()}?mode=ro", uri=True)
+    except sqlite3.OperationalError as exc:
+        raise CacheUnusableError(
+            f"{layout.memory_db} is missing or isn't a usable cache ({exc}). "
+            "Run `rune rebuild-cache` to regenerate it."
+        ) from exc
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
