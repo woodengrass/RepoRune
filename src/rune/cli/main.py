@@ -67,8 +67,7 @@ from rune.core.scopes.model import (
     set_scope_locked,
     update_scope,
 )
-from rune.core.scopes.reconcile import InvalidRefError
-from rune.core.scopes.reconcile import GitHistoryReadError
+from rune.core.scopes.reconcile import GitHistoryReadError, InvalidRefError
 from rune.core.scopes.reconcile import reconcile as core_reconcile
 from rune.core.status import compute_status
 from rune.core.storage.canonical import CanonicalReadError
@@ -83,12 +82,12 @@ from rune.core.storage.models import (
     ScopeSource,
     Severity,
 )
+from rune.core.storage.schema_versions import UnknownSchemaVersionError
 from rune.core.storage.sqlite.materialize import (
     CacheUnusableError,
     CanonicalConflictError,
     connect_for_read,
 )
-from rune.core.storage.schema_versions import UnknownSchemaVersionError
 from rune.core.update import run_update
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -684,7 +683,7 @@ def _validate_actor(value: str, option: str) -> Actor:
         return Actor(value)
     except ValueError:
         _err(f"{option} must be 'agent' or 'human', got {value!r}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from None
 
 
 def _handle_cache_refresh_failure(exc: CanonicalConflictError) -> None:

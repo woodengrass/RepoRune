@@ -91,8 +91,8 @@ from rune.core.storage.models import (
     RecordType,
     Severity,
 )
-from rune.core.storage.sqlite.materialize import CacheUnusableError
 from rune.core.storage.schema_versions import UnknownSchemaVersionError
+from rune.core.storage.sqlite.materialize import CacheUnusableError
 
 mcp = MCPServer(
     name="rune",

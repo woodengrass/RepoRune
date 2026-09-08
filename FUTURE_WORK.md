@@ -212,6 +212,23 @@ They must remain thin `--json` CLI adapters over existing core retrieval
 functions. The previous deferment of `scope-read` is superseded by this
 decision.
 
+## Deferred Refactoring: CLI Module Split
+
+`src/rune/cli/main.py` is the largest module (~1400 lines). The real problem
+is not the line count but interleaved responsibilities in a few commands:
+CLI parsing, core invocation, JSON shaping, and human-readable rendering
+mixed in one function (e.g. `proposal_edit`, complexity 15). Splitting by
+subcommand group (`cli/scope_commands.py`, `cli/memory_commands.py`, ...)
+would let each layer stay testable and let `ty` verify payload shapes
+without narrowing asserts.
+
+Deferred, not scheduled: there is no behavioral problem (tests green), the
+file is a parallel-development hot zone, and line count alone is not a
+reason to split (`materialize.py` stays whole — its single-transaction
+readability would be harmed by splitting). Do it boy-scout style inside
+the next task that already touches CLI code, not as a standalone refactor.
+Typer app registration and every `--json` contract must stay unchanged.
+
 ## Open Questions Requiring Design
 
 The following are deliberately separated from sections 1-9: they are real
@@ -265,6 +282,9 @@ invocation and argument-escaping policy can be designed and acceptance-tested.
 
 The following remain separately tracked and are not part of sections 1-9:
 
+- ConfigError command handling for write commands such as note/propose/approve.
+- Negative limits outside `search` and `symbol_search`, notably
+  `related_context.max_items` and its CLI/MCP boundaries.
 - src-layout absolute import resolution.
 - Parser traversal consistency for top-level Python conditional/try/with blocks.
 

@@ -18,6 +18,7 @@ only decides *what to put in* the code-index portion of that call.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 from collections import defaultdict
 from pathlib import Path
@@ -546,10 +547,11 @@ def run_update(layout: RuneLayout, full: bool = False) -> dict[str, int | float 
         # Canonical is authoritative. If any deferred canonical write fails
         # after SQLite committed, remove the now-untrustworthy derived cache
         # rather than letting readers observe data canonical does not contain.
-        try:
+        # `discard_cache` failure here must not mask the original write
+        # error, so only that cleanup is suppressed (not the pattern §19
+        # forbids: swallowing the real error is never acceptable).
+        with contextlib.suppress(OSError):
             discard_cache(layout)
-        except OSError:
-            pass
         raise
 
     stats.update(

@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from rune.core.project import RuneLayout
-from rune.core.storage.sqlite.materialize import CACHE_SCHEMA_VERSION, CacheUnusableError, connect_for_read
+from rune.core.storage.sqlite.materialize import (
+    CACHE_SCHEMA_VERSION,
+    CacheUnusableError,
+    connect_for_read,
+)
 
 
 def _write_schema_meta(layout: RuneLayout, value: str) -> None:

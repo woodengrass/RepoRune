@@ -13,7 +13,13 @@ from rune.core.memory.notes import (
 )
 from rune.core.project import init_project
 from rune.core.storage.canonical import read_jsonl
-from rune.core.storage.models import Actor, Note, NoteCategory, NoteStatus, RevisionAuthor
+from rune.core.storage.models import (
+    Actor,
+    Note,
+    NoteCategory,
+    NoteStatus,
+    RevisionAuthor,
+)
 from rune.core.update import run_update
 
 

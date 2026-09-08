@@ -320,7 +320,7 @@ def test_approve_writes_memory_revision_before_resolving_proposal(git_repo: Path
     real_append_jsonl = proposals_module.append_jsonl
     call_count = {"n": 0}
 
-    def flaky_append_jsonl(path, model):
+    def flaky_append_jsonl(path: Path, model: MemoryRevision | Proposal) -> None:
         call_count["n"] += 1
         if call_count["n"] == 2:  # the proposals.jsonl resolution write
             raise OSError("simulated crash between the two canonical writes")
@@ -456,7 +456,9 @@ def test_deactivate_cache_refresh_failure_gives_written_content_not_raw_tracebac
     assert decisions[-1].status is RecordStatus.inactive
 
 
-def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(git_repo: Path) -> None:
+def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A relayed review confirmed by hand: approve() writes the memory
     revision before resolving the proposal (so a crash between the two
     leaves the content safely written and the proposal still `pending`,
@@ -473,18 +475,15 @@ def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(g
     real_append = proposals_module.append_jsonl
     call_count = {"n": 0}
 
-    def flaky_append(path: Path, model: Proposal) -> None:
+    def flaky_append(path: Path, model: MemoryRevision | Proposal) -> None:
         call_count["n"] += 1
         if call_count["n"] == 2:  # the proposals.jsonl resolution write
             raise OSError("simulated crash between the two canonical writes")
         return real_append(path, model)
 
-    proposals_module.append_jsonl = flaky_append  # type: ignore[assignment]
-    try:
-        with pytest.raises(OSError):
-            approve(layout, proposal.proposal_id, resolved_by="alice")
-    finally:
-        proposals_module.append_jsonl = real_append
+    monkeypatch.setattr(proposals_module, "append_jsonl", flaky_append)
+    with pytest.raises(OSError):
+        approve(layout, proposal.proposal_id, resolved_by="alice")
 
     # recovery: re-approve the still-pending proposal
     resolved, _memory_rev = approve(layout, proposal.proposal_id, resolved_by="alice")
@@ -497,7 +496,9 @@ def test_reapproving_a_still_pending_proposal_after_a_crash_does_not_duplicate(g
     assert decisions[0].revision == 1
 
 
-def test_reapproving_after_a_crash_with_a_different_by_does_not_duplicate(git_repo: Path) -> None:
+def test_reapproving_after_a_crash_with_a_different_by_does_not_duplicate(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Relayed review, reproduced by hand: the retry-after-crash
     idempotency check (see the test above) compared `approved_by` as
     part of "is this the same content already written" -- so a retry
@@ -515,18 +516,15 @@ def test_reapproving_after_a_crash_with_a_different_by_does_not_duplicate(git_re
     real_append = proposals_module.append_jsonl
     call_count = {"n": 0}
 
-    def flaky_append(path: Path, model: Proposal) -> None:
+    def flaky_append(path: Path, model: MemoryRevision | Proposal) -> None:
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise OSError("simulated crash between the two canonical writes")
         return real_append(path, model)
 
-    proposals_module.append_jsonl = flaky_append  # type: ignore[assignment]
-    try:
-        with pytest.raises(OSError):
-            approve(layout, proposal.proposal_id, resolved_by="alice")
-    finally:
-        proposals_module.append_jsonl = real_append
+    monkeypatch.setattr(proposals_module, "append_jsonl", flaky_append)
+    with pytest.raises(OSError):
+        approve(layout, proposal.proposal_id, resolved_by="alice")
 
     resolved, memory_rev = approve(layout, proposal.proposal_id, resolved_by="bob")
     assert resolved.status is ProposalStatus.approved
