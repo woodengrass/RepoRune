@@ -38,7 +38,7 @@ import { extractPathsFromToolArgs } from "./tool-paths.js";
 const TITLE_GENERATION_SYSTEM_MARKER =
   "You are a title generator. You output ONLY a thread title. Nothing else.";
 const RUNE_PLUGIN_BUILD = "directory-normalization-host-debug-20260907-a";
-const MAX_BASH_SCOPE_ACTIVATIONS = 100;
+export const MAX_SCOPE_ACTIVATIONS = 100;
 export const MAX_SESSION_ADMISSIONS = 1024;
 
 /**
@@ -300,7 +300,16 @@ export function createRuneHooks(
           arg_keys: output.args && typeof output.args === "object" ? Object.keys(output.args) : [],
           extracted_paths: paths, paths_are_absolute: paths.map((path) => /^(?:[A-Za-z]:[\\/]|\/)/.test(path)),
         });
-        for (const path of paths) await activateScopesForPath(input.sessionID, path);
+        for (const path of paths.slice(0, MAX_SCOPE_ACTIVATIONS)) {
+          await activateScopesForPath(input.sessionID, path);
+        }
+        if (paths.length > MAX_SCOPE_ACTIVATIONS) {
+          await logAcceptance("scope-activation.capped", {
+            session_id: input.sessionID,
+            tool: input.tool,
+            skipped_paths: paths.length - MAX_SCOPE_ACTIVATIONS,
+          });
+        }
       } catch (error) {
         await failOpen("tool.execute.before", error, { tool: input.tool, session_id: input.sessionID });
       }
@@ -317,13 +326,13 @@ export function createRuneHooks(
           tool: input.tool, session_id: input.sessionID, tool_call_id: input.callID,
           extracted_paths: paths, paths_are_absolute: paths.map((path) => /^(?:[A-Za-z]:[\\/]|\/)/.test(path)),
         });
-        for (const path of paths.slice(0, MAX_BASH_SCOPE_ACTIVATIONS)) {
+        for (const path of paths.slice(0, MAX_SCOPE_ACTIVATIONS)) {
           await activateScopesForPath(input.sessionID, path);
         }
-        if (paths.length > MAX_BASH_SCOPE_ACTIVATIONS) {
+        if (paths.length > MAX_SCOPE_ACTIVATIONS) {
           await logAcceptance("scope-activation.capped", {
             session_id: input.sessionID,
-            skipped_paths: paths.length - MAX_BASH_SCOPE_ACTIVATIONS,
+            skipped_paths: paths.length - MAX_SCOPE_ACTIVATIONS,
           });
         }
       } catch (error) {

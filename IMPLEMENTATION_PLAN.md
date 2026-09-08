@@ -2494,3 +2494,10 @@ git commit／真實 `rune update` 掃描整個流程走一遍、非法 ref 的 C
 175. OpenCode's empty `RUNE_CLI_PATH` override now falls back to `rune`, and nested plugin directories
     are covered by a regression test for enclosing-project discovery. Direct glob translation behavior
     is also covered by unit tests.
+
+176. Follow-up review of the Milestone 7 adapter found that the existing normalized-path and in-flight
+     deduplication prevented repeated `scope-for` calls for the same path, but multi-file non-bash tools had
+     no activation bound (the bound only covered post-bash Git paths). `MAX_SCOPE_ACTIVATIONS` is now shared
+     by both paths, with a regression test for `apply_patch`. The session admission cap, ancestor project
+     discovery, status cache-error handling, and direct `_glob_to_regex` tests were rechecked as already
+     fixed; no duplicate implementations were added for those findings.

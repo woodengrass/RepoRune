@@ -8,6 +8,7 @@ import {
   createRuneHooks,
   findRuneProjectDirectory,
   isRuneProject,
+  MAX_SCOPE_ACTIVATIONS,
   MAX_SESSION_ADMISSIONS,
   pathForScopeLookup,
   pluginDirectoryPath,
@@ -323,6 +324,28 @@ test("concurrent tool calls for the same path share one scope lookup", async () 
   await Promise.all([first, second]);
 
   assert.equal(scopeCalls, 1);
+});
+
+test("non-bash scope activation is capped for multi-file tools", async () => {
+  let scopeCalls = 0;
+  const hooks = createRuneHooks("/repo", fakeClient({
+    scopeFor: async (_directory, path) => {
+      scopeCalls += 1;
+      return fakeClient().scopeFor("/repo", path);
+    },
+  }));
+  await hooks.event!({ event: { type: "session.created", properties: { info: { id: "s1" } as never } } });
+
+  const patchText = Array.from(
+    { length: MAX_SCOPE_ACTIVATIONS + 1 },
+    (_, index) => `*** Update File: app/file-${index}.py`,
+  ).join("\n");
+  await hooks["tool.execute.before"]!(
+    { tool: "apply_patch", sessionID: "s1", callID: "c1" },
+    { args: { patchText } },
+  );
+
+  assert.equal(scopeCalls, MAX_SCOPE_ACTIVATIONS);
 });
 
 test("session bootstrap is registered before an awaited event diagnostic", async () => {

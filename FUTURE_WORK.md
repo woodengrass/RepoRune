@@ -295,5 +295,5 @@ validation, negative retrieval-limit handling, `--since` Git-history error
 classification, Windows Unicode output, read-only SQLite creation, check query
 batching, HTTP client closure, marker escaping, session bootstrap ordering and
 cleanup, same-path in-flight scope deduplication, session admission bounding
-without eviction, bash activation cap, endpoint JSON validation, and NTFS case
-handling.
+without eviction, shared scope activation caps across ordinary tools and bash,
+endpoint JSON validation, and NTFS case handling.
