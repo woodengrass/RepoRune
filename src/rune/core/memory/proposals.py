@@ -396,8 +396,9 @@ def approve(
         if edited_payload is not None
         else (RevisionAuthor.agent if proposal.created_by == "agent" else RevisionAuthor.human)
     )
-    new_memory_revision = payload.model_copy(
-        update={
+    new_memory_revision = validated_copy(
+        payload,
+        {
             "revision": next_revision,
             "status": RecordStatus.active,
             "source_hashes": source_hashes,
@@ -453,8 +454,9 @@ def approve(
         # is wrong.
         append_jsonl(target_path, new_memory_revision)
 
-    resolved_proposal = proposal.model_copy(
-        update={
+    resolved_proposal = validated_copy(
+        proposal,
+        {
             "revision": proposal.revision + 1,
             "status": ProposalStatus.edited if edited_payload is not None else ProposalStatus.approved,
             "payload": new_memory_revision,
@@ -490,8 +492,11 @@ def deactivate(
     if record_id not in current:
         raise RecordNotFoundError(f"{record_type.value} {record_id!r} does not exist")
     current_rev = current[record_id]
-    updated = current_rev.model_copy(
-        update={
+    if current_rev.status is RecordStatus.inactive:
+        return current_rev
+    updated = validated_copy(
+        current_rev,
+        {
             "revision": current_rev.revision + 1,
             "status": RecordStatus.inactive,
             "created_by": RevisionAuthor.human,
@@ -511,8 +516,9 @@ def reject(layout: RuneLayout, proposal_id: str, *, resolved_by: str) -> Proposa
             f"proposal {proposal_id!r} is already {proposal.status.value}, not pending"
         )
     now = utc_now_iso()
-    resolved_proposal = proposal.model_copy(
-        update={
+    resolved_proposal = validated_copy(
+        proposal,
+        {
             "revision": proposal.revision + 1,
             "status": ProposalStatus.rejected,
             "resolved_at": now,

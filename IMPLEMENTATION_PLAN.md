@@ -2479,3 +2479,18 @@ ARCHITECTURE.md §16.6 新增對應段落、§17 第 2 點更新為「已實作�
 baseline、非法 ref 丟 `InvalidRefError`）+ `tests/unit/test_cli.py` 2 個端到端測試（真實檔案／真實
 git commit／真實 `rune update` 掃描整個流程走一遍、非法 ref 的 CLI 錯誤路徑）。403 個測試全綠
 （396 → 403），`ruff check` 全綠。
+
+**Correctness fixes recorded 2026-09-09**:
+
+171. Canonical lifecycle and approval revision builders now use `validated_copy` instead of unchecked
+    `model_copy`, so generated timestamps, statuses, snapshots, and payloads cannot bypass Pydantic
+    validation before being appended. Semantic lifecycle copies follow the same rule.
+172. Stable scope and Decision/Constraint IDs now have explicit lower-kebab-case Pydantic constraints.
+    Invalid IDs, including leading-dash values, are rejected at the canonical boundary and mapped to
+    clean CLI errors. Existing test fixtures were aligned with the documented kebab-case contract.
+173. Human deactivation is idempotent: calling `deactivate` when the current revision is already
+    `inactive` returns that current revision without appending an identical history row.
+174. `rebuild_cache` statistics now count current logical IDs rather than every historical revision.
+175. OpenCode's empty `RUNE_CLI_PATH` override now falls back to `rune`, and nested plugin directories
+    are covered by a regression test for enclosing-project discovery. Direct glob translation behavior
+    is also covered by unit tests.

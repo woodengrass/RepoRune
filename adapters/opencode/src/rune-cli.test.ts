@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parseRuneJson, RuneCliError, validateProposeResult, validateScopeForResult } from "./rune-cli.js";
+import {
+  parseRuneJson,
+  resolveRuneCliPath,
+  RuneCliError,
+  validateProposeResult,
+  validateScopeForResult,
+} from "./rune-cli.js";
 
 test("adapter rejects a missing or incompatible core protocol version", () => {
   assert.throws(
@@ -23,4 +29,10 @@ test("adapter rejects malformed endpoint payloads after protocol validation", ()
     () => validateProposeResult({ protocol_version: 1, proposal_id: "p", record_id: "r" } as never, "decision propose"),
     (error: unknown) => error instanceof RuneCliError && /invalid status/.test(error.message),
   );
+});
+
+test("an empty CLI override falls back to the default executable", () => {
+  assert.equal(resolveRuneCliPath(""), "rune");
+  assert.equal(resolveRuneCliPath(undefined), "rune");
+  assert.equal(resolveRuneCliPath("rune-dev"), "rune-dev");
 });

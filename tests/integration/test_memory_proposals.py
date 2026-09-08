@@ -270,6 +270,18 @@ def test_deactivate_appends_inactive_revision_with_full_snapshot(git_repo: Path)
     assert updated.approved_by == "bob"
 
 
+def test_deactivate_is_idempotent_for_an_inactive_current_revision(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    proposal = propose(layout, type=RecordType.decision, record_id="d1", content="use postgres")
+    approve(layout, proposal.proposal_id, resolved_by="alice")
+
+    first = deactivate(layout, RecordType.decision, "d1", by="bob")
+    second = deactivate(layout, RecordType.decision, "d1", by="carol")
+
+    assert second == first
+    assert len(read_jsonl(layout.decisions_jsonl, MemoryRevision)) == 2
+
+
 def test_materialize_reflects_current_revision_after_deactivate(git_repo: Path) -> None:
     """End-to-end: propose -> approve -> deactivate -> rebuild_cache must
     show `current_revision=2, status=inactive`, not fall back to rev1 --

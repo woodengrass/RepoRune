@@ -142,7 +142,7 @@ class ScopeMembers(BaseModel):
     symbols: list[str] = []          # symbol_id 清單
 
 class Scope(BaseModel):
-    id: str                          # 穩定 kebab-case，例如 "authentication"
+    id: str                          # 穩定 lower-kebab-case，例如 "authentication"
     name: str
     description: str = ""
     locked: bool = False
@@ -302,7 +302,7 @@ class PersistenceMode(str, Enum):    # 僅 constraint 使用
     temporary = "temporary"
 
 class MemoryRevision(BaseModel):
-    record_id: str                   # 穩定，例如 "auth-session-storage"
+    record_id: str                   # 穩定 lower-kebab-case，例如 "auth-session-storage"
     revision: int                    # 1, 2, 3, ...，per record_id 單調遞增
     type: RecordType
     status: RecordStatus

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from pydantic import ValidationError
+
 from rune.core.project import RuneLayout
 from rune.core.storage.canonical import read_json_model, write_json_model
 from rune.core.storage.models import (
@@ -23,6 +25,10 @@ class ScopeNotFoundError(Exception):
 
 class ScopeAlreadyExistsError(Exception):
     pass
+
+
+class ScopeValidationError(Exception):
+    """Raised when a scope cannot be represented by the canonical model."""
 
 
 def load_scopes(layout: RuneLayout) -> ScopesFile:
@@ -53,14 +59,17 @@ def create_scope(
     scopes_file = load_scopes(layout)
     if any(scope.id == scope_id for scope in scopes_file.scopes):
         raise ScopeAlreadyExistsError(f"Scope {scope_id!r} already exists.")
-    scope = Scope(
-        id=scope_id,
-        name=name,
-        description=description,
-        locked=locked,
-        source=source,
-        members=ScopeMembers(files=sorted(set(files)), symbols=sorted(set(symbols))),
-    )
+    try:
+        scope = Scope(
+            id=scope_id,
+            name=name,
+            description=description,
+            locked=locked,
+            source=source,
+            members=ScopeMembers(files=sorted(set(files)), symbols=sorted(set(symbols))),
+        )
+    except ValidationError as exc:
+        raise ScopeValidationError(str(exc)) from exc
     scopes_file.scopes.append(scope)
     save_scopes(layout, scopes_file)
     return scope

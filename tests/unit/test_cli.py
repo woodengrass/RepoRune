@@ -29,6 +29,50 @@ def test_init_then_status_json_reports_zero_modified(git_repo: Path) -> None:
     assert payload["files_deleted"] == 0
 
 
+def test_scope_create_rejects_invalid_id_without_traceback(git_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+
+    result = runner.invoke(
+        app,
+        ["scope", "create", "Bad_ID", "--name", "Bad", "--path", str(git_repo)],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "String should match pattern" in result.output
+
+
+def test_decision_propose_rejects_invalid_id_without_traceback(git_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+
+    result = runner.invoke(
+        app,
+        [
+            "decision", "propose", "Bad_ID", "--content", "content",
+            "--path", str(git_repo),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "String should match pattern" in result.output
+
+
+def test_decision_propose_rejects_leading_dash_id_after_option_separator(git_repo: Path) -> None:
+    runner.invoke(app, ["init", "--path", str(git_repo)])
+
+    result = runner.invoke(
+        app,
+        [
+            "decision", "propose", "--content", "content", "--path", str(git_repo), "--", "-bad",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "String should match pattern" in result.output
+
+
 def test_status_reports_modified_added_and_deleted_counts(git_repo: Path) -> None:
     (git_repo / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
     (git_repo / "b.py").write_text("def bar():\n    pass\n", encoding="utf-8")

@@ -59,6 +59,7 @@ from rune.core.scopes.heuristics import ScopeCandidate, suggest_from_paths
 from rune.core.scopes.model import (
     ScopeAlreadyExistsError,
     ScopeNotFoundError,
+    ScopeValidationError,
     create_scope,
     delete_scope,
     load_scopes,
@@ -169,7 +170,7 @@ def status(
     path = path or Path.cwd()
     try:
         layout = _require_layout(path)
-    except (NotAGitRepoError, _MissingLayoutError, CacheUnusableError) as exc:
+    except (NotAGitRepoError, _MissingLayoutError) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
 
@@ -369,7 +370,9 @@ def scope_create(
     """Create a human scope. Manual scopes start locked."""
     try:
         scope = create_scope(_scope_layout(path), scope_id, name, description, files, symbols)
-    except (NotAGitRepoError, _MissingLayoutError, ScopeAlreadyExistsError) as exc:
+    except (
+        NotAGitRepoError, _MissingLayoutError, ScopeAlreadyExistsError, ScopeValidationError
+    ) as exc:
         _err(str(exc))
         raise typer.Exit(code=1) from exc
     _print_scope(scope)

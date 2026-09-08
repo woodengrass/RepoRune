@@ -16,7 +16,11 @@ const execFileAsync = promisify(execFile);
 // rune.exe without requiring a global `pip install`/PATH entry -- the
 // real deployment story (Milestone 8 packaging) is expected to put
 // `rune` on PATH, at which point this default is what actually runs.
-const RUNE_CLI_PATH = process.env.RUNE_CLI_PATH ?? "rune";
+export function resolveRuneCliPath(value: string | undefined): string {
+  return value || "rune";
+}
+
+const RUNE_CLI_PATH = resolveRuneCliPath(process.env.RUNE_CLI_PATH);
 export const RUNE_PROTOCOL_VERSION = 1;
 
 export class RuneCliError extends Error {

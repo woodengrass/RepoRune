@@ -207,6 +207,16 @@ def test_rebuild_cache_is_idempotent_given_same_canonical_state(git_repo: Path) 
     assert stats_first == stats_second
 
 
+def test_rebuild_cache_stats_count_current_logical_records(git_repo: Path) -> None:
+    layout = init_project(git_repo)
+    append_jsonl(layout.decisions_jsonl, _decision("d1", 1, RecordStatus.active))
+    append_jsonl(layout.decisions_jsonl, _decision("d1", 2, RecordStatus.inactive))
+
+    stats = rebuild_cache(layout)
+
+    assert stats["decisions"] == 1
+
+
 def test_decision_critical_and_source_fields_persist(git_repo: Path) -> None:
     """Global Code Standards / Hard Policy Injection support fields
     (ARCHITECTURE.md §7): a Decision marked `critical=True` with a

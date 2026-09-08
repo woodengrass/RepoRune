@@ -1036,9 +1036,9 @@ def test_multiple_semantic_revisions_append_atomically_in_one_run(
     write_json_model(
         layout.scopes_json,
         ScopesFile(scopes=[
-            Scope(id="scope_a", name="A", locked=False, source=ScopeSource.human,
+            Scope(id="scope-a", name="A", locked=False, source=ScopeSource.human,
                   members=ScopeMembers(files=["app/services.py"])),
-            Scope(id="scope_b", name="B", locked=False, source=ScopeSource.human,
+            Scope(id="scope-b", name="B", locked=False, source=ScopeSource.human,
                   members=ScopeMembers(files=["app/main.py"])),
         ]),
     )

@@ -4,6 +4,7 @@ from pathlib import Path
 
 from rune.core.index.scanner import (
     ScannedFile,
+    _glob_to_regex,
     diff_against_previous,
     scan_files,
     scan_files_with_issues,
@@ -14,6 +15,21 @@ from rune.core.storage.models import IndexConfig
 def _write(path: Path, content: str = "x = 1\n") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def test_glob_to_regex_matches_zero_or_more_segments_for_double_star() -> None:
+    pattern = _glob_to_regex("**/*.py")
+
+    assert pattern.fullmatch("main.py")
+    assert pattern.fullmatch("pkg/nested/service.py")
+    assert not pattern.fullmatch("pkg/service.js")
+
+
+def test_glob_to_regex_keeps_single_star_within_one_path_segment() -> None:
+    pattern = _glob_to_regex("src/*.py")
+
+    assert pattern.fullmatch("src/main.py")
+    assert not pattern.fullmatch("src/nested/main.py")
 
 
 def test_scan_files_finds_top_level_and_nested_files(tmp_path: Path) -> None:

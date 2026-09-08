@@ -861,9 +861,11 @@ def rebuild_cache(
         "symbols": len(code_index.symbols),
         "edges": len(code_index.edges),
         "scopes": len(scopes_file.scopes),
-        "decisions": len(decisions),
-        "constraints": len(constraints),
-        "notes": len(notes),
-        "proposals": len(proposals),
-        "semantic_summaries": len(semantic),
+        # These are user-facing logical-record counts. Canonical JSONL keeps
+        # every revision, but one cache record represents each current ID.
+        "decisions": len(_group_current_by_id(decisions, "record_id", "decisions.jsonl")),
+        "constraints": len(_group_current_by_id(constraints, "record_id", "constraints.jsonl")),
+        "notes": len(_group_current_by_id(notes, "id", "notes.jsonl")),
+        "proposals": len(_group_current_by_id(proposals, "proposal_id", "proposals.jsonl")),
+        "semantic_summaries": len(current_scope_summaries(semantic)),
     }

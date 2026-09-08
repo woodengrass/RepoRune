@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from rune.core.memory.hashes import compute_scope_membership_hash, compute_source_hashes
 from rune.core.memory.staleness import (
     detect_constraint_transitions,
@@ -95,6 +98,17 @@ def test_decision_deleted_file_triggers_review_required() -> None:
     assert result[0].revision == 2
     assert result[0].created_by is RevisionAuthor.system_staleness
     assert result[0].content == "use postgres"  # full snapshot, not a stub
+
+
+def test_decision_system_revision_revalidates_timestamp() -> None:
+    with pytest.raises(ValidationError):
+        detect_decision_transitions(
+            {"d1": _decision(files=["a.py"])},
+            known_scope_ids=set(),
+            known_files=set(),
+            known_symbol_ids=set(),
+            now="2026-01-02T00:00:00",
+        )
 
 
 def test_decision_deleted_scope_triggers_orphaned_not_review_required() -> None:
@@ -316,6 +330,17 @@ def test_note_system_transition_does_not_overwrite_created_at() -> None:
     assert len(result) == 1
     assert result[0].created_at == note.created_at
     assert result[0].last_verified_at == _NOW
+
+
+def test_note_system_revision_revalidates_timestamp() -> None:
+    with pytest.raises(ValidationError):
+        detect_note_transitions(
+            {"n1": _note(scopes=["gone"])},
+            known_scope_ids=set(),
+            file_hashes={},
+            symbol_owning_file={},
+            now="2026-01-02T00:00:00",
+        )
 
 
 def test_note_ttl_expiry_is_expired() -> None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from rune.core.memory.hashes import compute_scope_membership_hash, compute_source_hashes
+from rune.core.storage.canonical import validated_copy
 from rune.core.storage.models import (
     MemoryRevision,
     Note,
@@ -76,7 +77,7 @@ def _system_revision(
     }
     if extra:
         updates.update(extra)
-    return current.model_copy(update=updates)
+    return validated_copy(current, updates)
 
 
 def _existence_status(
@@ -205,7 +206,7 @@ def _note_system_revision(
     }
     if extra:
         updates.update(extra)
-    return current.model_copy(update=updates)
+    return validated_copy(current, updates)
 
 
 def detect_note_transitions(

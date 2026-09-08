@@ -24,6 +24,7 @@ from rune.core.semantic.validation import (
     ValidationOutcome,
     validate_and_build_scope_summary,
 )
+from rune.core.storage.canonical import validated_copy
 from rune.core.storage.models import (
     PricingConfig,
     Scope,
@@ -143,8 +144,9 @@ def detect_orphaned_scopes(
         if scope_id in current_scope_ids or summary.status is SemanticStatus.orphaned:
             continue
         orphaned.append(
-            summary.model_copy(
-                update={
+            validated_copy(
+                summary,
+                {
                     "revision": summary.revision + 1,
                     "status": SemanticStatus.orphaned,
                     "generated_at": now,
@@ -194,8 +196,9 @@ def mark_possibly_stale(
         if current.source_hash == source_hash:
             continue
         stale_markers.append(
-            current.model_copy(
-                update={
+            validated_copy(
+                current,
+                {
                     "revision": current.revision + 1,
                     "status": SemanticStatus.possibly_stale,
                     "source_hash": source_hash,
@@ -509,8 +512,9 @@ def refresh_scope_summary(
     sanitized_error = _sanitized_last_error(last_reason)
     local_log.append(f"[{scope.id}] all attempts exhausted, last_error={sanitized_error}: {last_reason}")
     if current is not None:
-        failure_summary = current.model_copy(
-            update={
+        failure_summary = validated_copy(
+            current,
+            {
                 "revision": next_revision,
                 "status": SemanticStatus.stale,
                 "last_error": sanitized_error,

@@ -4,7 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { createRuneHooks, isRuneProject, pathForScopeLookup, pluginDirectoryPath, type RuneClient } from "./plugin.js";
+import {
+  createRuneHooks,
+  findRuneProjectDirectory,
+  isRuneProject,
+  pathForScopeLookup,
+  pluginDirectoryPath,
+  type RuneClient,
+} from "./plugin.js";
 import type { HardBootstrapResult, ScopeForResult, SoftBootstrapResult } from "./rune-cli.js";
 
 function fakeClient(overrides: Partial<RuneClient> = {}): RuneClient {
@@ -231,6 +238,20 @@ test("Rune project detection only enables directories with a .rune directory", a
     assert.equal(await isRuneProject(root), false);
     await mkdir(join(root, ".rune"));
     assert.equal(await isRuneProject(root), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a nested plugin directory resolves to its enclosing Rune project", async () => {
+  const root = await mkdtemp(join(tmpdir(), "rune-opencode-plugin-nested-"));
+  const nested = join(root, "workspace", "src");
+  try {
+    await mkdir(join(root, ".rune"));
+    await mkdir(nested, { recursive: true });
+
+    assert.equal(await isRuneProject(nested), false);
+    assert.equal(await findRuneProjectDirectory(nested), root);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

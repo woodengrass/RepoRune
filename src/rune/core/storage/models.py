@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, StringConstraints
 
 # --------------------------------------------------------------------------
 # Shared validators / constrained types
@@ -34,6 +34,11 @@ def _validate_iso8601_utc(value: str) -> str:
 
 Timestamp = Annotated[str, AfterValidator(_validate_iso8601_utc)]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+# IDs are persisted across re-indexes, so reject ambiguous forms at the
+# canonical boundary rather than allowing them to become hard-to-address CLI
+# records later.
+ScopeId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
+RecordId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")]
 
 
 class StrictModel(BaseModel):
@@ -159,7 +164,7 @@ class ScopeMembers(BaseModel):
 
 
 class Scope(BaseModel):
-    id: str
+    id: ScopeId
     name: str
     description: str = ""
     locked: bool = False
@@ -203,7 +208,7 @@ class SemanticStatus(str, Enum):
 
 
 class ScopeSummary(BaseModel):
-    scope_id: str
+    scope_id: ScopeId
     revision: int = Field(ge=1)
     # Per-scope_id monotonically increasing; current = max(revision), same
     # convention as Decision/Constraint/Note (DATA_MODEL.md §1, §3). Added
@@ -267,7 +272,7 @@ class PersistenceMode(str, Enum):
 
 
 class MemoryRevision(BaseModel):
-    record_id: str
+    record_id: RecordId
     revision: int = Field(ge=1)
     type: RecordType
     status: RecordStatus
@@ -321,7 +326,7 @@ class Proposal(BaseModel):
     proposal_id: str
     revision: int = Field(ge=1)
     type: RecordType
-    record_id: str
+    record_id: RecordId
     payload: MemoryRevision
     status: ProposalStatus = ProposalStatus.pending
     created_by: Literal["agent", "human"]  # propose actions are never system-generated
