@@ -2501,3 +2501,59 @@ git commit／真實 `rune update` 掃描整個流程走一遍、非法 ref 的 C
      by both paths, with a regression test for `apply_patch`. The session admission cap, ancestor project
      discovery, status cache-error handling, and direct `_glob_to_regex` tests were rechecked as already
      fixed; no duplicate implementations were added for those findings.
+
+177. Governance Memory review (2026-09-09, user-confirmed): `approve()` writes two canonical files
+    (`decisions/constraints.jsonl` + `proposals.jsonl`) non-atomically. The existing write order
+    (authoritative content first, proposal resolution second) plus retry-after-crash idempotency stays
+    as the mitigation. The residual partial-write risk is explicitly accepted and will only be
+    eliminated by FUTURE_WORK.md section 4 (project-level canonical write lock held across the whole
+    approval). No additional hardening in the current scope.
+178. Governance Memory review (2026-09-09, user-confirmed): `reject()` and `propose()` do not call
+    `records.refresh_cache()`, so SQLite `pending_proposals` stays stale until the next update while
+    CLI output (which reads canonical directly) stays correct. Deferred to FUTURE_WORK.md sections 7/9
+    (incremental projection / rejection projection invariant) instead of patching a refresh here.
+179. Governance Memory review (2026-09-09, user-confirmed): `staleness._parse()` raises a raw
+    `ValueError` on malformed `expires_at` instead of a domain error. Left to FUTURE_WORK.md section 3
+    (canonical fail-closed: corrupt/invalid records and unsupported versions produce domain errors)
+    since Pydantic UTC validation already blocks naive timestamps at every write path.
+180. Governance Memory review (2026-09-09, coverage confirmed): all six write commands that trigger
+    `records.refresh_cache()` (`decision deactivate`, `constraint deactivate`, `note add`,
+    `note update`, `proposal approve`, `proposal edit`) map `CanonicalConflictError` to the clean
+    "write succeeded but cache is stale" message and map `CanonicalReadError`/
+    `UnknownSchemaVersionError` to clean exit code 1. Corrupt/0-byte `memory.db` does not produce a
+    raw traceback on this path because `read_current_code_index()` returns empty `CodeIndexData` on
+    `sqlite3.DatabaseError` (fail-open, documented in `materialize.py`). Verified with
+    `test_memory_proposals.py` + `test_memory_notes.py` + `test_read_boundaries.py` +
+    `test_materialize.py` (73 passed) and CLI-filtered `test_cli.py -k "note or proposal or
+    deactivate or approve"` (4 passed).
+181. Reference + Scopes review (2026-09-09, user-confirmed): `Scope` writers used bare
+    `model_copy(update=...)`, which skips Pydantic validators -- the same bug class as notes.py
+    item 148. Reproduced by hand: `set_scope_locked` accepted `locked='not-a-bool'` and wrote it
+    into `scopes.json`, breaking every later load. Fixed by routing `update_scope`,
+    `set_scope_locked`, `assign_new_files_from_imports`, and reconcile's AUTO apply through
+    `canonical.validated_copy()` (bad values now fail loudly before any write). Regression tests
+    verify the invalid write raises `ValidationError` with canonical byte-identical afterwards,
+    and that auto-assign preserves existing `members.symbols`. Each new test was confirmed to fail
+    on the pre-fix implementation via `git stash` of `src/` only.
+182. Reference + Scopes review (2026-09-09, user-confirmed, option A): a file covered only via
+    `members.symbols` counts as assigned in `reconcile()` (`assigned = members.files` union
+    symbol-owning files), so the unattended AUTO path never touches a file a human already
+    expressed intent about -- even with unique high-confidence import evidence. Whole-file
+    membership stays discoverable through a new read-only partial-coverage REVIEW
+    (`_partial_coverage_entries`, "partially covered: N/M", bounded by existing symbol
+    memberships, never auto-applied, excluded from `auto_count`/the large-churn guardrail).
+    `ReconcileEntry.target_type` tightened from `str` to `Literal["file", "symbol"]`; no JSON
+    contract change (existing REVIEW enum value reused). Regression tests cover both the
+    unique-evidence and zero-evidence cases.
+183. Reference + Scopes review (2026-09-09, user-confirmed, option A): `suggest_from_graph`
+    derived the no-common-parent fallback label from a constant `"connected-component"`, so two
+    unrelated islands received the same candidate id (reproduced by test; the CLI's
+    `_unique_candidate_id` was masking it). The fallback now derives from each component's own
+    files with in-batch `-2`/`-3` disambiguation, over pre-sorted components so suffix assignment
+    is deterministic across runs (same lesson as references.py's `sorted(imported_files)`).
+    `find_referencing_edges` replaced `SELECT *` with an explicit column list (`id` deliberately
+    excluded: autoincrement identity is meaningless across rebuilds). The CLI/core `while`-loop
+    dedup duplication is intentionally kept, not extracted: the two sites differ in used-set
+    semantics, empty-fallback strings, and signatures, and unifying them would change user-visible
+    output (§33) to save four lines. A shared core merge-and-dedup layer is deferred to the future
+    MCP suggest round together with the CLI/MCP contract governance in FUTURE_WORK.md.

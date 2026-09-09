@@ -7,7 +7,11 @@ from collections.abc import Iterable
 from pydantic import ValidationError
 
 from rune.core.project import RuneLayout
-from rune.core.storage.canonical import read_json_model, write_json_model
+from rune.core.storage.canonical import (
+    read_json_model,
+    validated_copy,
+    write_json_model,
+)
 from rune.core.storage.models import (
     Edge,
     EdgeType,
@@ -90,12 +94,16 @@ def update_scope(
     scope = get_scope(scopes_file, scope_id)
     files = (set(scope.members.files) | set(add_files)) - set(remove_files)
     symbols = (set(scope.members.symbols) | set(add_symbols)) - set(remove_symbols)
-    updated = scope.model_copy(
-        update={
+    # validated_copy, not model_copy: model_copy skips Pydantic validators,
+    # so a bad value would be written straight into scopes.json and break
+    # every later load (same bug class as notes.py, see canonical.py).
+    updated = validated_copy(
+        scope,
+        {
             "name": name if name is not None else scope.name,
             "description": description if description is not None else scope.description,
             "members": ScopeMembers(files=sorted(files), symbols=sorted(symbols)),
-        }
+        },
     )
     scopes_file.scopes[scopes_file.scopes.index(scope)] = updated
     save_scopes(layout, scopes_file)
@@ -105,7 +113,8 @@ def update_scope(
 def set_scope_locked(layout: RuneLayout, scope_id: str, locked: bool) -> Scope:
     scopes_file = load_scopes(layout)
     scope = get_scope(scopes_file, scope_id)
-    updated = scope.model_copy(update={"locked": locked})
+    # validated_copy: a non-bool `locked` must fail here, not poison scopes.json.
+    updated = validated_copy(scope, {"locked": locked})
     scopes_file.scopes[scopes_file.scopes.index(scope)] = updated
     save_scopes(layout, scopes_file)
     return updated
@@ -184,12 +193,16 @@ def assign_new_files_from_imports(
         scope = get_scope(scopes_file, scope_id)
         if path in scope.members.files:
             continue
-        updated = scope.model_copy(
-            update={
-                "members": scope.members.model_copy(
-                    update={"files": sorted([*scope.members.files, path])}
+        # validated_copy (see update_scope): never write unvalidated state
+        # to canonical, even on this unattended write path.
+        updated = validated_copy(
+            scope,
+            {
+                "members": ScopeMembers(
+                    files=sorted([*scope.members.files, path]),
+                    symbols=list(scope.members.symbols),
                 )
-            }
+            },
         )
         scopes_file.scopes[scopes_file.scopes.index(scope)] = updated
         changed_scope_ids.append(scope_id)

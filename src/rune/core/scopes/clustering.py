@@ -29,15 +29,34 @@ def suggest_from_graph(conn: sqlite3.Connection, excluded_files: set[str] | None
             graph.add_edge(source_file, target_file)
 
     candidates: list[ScopeCandidate] = []
-    for component in nx.connected_components(graph):
-        if len(component) < 2:
-            continue
-        files = tuple(sorted(component))
+    # Sorted up front so the `-2`/`-3` disambiguation below assigns the
+    # same ids on every run: `connected_components` iteration order follows
+    # graph insertion order, which itself follows unordered SQLite row
+    # order (same lessons as references.py's `sorted(imported_files)`).
+    components = sorted(
+        tuple(sorted(component))
+        for component in nx.connected_components(graph)
+        if len(component) >= 2
+    )
+    seen_ids: set[str] = set()
+    for files in components:
         common_parent = _common_parent(files)
-        label = common_parent or "connected-component"
+        # A component with no common parent has no directory-derived name.
+        # Derive the fallback from the component's own files (instead of a
+        # constant "connected-component") so two unrelated islands never
+        # share one id -- callers other than the CLI, which dedups via
+        # `_unique_candidate_id`, must not receive duplicates.
+        label = common_parent or f"connected-{files[0]}"
+        base_id = scope_id_for_path(label) or "connected-component"
+        candidate_id = base_id
+        suffix = 2
+        while candidate_id in seen_ids:
+            candidate_id = f"{base_id}-{suffix}"
+            suffix += 1
+        seen_ids.add(candidate_id)
         candidates.append(
             ScopeCandidate(
-                id=scope_id_for_path(label),
+                id=candidate_id,
                 name=label.replace("-", " ").replace("_", " ").title(),
                 files=files,
                 reason="Files are connected by import/reference graph edges.",

@@ -22,6 +22,8 @@ from rune.core.storage.models import (
     ScopeMembers,
     ScopesFile,
     ScopeSource,
+    Symbol,
+    SymbolKind,
 )
 from rune.core.storage.sqlite.materialize import CodeIndexData, rebuild_cache
 
@@ -546,3 +548,85 @@ def test_since_does_not_treat_git_history_read_failure_as_missing_file(
 
     with pytest.raises(GitHistoryReadError, match="cannot read"):
         _scopes_json_at_ref(layout, "HEAD")
+
+
+def _symbol(symbol_id: str, path: str, name: str = "f") -> Symbol:
+    return Symbol(
+        symbol_id=symbol_id, file=path, name=name, qualified_name=name,
+        kind=SymbolKind.function, start_line=1, end_line=2,
+    )
+
+
+def test_symbol_covered_file_never_auto_applies_despite_unique_import(git_repo: Path) -> None:
+    """Option A: a file covered only via `members.symbols` counts as
+    assigned, so even unique high-confidence import evidence must not
+    AUTO-apply it on the unattended write path. It gets a read-only
+    partial-coverage REVIEW instead.
+    """
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(
+                      files=["app/services.py"],
+                      symbols=["app/new.py:f:function"],
+                  )),
+        ]
+    )
+    layout = init_project(git_repo)
+    save_scopes(layout, scopes_file)
+    rebuild_cache(
+        layout,
+        code_index=CodeIndexData(
+            files=[_file(p) for p in ("app/services.py", "app/new.py")],
+            symbols=[_symbol("app/new.py:f:function", "app/new.py")],
+            edges=[
+                Edge(source_file="app/new.py", target_file="app/services.py",
+                     edge_type=EdgeType.imports, confidence=1.0),
+            ],
+        ),
+    )
+
+    result, updated = reconcile(layout, full=False)
+
+    assert result.auto_count == 0
+    assert result.applied is False
+    assert updated is None
+    assert not any(
+        e.classification is ReconcileClassification.auto for e in result.entries
+    )
+    partial = [e for e in result.entries if e.target == "app/new.py"]
+    assert len(partial) == 1
+    assert partial[0].classification is ReconcileClassification.review
+    assert "partially covered" in partial[0].reason
+    assert partial[0].candidate_scope_ids == ("app",)
+
+
+def test_symbol_covered_file_without_evidence_is_partial_review(git_repo: Path) -> None:
+    """Without any import evidence the file must surface as partial-coverage
+    REVIEW, not as a zero-evidence REVIEW -- a human already expressed
+    intent about it via `members.symbols`.
+    """
+    scopes_file = ScopesFile(
+        scopes=[
+            Scope(id="app", name="App", locked=False, source=ScopeSource.model,
+                  members=ScopeMembers(symbols=["lone.py:f:function"])),
+        ]
+    )
+    layout = init_project(git_repo)
+    save_scopes(layout, scopes_file)
+    rebuild_cache(
+        layout,
+        code_index=CodeIndexData(
+            files=[_file("lone.py")],
+            symbols=[_symbol("lone.py:f:function", "lone.py")],
+        ),
+    )
+
+    result, updated = reconcile(layout, full=False)
+
+    assert updated is None
+    entries = [e for e in result.entries if e.target == "lone.py"]
+    assert len(entries) == 1
+    assert entries[0].classification is ReconcileClassification.review
+    assert "partially covered" in entries[0].reason
+    assert "1/1" in entries[0].reason

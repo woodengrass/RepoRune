@@ -36,6 +36,12 @@ update` on the merged tree -> `rune scope reconcile`", ARCHITECTURE.md
   this direction (existing membership -> BROKEN/REVIEW) does apply
   symmetrically to both, since it is not a "new item" flood risk: it is
   strictly bounded by how many memberships already exist in `scopes.json`.
+- A file covered only via `members.symbols` (its owning file is in no
+  scope's `members.files`) counts as assigned for AUTO purposes, so the
+  unattended write path never touches it -- but it gets a read-only
+  partial-coverage REVIEW (`_partial_coverage_entries`, bounded by existing
+  symbol memberships, never auto-applied, excluded from the churn
+  guardrail) so whole-file membership stays discoverable.
 
 Everything else -- a file that changed content but is *already* a member
 of some scope, or was already correctly absent from all scopes -- is by
@@ -85,6 +91,7 @@ import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal
 
 from rune.core.project import RuneLayout
 from rune.core.scopes.model import (
@@ -92,8 +99,8 @@ from rune.core.scopes.model import (
     load_scopes,
     member_files_by_unlocked_scope,
 )
-from rune.core.storage.canonical import CanonicalReadError
-from rune.core.storage.models import Edge, ScopesFile, ScopeSource
+from rune.core.storage.canonical import CanonicalReadError, validated_copy
+from rune.core.storage.models import Edge, ScopeMembers, ScopesFile, ScopeSource, Symbol
 from rune.core.storage.sqlite.materialize import read_current_code_index
 
 
@@ -115,7 +122,7 @@ class ReconcileClassification(str, Enum):
 @dataclass(frozen=True)
 class ReconcileEntry:
     scope_id: str | None
-    target_type: str  # "file" | "symbol"
+    target_type: Literal["file", "symbol"]
     target: str
     classification: ReconcileClassification
     reason: str
@@ -239,6 +246,48 @@ def _merge_affected_entries(
     return entries
 
 
+def _partial_coverage_entries(
+    scopes_file: ScopesFile,
+    symbol_owning_file: dict[str, str],
+    symbols: Iterable[Symbol],
+) -> list[ReconcileEntry]:
+    """REVIEW-only entries for files covered solely via `members.symbols`.
+
+    These files count as assigned (so they never reach AUTO), but whole-file
+    membership may still be worth a human look -- e.g. 1 of 50 symbols is
+    scoped. Bounded by existing symbol memberships (no zero-evidence flood),
+    never auto-applied, never counted toward the large-churn guardrail
+    (which only watches `auto_count`).
+    """
+    indexed_by_file: dict[str, list[str]] = {}
+    for symbol in symbols:
+        indexed_by_file.setdefault(symbol.file, []).append(symbol.symbol_id)
+    member_symbol_ids = {
+        symbol_id for scope in scopes_file.scopes for symbol_id in scope.members.symbols
+    }
+    covering_scopes_by_file: dict[str, set[str]] = {}
+    for scope in scopes_file.scopes:
+        for symbol_id in scope.members.symbols:
+            path = symbol_owning_file.get(symbol_id)
+            if path is not None and path not in scope.members.files:
+                covering_scopes_by_file.setdefault(path, set()).add(scope.id)
+    entries: list[ReconcileEntry] = []
+    for path in sorted(covering_scopes_by_file):
+        indexed = indexed_by_file.get(path, [])
+        covered = [sid for sid in indexed if sid in member_symbol_ids]
+        entries.append(
+            ReconcileEntry(
+                None, "file", path, ReconcileClassification.review,
+                f"partially covered: {len(covered)}/{len(indexed)} indexed symbols "
+                f"are scope members (via members.symbols), but the file itself is "
+                f"in no scope's members.files -- consider whole-file membership; "
+                f"never auto-applied",
+                candidate_scope_ids=tuple(sorted(covering_scopes_by_file[path])),
+            )
+        )
+    return entries
+
+
 def reconcile(
     layout: RuneLayout, *, full: bool = False, large_churn_threshold: int = 20, since: str | None = None
 ) -> tuple[ReconcileResult, ScopesFile | None]:
@@ -333,7 +382,20 @@ def reconcile(
                     )
                 )
 
-    assigned_files = {f for scope in scopes_file.scopes for f in scope.members.files}
+    file_assigned = {f for scope in scopes_file.scopes for f in scope.members.files}
+    # Option A (user-confirmed): a file covered only via `members.symbols`
+    # counts as assigned -- it is excluded from AUTO/zero-evidence REVIEW
+    # so the unattended write path never "discovers" a file a human already
+    # expressed intent about. Such files get a dedicated partial-coverage
+    # REVIEW below instead (read-only, never auto-applied), so whole-file
+    # membership stays discoverable without widening AUTO.
+    symbol_covered_files = {
+        symbol_owning_file[symbol_id]
+        for scope in scopes_file.scopes
+        for symbol_id in scope.members.symbols
+        if symbol_id in symbol_owning_file
+    }
+    assigned_files = file_assigned | symbol_covered_files
     member_files_by_scope = member_files_by_unlocked_scope(scopes_file, symbol_owning_file)
     auto_candidates: list[tuple[str, str]] = []
     for path in sorted(known_files - assigned_files):
@@ -365,6 +427,10 @@ def reconcile(
                 )
             )
 
+    entries.extend(
+        _partial_coverage_entries(scopes_file, symbol_owning_file, code_index.symbols)
+    )
+
     if since is not None:
         entries.extend(
             _merge_affected_entries(layout, since, scopes_file, known_files, member_files_by_scope, code_index.edges)
@@ -377,20 +443,24 @@ def reconcile(
     updated_scopes_file: ScopesFile | None = None
     applied = False
     if not full and auto_candidates and not suspicious_churn:
-        updated_scopes_file = scopes_file.model_copy(deep=True)
-        by_index = {s.id: i for i, s in enumerate(updated_scopes_file.scopes)}
+        staged = scopes_file.model_copy(deep=True)
+        by_index = {s.id: i for i, s in enumerate(staged.scopes)}
         for path, scope_id in auto_candidates:
             idx = by_index[scope_id]
-            scope = updated_scopes_file.scopes[idx]
+            scope = staged.scopes[idx]
             if path in scope.members.files:
                 continue  # already a member somehow; nothing to apply
-            updated_scopes_file.scopes[idx] = scope.model_copy(
-                update={
-                    "members": scope.members.model_copy(
-                        update={"files": sorted([*scope.members.files, path])}
+            # validated_copy: same canonical-poisoning guard as model.py.
+            staged.scopes[idx] = validated_copy(
+                scope,
+                {
+                    "members": ScopeMembers(
+                        files=sorted([*scope.members.files, path]),
+                        symbols=list(scope.members.symbols),
                     )
-                }
+                },
             )
+        updated_scopes_file = staged
         applied = True
         entries = [
             ReconcileEntry(

@@ -135,8 +135,14 @@ def find_referencing_edges(conn: sqlite3.Connection, symbol_id: str) -> list[sql
     """"Who references symbol X" query helper (Milestone 3 deliverable),
     built on the plain `edges` table — no dedicated retrieval layer exists
     yet (that's Milestone 6's `core.retrieval`).
+
+    Columns are listed explicitly (never `SELECT *`): callers depend on
+    this row shape as a stable interface. (`id` is deliberately excluded:
+    an autoincrement row identity is meaningless across rebuilds.)
     """
     return conn.execute(
-        "SELECT * FROM edges WHERE target_symbol = ? ORDER BY source_file, source_symbol",
+        "SELECT source_symbol, source_file, target_symbol, target_file,"
+        " edge_type, confidence FROM edges"
+        " WHERE target_symbol = ? ORDER BY source_file, source_symbol",
         (symbol_id,),
     ).fetchall()

@@ -240,3 +240,23 @@ def test_find_referencing_edges_queries_by_target_symbol() -> None:
     rows = find_referencing_edges(conn, "t1")
     assert len(rows) == 1
     assert rows[0]["source_symbol"] == "s1"
+
+
+def test_find_referencing_edges_returns_explicit_stable_columns() -> None:
+    """`SELECT *` is banned in stable interfaces (§12): the row shape must
+    be an explicit column list, independent of physical table order.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE edges (confidence REAL, target_file TEXT, edge_type TEXT, "
+        "target_symbol TEXT, source_file TEXT, source_symbol TEXT)"
+    )
+    conn.execute("INSERT INTO edges VALUES (0.8, 'b.py', 'calls', 't1', 'a.py', 's1')")
+    rows = find_referencing_edges(conn, "t1")
+    assert len(rows) == 1
+    assert set(rows[0].keys()) == {
+        "source_symbol", "source_file", "target_symbol",
+        "target_file", "edge_type", "confidence",
+    }
+    assert rows[0]["source_symbol"] == "s1"
