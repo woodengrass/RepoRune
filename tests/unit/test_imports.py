@@ -78,6 +78,32 @@ def test_resolve_js_bare_package_import_returns_none(tmp_path: Path) -> None:
     assert target is None
 
 
+def test_resolve_js_parent_escape_outside_repo_is_unresolved(tmp_path: Path) -> None:
+    """Regression test: a relative specifier normalizing to outside the repo
+    (`../outside` from a top-level file) must resolve to None. `target_file`
+    is documented as a repo-relative path — storing an escape path would
+    point `repo_root / target` at a file outside the repo.
+    """
+    outside = tmp_path.parent / "outside_escape_target.ts"
+    outside.write_text("export const x = 1;\n", encoding="utf-8")
+    try:
+        target = resolve_import_target(tmp_path, "index.ts", "typescript", "../outside_escape_target")
+        assert target is None
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_resolve_python_escape_outside_repo_is_unresolved(tmp_path: Path) -> None:
+    """Locks the same containment invariant for the Python resolver: a
+    `..`-leading normalized candidate is honestly unresolved, never a
+    repo-external path. (Normal relative specifiers clamp at the repo root
+    and can't reach this branch today — this test pins the guard, while the
+    JS test above is the live-bug regression.)
+    """
+    target = resolve_import_target(tmp_path, "a.py", "python", "..outside_escape")
+    assert target is None
+
+
 def test_build_import_edges_always_confidence_one_even_when_unresolved(tmp_path: Path) -> None:
     raw = [RawImport(specifier="some-package", line=1), RawImport(specifier="./missing", line=2)]
     edges = build_import_edges(tmp_path, "src/index.ts", "typescript", raw)

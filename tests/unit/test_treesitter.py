@@ -366,6 +366,42 @@ def test_python_qualified_name_matches_extract_symbols_for_same_node() -> None:
     assert adapter.qualified_name(method_node) in from_extract
 
 
+def test_python_extracts_symbols_inside_block_statements() -> None:
+    """Regression test: `PythonParserAdapter._walk` had no generic recursion,
+    so any class/def nested in an `if`/`try`/`with` block was silently missed
+    (the JS-family walker already recursed). Block nesting must not hide
+    symbols; function bodies are still out of scope by design.
+    """
+    source = (
+        b"if True:\n"
+        b"    class Hidden:\n"
+        b"        pass\n"
+        b"try:\n"
+        b"    def helper():\n"
+        b"        pass\n"
+        b"except ImportError:\n"
+        b"    def fallback():\n"
+        b"        pass\n"
+        b"class Foo:\n"
+        b"    if True:\n"
+        b"        def bar(self):\n"
+        b"            pass\n"
+        b"def outer():\n"
+        b"    def inner():\n"
+        b"        pass\n"
+    )
+    adapter = PythonParserAdapter()
+    by_qname = {s.qualified_name: s for s in adapter.extract_symbols("m.py", source)}
+
+    assert by_qname["Hidden"].kind == SymbolKind.class_
+    assert by_qname["helper"].kind == SymbolKind.function
+    assert by_qname["fallback"].kind == SymbolKind.function
+    assert by_qname["Foo.bar"].kind == SymbolKind.method
+    # Function-local nested defs stay out of scope (unchanged V1 rule).
+    assert "outer.inner" not in by_qname
+    assert "inner" not in by_qname
+
+
 def test_typescript_qualified_name_for_a_method_includes_class_name() -> None:
     source = b"""
 class Widget {

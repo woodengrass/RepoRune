@@ -24,6 +24,11 @@ from rune.core.storage.models import IndexConfig
 # `.rune/cache/**` exclude (which a user could edit away) — nothing under
 # rune's own directory should ever be treated as project source, at any
 # depth, regardless of config.
+# Deliberate: `node_modules`/`__pycache__`/`.venv`/`venv` are locked here too,
+# not just default excludes. Dependency trees are never project knowledge —
+# tracing into a third-party lib is a single file read at query time, not a
+# persistent index entry — so there is intentionally no escape hatch even for
+# an explicit `include`.
 _ALWAYS_PRUNED_DIR_NAMES = frozenset(
     {".git", ".rune", "node_modules", "__pycache__", ".venv", "venv"}
 )

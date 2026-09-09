@@ -30,6 +30,17 @@ _JS_TRY_SUFFIXES = (
 )
 
 
+def _escapes_repo(candidate: str) -> bool:
+    """True when a normalized repo-relative candidate points outside the repo.
+
+    `target_file` is documented as a repo-relative path (DATA_MODEL.md §2.2);
+    a `..`-leading candidate would resolve through `repo_root / candidate` to
+    a file outside the repo and must never be stored. Callers treat it as
+    honestly unresolved (`None`), same as a bare package name.
+    """
+    return candidate == ".." or candidate.startswith("../")
+
+
 def _resolve_python_import(repo_root: Path, source_path: str, specifier: str) -> str | None:
     source_dir = posixpath.dirname(source_path)
     if specifier.startswith("."):
@@ -54,6 +65,9 @@ def _resolve_python_import(repo_root: Path, source_path: str, specifier: str) ->
     else:
         candidate_base = specifier.replace(".", "/")
 
+    if _escapes_repo(candidate_base):
+        return None
+
     for suffix_path in (f"{candidate_base}.py", f"{candidate_base}/__init__.py"):
         if (repo_root / suffix_path).is_file():
             return suffix_path
@@ -65,6 +79,8 @@ def _resolve_relative_js_import(repo_root: Path, source_path: str, specifier: st
         return None  # bare package import — not resolved in V1
     source_dir = posixpath.dirname(source_path)
     combined = posixpath.normpath(posixpath.join(source_dir, specifier))
+    if _escapes_repo(combined):
+        return None
     for suffix in _JS_TRY_SUFFIXES:
         candidate = combined + suffix
         if (repo_root / candidate).is_file():

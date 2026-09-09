@@ -185,6 +185,13 @@ class PythonParserAdapter:
                 # classes local to a function are out of scope.
             elif not scope and target.type == "expression_statement":
                 self._maybe_module_variable(target, path, symbols)
+            else:
+                # Block statements (`if`/`try`/`with`/`match`/...) can nest
+                # class/def at module or class level — recurse so they aren't
+                # silently missed. Function bodies are still never descended
+                # into (the `function_definition` branch above returns without
+                # recursing, so V1 keeps ignoring function-local nested defs).
+                self._walk(child, path, source, scope, symbols)
 
     def _make_symbol(
         self,
