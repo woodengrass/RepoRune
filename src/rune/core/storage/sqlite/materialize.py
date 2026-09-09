@@ -81,11 +81,11 @@ def connect(db_path: Path) -> sqlite3.Connection:
         # SQLite ignores declared foreign keys unless this is turned on per
         # connection — without it, every `REFERENCES ... ON DELETE CASCADE` in
         # schema.sql is decorative only. `scope_files.file`/`scope_symbols.
-        # symbol_id` deliberately do NOT declare a FK to files/symbols yet (see
-        # schema.sql comment): those tables stay empty until Milestone 2, while
-        # scopes.json can already carry file/symbol members in Milestone 1
-        # (e.g. via --force-preserved content), so enforcing that particular FK
-        # now would break legitimate M1 materialization.
+        # symbol_id` carry real FKs to files/symbols (restored in Milestone 2,
+        # see schema.sql comment), so dangling scope members are pre-filtered
+        # in `_materialize_scopes` and dangling edge targets are nulled in
+        # `_materialize_code_index` — `INSERT OR IGNORE` suppresses only
+        # UNIQUE conflicts, never FK violations.
         conn.execute("PRAGMA foreign_keys=ON;")
     except BaseException:
         # `sqlite3.connect()` succeeds even for a corrupt/0-byte file --
@@ -629,7 +629,10 @@ def read_current_code_index(layout: RuneLayout) -> CodeIndexData:
                     indexed_at=row["indexed_at"],
                     status=IndexedFileStatus(row["status"]),
                 )
-                for row in conn.execute("SELECT * FROM files")
+                for row in conn.execute(
+                    "SELECT path, language, content_hash, size, mtime, "
+                    "git_blob_hash, indexed_at, status FROM files"
+                )
             ]
             symbols = [
                 Symbol(
@@ -642,7 +645,10 @@ def read_current_code_index(layout: RuneLayout) -> CodeIndexData:
                     start_line=row["start_line"],
                     end_line=row["end_line"],
                 )
-                for row in conn.execute("SELECT * FROM symbols")
+                for row in conn.execute(
+                    "SELECT symbol_id, file, name, qualified_name, kind, "
+                    "signature, start_line, end_line FROM symbols"
+                )
             ]
             edges = [
                 Edge(
@@ -653,7 +659,10 @@ def read_current_code_index(layout: RuneLayout) -> CodeIndexData:
                     edge_type=EdgeType(row["edge_type"]),
                     confidence=row["confidence"],
                 )
-                for row in conn.execute("SELECT * FROM edges")
+                for row in conn.execute(
+                    "SELECT source_symbol, source_file, target_symbol, "
+                    "target_file, edge_type, confidence FROM edges"
+                )
             ]
         except sqlite3.DatabaseError:
             return CodeIndexData()

@@ -634,3 +634,42 @@ def test_connect_for_read_rejects_old_schema_version_cache(git_repo: Path) -> No
 
     with pytest.raises(CacheUnusableError):
         connect_for_read(layout)
+
+
+def test_read_current_code_index_round_trips_files_symbols_edges(git_repo: Path) -> None:
+    """Guards the `read_current_code_index` refactor from `SELECT *` to
+    explicit column lists (AGENTS.md §12): whatever `rebuild_cache`
+    materializes must come back with every field intact.
+    """
+    from rune.core.storage.models import Edge, EdgeType, Symbol, SymbolKind
+    from rune.core.storage.sqlite.materialize import read_current_code_index
+
+    layout = init_project(git_repo)
+    files = [_indexed_file("a.py"), _indexed_file("b.py")]
+    symbols = [
+        Symbol(
+            symbol_id="s1", file="a.py", name="f", qualified_name="f",
+            kind=SymbolKind.function, signature="def f():",
+            start_line=1, end_line=5,
+        )
+    ]
+    edges = [
+        Edge(
+            source_symbol=None, source_file="a.py", target_symbol=None,
+            target_file="b.py", edge_type=EdgeType.imports, confidence=1.0,
+        )
+    ]
+    rebuild_cache(layout, code_index=CodeIndexData(files=files, symbols=symbols, edges=edges))
+
+    result = read_current_code_index(layout)
+
+    assert [(f.path, f.language, f.content_hash) for f in result.files] == [
+        ("a.py", "python", "sha256:x"),
+        ("b.py", "python", "sha256:x"),
+    ]
+    assert [(s.symbol_id, s.file, s.qualified_name, s.kind) for s in result.symbols] == [
+        ("s1", "a.py", "f", SymbolKind.function),
+    ]
+    assert [
+        (e.source_file, e.target_file, e.edge_type, e.confidence) for e in result.edges
+    ] == [("a.py", "b.py", EdgeType.imports, 1.0)]
